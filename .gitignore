@@ -1,0 +1,22 @@
+# reference repos — cloned, never committed
+references/
+
+# runtime data
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/backups/
+queue/.processed/
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# node
+node_modules/
+ui/dist/
+
+# local model files
+models/
+*.onnx
