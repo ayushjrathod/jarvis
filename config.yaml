@@ -1,0 +1,60 @@
+# Mission Control — single config file
+# Paths are relative to this file's directory unless absolute.
+
+dispatcher:
+  host: 127.0.0.1
+  port: 8765
+  db: data/mission.db
+  queue_dir: queue
+  poll_interval_s: 5
+  max_concurrent_agentic: 2
+
+  # The claude aliases only exist in interactive zsh — invoke the binary directly.
+  claude_bin: /home/ayra/.local/bin/claude
+  claude_config_dir: /home/ayra/.claude-per
+
+  models:
+    # quick path: Messages API when credentials exist, else claude -p stream-json
+    quick: claude-fable-5
+    # null = let the CLI use its configured default (currently Fable 5)
+    agentic: null
+    # refusal fallback (locked decision #3)
+    fallback: claude-opus-4-8
+    classifier: claude-haiku-4-5
+
+  # messages_api | claude_cli | auto (auto: messages_api if API credentials found)
+  quick_backend: auto
+
+  # Note: a bare `claude -p` invocation carries ~$0.15-0.25 of notional cost
+  # (Claude Code system prompt overhead), so caps below that always trip.
+  budgets:
+    max_cost_per_task_usd: 3.00   # passed to claude -p --max-budget-usd
+    quick_max_cost_usd: 1.00
+    timeout_s: 600                # wall-clock kill for agentic runs
+    quick_max_tokens: 1024
+
+  task_defaults:
+    allowed_tools: [Read, Glob, Grep]   # read-only baseline for unattended runs
+
+  task_types:
+    summarize:
+      allowed_tools: [Read, Glob, Grep, Write]
+
+  # USD per million tokens, for quick-path cost computation (agentic cost comes
+  # from the CLI's total_cost_usd). Cached from docs 2026-07-05.
+  prices:
+    claude-fable-5:   { input: 10.0, output: 50.0 }
+    claude-opus-4-8:  { input: 5.0,  output: 25.0 }
+    claude-haiku-4-5: { input: 1.0,  output: 5.0 }
+
+jarvis:
+  trigger_key: KEY_F9
+  sample_rate: 16000
+  wake_word: hey_jarvis
+  stt:
+    engine: faster_whisper
+    model: small.en
+    compute: int8
+  tts:
+    engine: piper
+    voice: en_US-lessac-medium

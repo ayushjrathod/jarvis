@@ -20,7 +20,7 @@ Every working session MUST:
 
 | Phase | Scope | Status |
 |---|---|---|
-| A | Dispatcher core (API, queue watcher, classifier, headless runner, refusal fallback, SQLite logging, hooks) | **design proposed — awaiting approval** |
+| A | Dispatcher core (API, queue watcher, classifier, headless runner, refusal fallback, SQLite logging, hooks) | **implemented, acceptance passing — awaiting user review** |
 | B | Jarvis voice pipeline on the dispatcher | not started |
 | C | Tasks/work vertical slice + daily brief + weekly review | not started |
 | D | React dashboard | not started |
@@ -104,6 +104,22 @@ before writing from scratch.
 - Boring, readable code — one maintainer. Each component independently testable;
   smoke tests minimum.
 - Deferred (do not build): other life areas, cloud Routines, multi-agent fan-out.
+
+## Operational notes (learned Phase A)
+
+- Run the dispatcher: `.venv/bin/python -m dispatcher.main` (port 8765).
+  Tests: `.venv/bin/python -m unittest discover tests`. Acceptance:
+  `scripts/smoke_phase_a.sh` (needs the server running).
+- The `claude` command is a zsh alias; subprocesses must exec
+  `/home/ayra/.local/bin/claude` with `CLAUDE_CONFIG_DIR=~/.claude-per`
+  (set in config.yaml). This CLI (2.1.201) has **no `--max-turns`**; guardrails
+  are `--allowedTools` + `--max-budget-usd` + wall-clock timeout.
+- A bare `claude -p` run carries ~$0.15–0.25 notional cost (system-prompt
+  overhead) — budget caps below that always trip `error_max_budget_usd`.
+- **No API credentials on this machine** (subscription OAuth only): quick path
+  auto-falls back from Messages API to `claude -p` stream-json
+  (`quick_backend: auto`). Adding `ANTHROPIC_API_KEY` flips it to the
+  low-latency Messages API path with server-side refusal fallbacks.
 
 ## Known quirks / open items
 
