@@ -1,50 +1,46 @@
 # STATE — read me first each session
 
-_Last updated: 2026-07-05 (session 1, end)_
+_Last updated: 2026-07-06 (session 1, end)_
 
 ## Current phase
 
-**Phase A (dispatcher core) — implemented, all acceptance criteria passing.
-STOPPED for user review per working-style gate.** Phase B (Jarvis voice
-pipeline) starts only after the user signs off on Phase A.
+**Phase B (Jarvis voice pipeline) — implemented, headless acceptance 10/10.
+STOPPED per user instruction ("do phase B and stop").** User granted autonomy
+through the remaining phases earlier but then scoped this session to B; get a
+go-ahead before starting Phase C. User will hardware-test everything at the end.
 
-## What exists and works (verified 2026-07-05)
+## What exists and works
 
-- `dispatcher/` — FastAPI service on :8765: POST /task (quick→SSE stream,
-  agentic→202+ack), GET /task/{id}, /tasks, /events (SSE lifecycle feed),
-  /health, POST /task/{id}/cancel. Service layer is the single dispatch path.
-- Quick path: streamed answer, run row with cost/tokens ("capital of France"
-  → Paris, ~$0.04 warm). Backend auto-selects claude_cli (no API creds on
-  machine — see CLAUDE.md operational notes).
-- Agentic path: headless `claude -p` with allowedTools + budget + timeout;
-  summarize acceptance task wrote vault/briefs/test.md, cost $0.39, 5 turns.
-- Refusal→fallback: simulated via metadata.simulate_refusal; runs logged
-  refused(fable default) → done(claude-opus-4-8); task done.
-- Queue watcher: drop .md in queue/ → task; processed files archived with
-  task id; answer stored in run row.
-- 11 unit tests green (`python -m unittest discover tests`).
-- `jarvis/plugins/base.py` — the four approved voice ABCs (Phase B fills in
-  engines/).
+- Phase A dispatcher (see 2026-07-05 log) — unchanged, still passing.
+- Phase B voice pipeline: engines behind the four ABCs (faster-whisper,
+  openwakeword 0.4.0, Piper, DispatcherBrain), VAD utility, audio I/O with
+  interruptible player, evdev hotkey, sanitizer+chunker, main loop (PTT + wake
+  + barge-in), dictation mode. 24 unit tests green; smoke_phase_b.py 10/10
+  against a live dispatcher (TTS-synthesized speech drives wake/VAD/STT).
+- Voice models cached under data/models/ (silero_vad.onnx, piper voice) and
+  in-package (hey_jarvis) / HF cache (whisper small.en).
+
+## Hardware still untested (user, at the end)
+
+Mic capture, F9 hold (needs `input` group), speakers, real barge-in (echo
+caveat: use headphones or PipeWire echo-cancel — noted in CLAUDE.md).
 
 ## Next action
 
-1. User reviews Phase A → sign-off or change requests.
-2. Phase B on approval: clone OpenVoiceOS + OpenClaw into references/ (lift
-   plugin discipline + streaming TTS loop/sanitizer), refactor
-   jarvis/ptt_dictate.py record+transcribe into STTEngine, PTT → wake word →
-   VAD, barge-in.
+1. User go-ahead → Phase C: areas/tasks skill, area-aware agentic dispatch
+   (inject area SKILL.md into claude -p runs), task capture into vault/tasks/,
+   daily-brief + weekly-review agents, systemd user timers. Gmail MCP optional
+   (needs user OAuth; brief must degrade gracefully without it).
+2. Then Phase D (React dashboard over /events + /task), Phase E (systemd).
 
 ## Open questions for the user
 
-- eleanorkonik "build-a-dashboard" gist: couldn't locate without a URL; queue
-  pattern + SQLite pragmas were implemented from the approved design instead.
-  If you have the link, drop it in — happy to cross-check and lift the backup
-  habits for the nightly-backup timer (Phase E).
-- Budgets in config.yaml (quick 1.00 / agentic 3.00 notional USD) — sane?
+- eleanorkonik build-a-dashboard gist URL still unknown (non-blocking).
+- Phase C daily-brief timer time-of-day preference (defaulting to 07:30 local
+  unless told otherwise).
 
-## Standing decisions this session
+## Standing decisions
 
-- This directory is the monorepo root; git initialized (main branch).
-- Deviations from proposed Phase A design (all logged in
-  context/sessions/2026-07-05-1.md): no --max-turns (CLI lacks it), dual quick
-  backend with auto-detect, heuristic-only classifier with LLM-tiebreak hook.
+- Monorepo root = this dir; git on main. openwakeword pinned 0.4.0 (Py 3.14 /
+  tflite); Silero VAD context-sample fix in jarvis/vad.py; wake reset flushes
+  zeros — details in CLAUDE.md operational notes + session logs.

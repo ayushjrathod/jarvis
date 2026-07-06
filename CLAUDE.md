@@ -21,7 +21,7 @@ Every working session MUST:
 | Phase | Scope | Status |
 |---|---|---|
 | A | Dispatcher core (API, queue watcher, classifier, headless runner, refusal fallback, SQLite logging, hooks) | **implemented, acceptance passing — awaiting user review** |
-| B | Jarvis voice pipeline on the dispatcher | not started |
+| B | Jarvis voice pipeline on the dispatcher | **implemented, headless acceptance passing — mic/hotkey hardware untested, awaiting user review** |
 | C | Tasks/work vertical slice + daily brief + weekly review | not started |
 | D | React dashboard | not started |
 | E | systemd wrap-up | not started |
@@ -120,6 +120,25 @@ before writing from scratch.
   auto-falls back from Messages API to `claude -p` stream-json
   (`quick_backend: auto`). Adding `ANTHROPIC_API_KEY` flips it to the
   low-latency Messages API path with server-side refusal fallbacks.
+
+## Operational notes (learned Phase B)
+
+- Run Jarvis: `.venv/bin/python -m jarvis.main --mode ptt|wake|both` (needs the
+  dispatcher up). Dictation: `python -m jarvis.dictate`. Models via
+  `scripts/setup_voice.sh`; headless acceptance: `scripts/smoke_phase_b.py`
+  (TTS-generated speech drives wake/VAD/STT — no mic needed).
+- **openwakeword pinned at 0.4.0** (0.5+ needs tflite-runtime; no Python 3.14
+  wheels). 0.4.0 bundles hey_jarvis ONNX in-package. Its `reset()` doesn't
+  clear the mel-spec buffer — engine flushes 2s of zeros instead (else stale
+  audio re-fires the wake word).
+- **Silero VAD v5 ONNX needs 64 context samples** prepended to each 512-sample
+  frame (jarvis/vad.py handles it); bare 512 frames give near-zero probs.
+- **Barge-in echo caveat**: without echo cancellation the mic hears Jarvis
+  itself through speakers. Use headphones or PipeWire echo-cancel
+  (`pactl load-module module-echo-cancel`) until tuned.
+- Warm-load times (this CPU): all four models ~3s; STT of a short utterance
+  ~1.1s; TTS starts instantly. Quick-path first delta ~3-5s on the CLI
+  backend (Messages API path will cut this substantially).
 
 ## Known quirks / open items
 

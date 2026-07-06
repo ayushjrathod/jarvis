@@ -50,11 +50,17 @@ dispatcher:
 jarvis:
   trigger_key: KEY_F9
   sample_rate: 16000
-  wake_word: hey_jarvis
+  wake_word: hey_jarvis        # stock openWakeWord model name
+  wake_threshold: 0.5
   stt:
     engine: faster_whisper
     model: small.en
     compute: int8
   tts:
     engine: piper
-    voice: en_US-lessac-medium
+    voice: en_US-lessac-medium # Kokoro-82M drops in here later (TTSEngine ABC)
+  # VAD endpointing + barge-in (32ms frames)
+  vad_threshold: 0.5
+  endpoint_silence_ms: 900     # stop capture after this much trailing silence
+  max_utterance_s: 30
+  barge_in_frames: 6           # 6 x 32ms ≈ 192ms of speech cuts TTS + aborts call
