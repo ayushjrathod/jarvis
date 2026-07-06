@@ -40,12 +40,15 @@ def resolve_backend(cfg: Config) -> str:
     return "messages_api" if has_creds else "claude_cli"
 
 
-async def stream(text: str, cfg: Config, model_override: str | None = None):
+async def stream(text: str, cfg: Config, model_override: str | None = None,
+                 tools: list[str] | None = None, context: str = ""):
     backend = resolve_backend(cfg)
+    if tools and backend == "messages_api":
+        backend = "claude_cli"  # file-reading quick queries need CLI tool access
     if backend == "messages_api":
         agen = _stream_api(text, cfg, model_override)
     else:
-        agen = _stream_cli(text, cfg, model_override)
+        agen = _stream_cli(text, cfg, model_override, tools, context)
     async for item in agen:
         yield item
 
@@ -89,15 +92,19 @@ async def _stream_api(text: str, cfg: Config, model_override: str | None):
     })
 
 
-async def _stream_cli(text: str, cfg: Config, model_override: str | None):
+async def _stream_cli(text: str, cfg: Config, model_override: str | None,
+                      tools: list[str] | None = None, context: str = ""):
+    system = QUICK_SYSTEM + ("\n\n" + context if context else "")
     cmd = [
         cfg.claude_bin, "-p", text,
         "--output-format", "stream-json",
         "--include-partial-messages",
         "--verbose",
         "--max-budget-usd", str(cfg.budgets.get("quick_max_cost_usd", 0.10)),
-        "--system-prompt", QUICK_SYSTEM,
+        "--system-prompt", system,
     ]
+    if tools:
+        cmd += ["--allowedTools", ",".join(tools)]
     if model_override:
         cmd += ["--model", model_override]
     env = dict(os.environ)

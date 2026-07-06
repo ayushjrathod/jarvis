@@ -1,0 +1,9 @@
+[Unit]
+Description=Mission Control: submit the daily brief agent to the dispatcher
+# Phase E adds the dispatcher unit + After=/Requires= ordering; until then a
+# failed run just journals "dispatcher unreachable".
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Documents/code/jarvis
+ExecStart=%h/Documents/code/jarvis/.venv/bin/python scripts/run_agent.py tasks daily-brief

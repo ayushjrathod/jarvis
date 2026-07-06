@@ -15,9 +15,10 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import queue_watcher
+from . import queue_watcher, vault
 from .quick import resolve_backend
 from .config import Config
 from .service import Service, make_ack
@@ -53,14 +54,14 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
     @app.post("/task")
     async def post_task(t: TaskIn):
-        kind = svc.decide_kind(t.text, t.mode)
+        kind, area = svc.route(t.text, t.mode, t.area)
         if kind == "agentic":
-            task = await svc.submit(t.text, t.source, "agentic", t.area, t.metadata)
+            task = await svc.submit(t.text, t.source, "agentic", area, t.metadata)
             return JSONResponse(status_code=202, content={
                 "task_id": task["id"], "kind": "agentic",
                 "status": "queued", "ack": make_ack(t.text),
             })
-        task = await svc.create_task(t.text, t.source, "quick", t.area, t.metadata)
+        task = await svc.create_task(t.text, t.source, "quick", area, t.metadata)
 
         async def gen():
             async for event, payload in svc.stream_quick(task):
@@ -112,6 +113,35 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             "quick_backend": resolve_backend(cfg),
             "running_tasks": len(svc.bg),
         }
+
+    # -- vault endpoints for the dashboard (mechanical file I/O, no Claude) --
+
+    vault_dir = cfg.root / "vault"
+
+    @app.get("/vault/tasks")
+    async def vault_tasks():
+        return vault.list_tasks(vault_dir)
+
+    @app.post("/vault/tasks/{filename}/toggle")
+    async def vault_toggle(filename: str):
+        try:
+            return vault.toggle_task(vault_dir, filename)
+        except FileNotFoundError:
+            raise HTTPException(404, "no such task file")
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    @app.get("/vault/brief")
+    async def vault_brief():
+        brief = vault.current_brief(vault_dir)
+        if not brief:
+            raise HTTPException(404, "no briefs yet")
+        return brief
+
+    # serve the built dashboard, if present (mounted last: API routes win)
+    ui_dist = cfg.root / "ui" / "dist"
+    if ui_dist.is_dir():
+        app.mount("/", StaticFiles(directory=ui_dist, html=True), name="ui")
 
     return app
 

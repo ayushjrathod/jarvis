@@ -1,0 +1,7 @@
+[Unit]
+Description=Mission Control: submit the weekly review agent to the dispatcher
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Documents/code/jarvis
+ExecStart=%h/Documents/code/jarvis/.venv/bin/python scripts/run_agent.py tasks weekly-review

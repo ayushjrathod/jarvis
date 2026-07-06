@@ -9,6 +9,7 @@ import json
 import logging
 
 from . import quick, runner
+from .areas import AreaRegistry
 from .classifier import classify
 from .config import Config
 from .db import Database
@@ -36,6 +37,7 @@ class Service:
         self.sem = asyncio.Semaphore(cfg.max_concurrent_agentic)
         self.procs: dict = {}      # task_id -> subprocess (for cancel/barge-in)
         self.bg: dict = {}         # task_id -> asyncio.Task
+        self.areas = AreaRegistry(cfg.root / "areas")
 
     async def fire(self, event: str, task: dict, **extra):
         payload = {
@@ -48,8 +50,14 @@ class Service:
         }
         await self.hooks.fire(payload)
 
-    def decide_kind(self, text: str, mode: str) -> str:
-        return mode if mode in ("quick", "agentic") else classify(text)
+    def route(self, text: str, mode: str, area: str | None = None) -> tuple[str, str | None]:
+        """(kind, area). Area quick_triggers beat triggers beat the classifier;
+        an explicit mode always wins the kind, an explicit area wins the area."""
+        matched, hint = self.areas.match(text)
+        area_name = area or (matched.name if matched else None)
+        if mode in ("quick", "agentic"):
+            return mode, area_name
+        return (hint or classify(text)), area_name
 
     async def create_task(self, text, source, kind, area=None, metadata=None) -> dict:
         task = self.db.create_task(text, source, kind, area, metadata)
@@ -60,8 +68,8 @@ class Service:
         """Fire-and-forget entry point (queue watcher, timers). Quick tasks run
         in the background with output stored in the run row; HTTP clients that
         want streamed quick answers go through create_task + stream_quick."""
-        kind = self.decide_kind(text, mode)
-        task = await self.create_task(text, source, kind, area, metadata)
+        kind, area_name = self.route(text, mode, area)
+        task = await self.create_task(text, source, kind, area_name, metadata)
         if kind == "agentic":
             self.start_agentic(task)
         else:
@@ -77,13 +85,20 @@ class Service:
         await self.fire("started", task)
         yield ("task", {"task_id": task["id"], "kind": "quick"})
 
+        area = self.areas.get(task["area"]) if task.get("area") else None
+        q_tools = area.quick_allowed_tools if area else None
+        q_context = area.context() if area else ""
+
         models = [None, self.cfg.models.get("fallback", "claude-opus-4-8")]
         for attempt, model_override in enumerate(models, start=1):
             label = model_override or self.cfg.models.get("quick") or "cli-default"
             run_id = self.db.create_run(task["id"], attempt, label)
             meta, collected = {}, []
             try:
-                async for kind, payload in quick.stream(task["text"], self.cfg, model_override):
+                async for kind, payload in quick.stream(
+                    task["text"], self.cfg, model_override,
+                    tools=q_tools, context=q_context,
+                ):
                     if kind == "delta":
                         collected.append(payload)
                         yield ("delta", {"text": payload})
@@ -145,7 +160,13 @@ class Service:
         self.db.set_task_status(task["id"], "running")
         await self.fire("started", task)
         meta = json.loads(task["metadata"]) if task.get("metadata") else {}
-        tools = self.cfg.tools_for(meta.get("task_type") or task.get("area"))
+        area = self.areas.get(task["area"]) if task.get("area") else None
+        tools = (
+            meta.get("allowed_tools")                                # agent-file override
+            or (area.allowed_tools if area and area.allowed_tools else None)
+            or self.cfg.tools_for(meta.get("task_type"))
+        )
+        system_extra = area.context() if area else ""
         attempts = [
             (1, self.cfg.models.get("agentic")),
             (2, self.cfg.models.get("fallback", "claude-opus-4-8")),
@@ -160,7 +181,8 @@ class Service:
                           "error": "simulated refusal (metadata.simulate_refusal)"}
             else:
                 result = await runner.run_once(
-                    task["text"], self.cfg, model, tools, self.procs, task["id"]
+                    task["text"], self.cfg, model, tools, self.procs, task["id"],
+                    system_extra=system_extra,
                 )
             output_path = runner.guess_output_path(task["text"], self.cfg.root)
             self.db.finish_run(

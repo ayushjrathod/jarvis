@@ -45,13 +45,14 @@ def guess_output_path(task_text: str, root) -> str | None:
 
 
 async def run_once(text: str, cfg: Config, model: str | None, tools: list[str],
-                   procs: dict, task_id: str) -> dict:
+                   procs: dict, task_id: str, system_extra: str = "") -> dict:
     """One `claude -p` attempt. Returns normalized result fields."""
+    system = AGENT_SYSTEM + ("\n\n" + system_extra if system_extra else "")
     cmd = [
         cfg.claude_bin, "-p", text,
         "--output-format", "json",
         "--max-budget-usd", str(cfg.budgets.get("max_cost_per_task_usd", 0.50)),
-        "--append-system-prompt", AGENT_SYSTEM,
+        "--append-system-prompt", system,
     ]
     if tools:
         cmd += ["--allowedTools", ",".join(tools)]

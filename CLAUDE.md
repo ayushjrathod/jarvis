@@ -21,8 +21,8 @@ Every working session MUST:
 | Phase | Scope | Status |
 |---|---|---|
 | A | Dispatcher core (API, queue watcher, classifier, headless runner, refusal fallback, SQLite logging, hooks) | **implemented, acceptance passing — awaiting user review** |
-| B | Jarvis voice pipeline on the dispatcher | **implemented, headless acceptance passing — mic/hotkey hardware untested, awaiting user review** |
-| C | Tasks/work vertical slice + daily brief + weekly review | not started |
+| B | Jarvis voice pipeline on the dispatcher | **done — user-verified on hardware 2026-07-06** |
+| C | Tasks/work vertical slice + daily brief + weekly review | **implemented, acceptance passing — Gmail MCP left to user OAuth** |
 | D | React dashboard | not started |
 | E | systemd wrap-up | not started |
 
