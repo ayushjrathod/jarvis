@@ -25,6 +25,7 @@ from jarvis.config import JarvisConfig
 from jarvis.hotkey import HotkeyWatcher
 from jarvis.sanitize import SentenceChunker, sanitize
 from jarvis.vad import FRAME_SAMPLES, SileroVAD
+from jarvis.wake_capture import capture_after_wake
 
 log = logging.getLogger("jarvis")
 
@@ -203,46 +204,18 @@ class Jarvis:
 
     def _wake_capture_once(self) -> np.ndarray | None:
         sr = self.cfg.sample_rate
+        prebuffer_frames = max(0, self.cfg.wake_prebuffer_ms // 32)
         with MicStream(sr, FRAME_SAMPLES) as mic:
-            # phase 1: wait for the wake word
-            while True:
-                if self.busy.locked():  # don't trigger while speaking/thinking
-                    mic.drain()
-                    threading.Event().wait(0.2)
-                    continue
-                frame = mic.read()
-                if frame is None or len(frame) != FRAME_SAMPLES:
-                    continue
-                if self.wake.process(frame):
-                    break
-            self.wake.reset()
-            log.info("wake word detected, listening…")
+            def on_busy():  # don't trigger while speaking/thinking
+                mic.drain()
+                threading.Event().wait(0.2)
 
-            # phase 2: VAD-endpointed capture
-            self.vad.reset()
-            frames: list[np.ndarray] = []
-            silence_frames = 0
-            silence_limit = self.cfg.endpoint_silence_ms // 32
-            max_frames = self.cfg.max_utterance_s * sr // FRAME_SAMPLES
-            heard_speech = False
-            waited = 0
-            while len(frames) < max_frames:
-                frame = mic.read()
-                if frame is None:
-                    continue
-                frames.append(frame)
-                if self.vad.is_speech(frame):
-                    heard_speech = True
-                    silence_frames = 0
-                elif heard_speech:
-                    silence_frames += 1
-                    if silence_frames >= silence_limit:
-                        break
-                else:
-                    waited += 1
-                    if waited > 5 * sr // FRAME_SAMPLES:  # 5s of nothing
-                        return None
-            return np.concatenate(frames) if heard_speech else None
+            return capture_after_wake(
+                mic.read, self.wake, self.vad, self.cfg,
+                prebuffer_frames=prebuffer_frames,
+                is_busy=self.busy.locked, on_busy=on_busy,
+                on_wake=lambda: log.info("wake word detected, listening…"),
+            )
 
     async def notices_loop(self):
         async for ev in self.brain.notices():

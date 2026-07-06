@@ -18,6 +18,9 @@ class JarvisConfig:
     sample_rate: int = 16000
     wake_word: str = "hey_jarvis"
     wake_threshold: float = 0.5
+    # rolling audio kept before wake-word detection fires, spliced onto the
+    # front of the capture so the first word isn't clipped
+    wake_prebuffer_ms: int = 400
     stt: dict = field(default_factory=lambda: {"engine": "faster_whisper", "model": "small.en", "compute": "int8"})
     tts: dict = field(default_factory=lambda: {"engine": "piper", "voice": "en_US-lessac-medium"})
     dispatcher_url: str = "http://127.0.0.1:8765"
@@ -41,6 +44,7 @@ class JarvisConfig:
         cfg.sample_rate = j.get("sample_rate", cfg.sample_rate)
         cfg.wake_word = j.get("wake_word", cfg.wake_word)
         cfg.wake_threshold = j.get("wake_threshold", cfg.wake_threshold)
+        cfg.wake_prebuffer_ms = j.get("wake_prebuffer_ms", cfg.wake_prebuffer_ms)
         cfg.stt = {**cfg.stt, **(j.get("stt") or {})}
         cfg.tts = {**cfg.tts, **(j.get("tts") or {})}
         cfg.vad_threshold = j.get("vad_threshold", cfg.vad_threshold)

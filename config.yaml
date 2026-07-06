@@ -54,6 +54,7 @@ jarvis:
   sample_rate: 16000
   wake_word: hey_jarvis        # stock openWakeWord model name
   wake_threshold: 0.5
+  wake_prebuffer_ms: 400       # rolling audio kept before wake fires, spliced onto capture
   stt:
     engine: faster_whisper
     model: small.en

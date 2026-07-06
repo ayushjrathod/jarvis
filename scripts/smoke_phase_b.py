@@ -22,6 +22,7 @@ from jarvis import engines
 from jarvis.config import JarvisConfig
 from jarvis.sanitize import SentenceChunker
 from jarvis.vad import FRAME_SAMPLES, SileroVAD
+from jarvis.wake_capture import capture_after_wake
 
 PASS, FAIL = 0, 0
 
@@ -84,6 +85,47 @@ def main():
         wake.process(silence[i:i + 1280]) for i in range(0, len(silence) - 1280, 1280)
     )
     check("wake word silent on silence", not false_fire)
+
+    # -- pre-wake-word ring buffer (adaptation-audit item 4): the first word
+    # right after "hey jarvis" must survive, not get clipped by wake latency --
+    def frame_source(audio):
+        pos = 0
+
+        def read():
+            nonlocal pos
+            if pos + FRAME_SAMPLES > len(audio):
+                return np.zeros(FRAME_SAMPLES, dtype=np.int16)
+            frame = audio[pos:pos + FRAME_SAMPLES]
+            pos += FRAME_SAMPLES
+            return frame
+
+        return read
+
+    wake_phrase_audio = resample(
+        tts_say(tts, "Hey Jarvis, what time is it right now"), tts.sample_rate, cfg.sample_rate
+    )
+    combined = np.concatenate([wake_phrase_audio, np.zeros(cfg.sample_rate, dtype=np.int16)])
+
+    wake.reset()
+    vad.reset()
+    audio_buffered = capture_after_wake(
+        frame_source(combined), wake, vad, cfg,
+        prebuffer_frames=cfg.wake_prebuffer_ms // 32,
+    )
+    wake.reset()
+    vad.reset()
+    audio_unbuffered = capture_after_wake(frame_source(combined), wake, vad, cfg, prebuffer_frames=0)
+
+    buffered_len = 0 if audio_buffered is None else len(audio_buffered)
+    unbuffered_len = 0 if audio_unbuffered is None else len(audio_unbuffered)
+    check("pre-wake buffer captures extra audio ahead of the wake trigger",
+          audio_buffered is not None and audio_unbuffered is not None and buffered_len > unbuffered_len,
+          f"buffered={buffered_len} samples, unbuffered={unbuffered_len} samples")
+
+    if audio_buffered is not None:
+        transcript = stt.transcribe(audio_buffered)
+        check("first word after wake word survives in transcript",
+              "time" in transcript.lower(), transcript)
 
     # -- VAD: speech vs silence ------------------------------------------------
     vad.reset()
