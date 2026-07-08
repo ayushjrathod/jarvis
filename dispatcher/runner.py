@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 
 from .config import Config
+
+log = logging.getLogger("dispatcher.runner")
 
 AGENT_SYSTEM = (
     "You are an unattended background agent of the mission-control system. "
@@ -44,9 +47,39 @@ def guess_output_path(task_text: str, root) -> str | None:
     return None
 
 
+# Whitelist for the one-time transient retry below: a spawn error (CLI binary
+# momentarily missing/unreadable) or a wall-clock timeout. Never retried here:
+# refusals and budget-exceeded, which are deliberate terminal outcomes handled
+# by the caller's model-fallback logic instead.
+SPAWN_ERRORS = (OSError,)
+
+
 async def run_once(text: str, cfg: Config, model: str | None, tools: list[str],
                    procs: dict, task_id: str, system_extra: str = "") -> dict:
-    """One `claude -p` attempt. Returns normalized result fields."""
+    """One `claude -p` attempt (with one internal retry on a transient
+    spawn/timeout error). Returns normalized result fields."""
+    for attempt in (1, 2):
+        try:
+            return await _attempt(text, cfg, model, tools, procs, task_id, system_extra)
+        except _Timeout as exc:
+            if attempt == 2:
+                return {"status": "timeout", "error": str(exc)}
+        except SPAWN_ERRORS as exc:
+            if attempt == 2:
+                return {"status": "failed", "error": f"spawn error: {exc}"}
+        delay = cfg.budgets.get("transient_retry_delay_s", 2)
+        log.warning("transient error on task %s attempt %d, retrying in %ss", task_id, attempt, delay)
+        await asyncio.sleep(delay)
+
+
+class _Timeout(Exception):
+    def __init__(self, seconds):
+        super().__init__(f"killed after {seconds}s")
+        self.seconds = seconds
+
+
+async def _attempt(text: str, cfg: Config, model: str | None, tools: list[str],
+                    procs: dict, task_id: str, system_extra: str = "") -> dict:
     system = AGENT_SYSTEM + ("\n\n" + system_extra if system_extra else "")
     cmd = [
         cfg.claude_bin, "-p", text,
@@ -73,7 +106,7 @@ async def run_once(text: str, cfg: Config, model: str | None, tools: list[str],
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
-        return {"status": "timeout", "error": f"killed after {timeout}s"}
+        raise _Timeout(timeout)
     finally:
         procs.pop(task_id, None)
 

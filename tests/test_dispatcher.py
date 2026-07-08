@@ -3,14 +3,17 @@
 Run: .venv/bin/python -m unittest discover tests
 """
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from dispatcher.classifier import classify
+from dispatcher.config import Config
 from dispatcher.db import Database
 from dispatcher.queue_watcher import _ingest_one, parse_task_file
-from dispatcher.runner import is_refusal
+from dispatcher.runner import is_refusal, run_once
 from dispatcher.service import make_ack
 
 
@@ -185,6 +188,107 @@ class TestQueueIngestRetry(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(f.exists())
         self.assertTrue((self.processed / "t.t1.md").exists())
         self.assertEqual(retries, {})
+
+
+class _FakeProc:
+    def __init__(self, communicate_result=None, communicate_delay=0.0, returncode=0):
+        self._result = communicate_result or (b'{"result": "ok", "is_error": false}', b"")
+        self._delay = communicate_delay
+        self.returncode = returncode
+        self.killed = False
+
+    async def communicate(self):
+        if self._delay:
+            await asyncio.sleep(self._delay)
+        return self._result
+
+    def kill(self):
+        self.killed = True
+
+    async def wait(self):
+        return None
+
+
+def _test_cfg(**budgets):
+    cfg = Config(root=Path("."))
+    cfg.claude_bin = "claude"
+    cfg.budgets = {"timeout_s": 5, "transient_retry_delay_s": 0, **budgets}
+    return cfg
+
+
+class TestRunnerTransientRetry(unittest.IsolatedAsyncioTestCase):
+    async def test_spawn_error_then_success_retries_once(self):
+        cfg = _test_cfg()
+        good_proc = _FakeProc()
+        with patch(
+            "dispatcher.runner.asyncio.create_subprocess_exec",
+            AsyncMock(side_effect=[OSError("no such file"), good_proc]),
+        ) as mock_spawn:
+            result = await run_once("do it", cfg, None, [], {}, "task1")
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(mock_spawn.call_count, 2)
+
+    async def test_spawn_error_twice_fails_after_one_retry(self):
+        cfg = _test_cfg()
+        with patch(
+            "dispatcher.runner.asyncio.create_subprocess_exec",
+            AsyncMock(side_effect=[OSError("a"), OSError("b")]),
+        ) as mock_spawn:
+            result = await run_once("do it", cfg, None, [], {}, "task1")
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("spawn error", result["error"])
+        self.assertEqual(mock_spawn.call_count, 2)
+
+    async def test_timeout_then_success_retries_once(self):
+        cfg = _test_cfg(timeout_s=0.05)
+        slow_proc = _FakeProc(communicate_delay=1.0)
+        good_proc = _FakeProc()
+        with patch(
+            "dispatcher.runner.asyncio.create_subprocess_exec",
+            AsyncMock(side_effect=[slow_proc, good_proc]),
+        ) as mock_spawn:
+            result = await run_once("do it", cfg, None, [], {}, "task1")
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(mock_spawn.call_count, 2)
+        self.assertTrue(slow_proc.killed)
+
+    async def test_timeout_twice_returns_timeout_status(self):
+        cfg = _test_cfg(timeout_s=0.05)
+        slow_proc_1 = _FakeProc(communicate_delay=1.0)
+        slow_proc_2 = _FakeProc(communicate_delay=1.0)
+        with patch(
+            "dispatcher.runner.asyncio.create_subprocess_exec",
+            AsyncMock(side_effect=[slow_proc_1, slow_proc_2]),
+        ) as mock_spawn:
+            result = await run_once("do it", cfg, None, [], {}, "task1")
+        self.assertEqual(result["status"], "timeout")
+        self.assertEqual(mock_spawn.call_count, 2)
+
+    async def test_refusal_is_not_retried(self):
+        cfg = _test_cfg()
+        refusal_proc = _FakeProc(
+            communicate_result=(b'{"stop_reason": "refusal"}', b"")
+        )
+        with patch(
+            "dispatcher.runner.asyncio.create_subprocess_exec",
+            AsyncMock(side_effect=[refusal_proc]),
+        ) as mock_spawn:
+            result = await run_once("do it", cfg, None, [], {}, "task1")
+        self.assertEqual(result["status"], "refused")
+        self.assertEqual(mock_spawn.call_count, 1)
+
+    async def test_budget_error_is_not_retried(self):
+        cfg = _test_cfg()
+        budget_proc = _FakeProc(
+            communicate_result=(b'{"is_error": true, "subtype": "error_max_budget_usd"}', b"")
+        )
+        with patch(
+            "dispatcher.runner.asyncio.create_subprocess_exec",
+            AsyncMock(side_effect=[budget_proc]),
+        ) as mock_spawn:
+            result = await run_once("do it", cfg, None, [], {}, "task1")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(mock_spawn.call_count, 1)
 
 
 if __name__ == "__main__":

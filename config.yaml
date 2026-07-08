@@ -33,6 +33,7 @@ dispatcher:
     quick_max_cost_usd: 1.00
     timeout_s: 600                # wall-clock kill for agentic runs
     quick_max_tokens: 1024
+    transient_retry_delay_s: 2    # backoff before the one retry on spawn/timeout error
 
   task_defaults:
     allowed_tools: [Read, Glob, Grep]   # read-only baseline for unattended runs
