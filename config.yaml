@@ -7,6 +7,7 @@ dispatcher:
   db: data/mission.db
   queue_dir: queue
   poll_interval_s: 5
+  queue_max_retries: 3   # transient ingest failures retried this many polls before .failed
   max_concurrent_agentic: 2
 
   # The claude aliases only exist in interactive zsh — invoke the binary directly.

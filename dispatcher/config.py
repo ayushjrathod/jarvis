@@ -17,6 +17,7 @@ class Config:
     db_path: Path = None
     queue_dir: Path = None
     poll_interval_s: float = 5.0
+    queue_max_retries: int = 3
     max_concurrent_agentic: int = 2
     claude_bin: str = "claude"
     claude_config_dir: str | None = None
@@ -44,6 +45,7 @@ class Config:
         cfg.db_path = rel(d.get("db", "data/mission.db"))
         cfg.queue_dir = rel(d.get("queue_dir", "queue"))
         cfg.poll_interval_s = d.get("poll_interval_s", cfg.poll_interval_s)
+        cfg.queue_max_retries = d.get("queue_max_retries", cfg.queue_max_retries)
         cfg.max_concurrent_agentic = d.get("max_concurrent_agentic", cfg.max_concurrent_agentic)
         cfg.claude_bin = d.get("claude_bin", cfg.claude_bin)
         cfg.claude_config_dir = d.get("claude_config_dir")

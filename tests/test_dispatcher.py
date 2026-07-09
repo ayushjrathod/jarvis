@@ -9,7 +9,7 @@ from pathlib import Path
 
 from dispatcher.classifier import classify
 from dispatcher.db import Database
-from dispatcher.queue_watcher import parse_task_file
+from dispatcher.queue_watcher import _ingest_one, parse_task_file
 from dispatcher.runner import is_refusal
 from dispatcher.service import make_ack
 
@@ -110,6 +110,81 @@ class TestAck(unittest.TestCase):
         ack = make_ack("summarize the files in vault notes into a brief please")
         self.assertTrue(ack.startswith("On it — summarize the files"))
         self.assertTrue(ack.endswith("…"))
+
+
+class _FakeService:
+    def __init__(self, submit_effect):
+        # submit_effect: either an exception instance to raise, or a dict to return
+        self.submit_effect = submit_effect
+        self.calls = 0
+
+    async def submit(self, **kwargs):
+        self.calls += 1
+        if isinstance(self.submit_effect, Exception):
+            raise self.submit_effect
+        return self.submit_effect
+
+
+class TestQueueIngestRetry(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.qdir = Path(self.tmp.name)
+        self.processed = self.qdir / ".processed"
+        self.failed = self.qdir / ".failed"
+        self.processed.mkdir()
+        self.failed.mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write(self, name, body="Do the thing.\n"):
+        f = self.qdir / name
+        f.write_text(body)
+        return f
+
+    async def test_terminal_error_moves_to_failed_immediately(self):
+        f = self._write("bad.md", body="")  # empty body -> ValueError, terminal
+        service = _FakeService(submit_effect={"id": "t1", "kind": "agentic"})
+        retries: dict = {}
+        await _ingest_one(f, service, self.processed, self.failed, retries, max_retries=3)
+        self.assertFalse(f.exists())
+        self.assertTrue((self.failed / "bad.md").exists())
+        self.assertEqual(retries, {})
+
+    async def test_transient_error_retries_in_place(self):
+        f = self._write("t.md")
+        service = _FakeService(submit_effect=OSError("disk hiccup"))
+        retries: dict = {}
+        await _ingest_one(f, service, self.processed, self.failed, retries, max_retries=3)
+        # left in place for next poll, not moved to .failed
+        self.assertTrue(f.exists())
+        self.assertFalse((self.failed / "t.md").exists())
+        self.assertEqual(retries["t.md"], 1)
+
+    async def test_transient_error_exhausts_retries_then_fails(self):
+        f = self._write("t.md")
+        service = _FakeService(submit_effect=OSError("disk hiccup"))
+        retries: dict = {}
+        for _ in range(3):
+            await _ingest_one(f, service, self.processed, self.failed, retries, max_retries=3)
+        self.assertTrue(f.exists())  # still in place after exactly max_retries attempts
+        await _ingest_one(f, service, self.processed, self.failed, retries, max_retries=3)
+        self.assertFalse(f.exists())
+        self.assertTrue((self.failed / "t.md").exists())
+        self.assertEqual(retries, {})
+
+    async def test_success_after_prior_transient_failure_clears_retry_count(self):
+        f = self._write("t.md")
+        service = _FakeService(submit_effect=OSError("disk hiccup"))
+        retries: dict = {}
+        await _ingest_one(f, service, self.processed, self.failed, retries, max_retries=3)
+        self.assertEqual(retries["t.md"], 1)
+
+        service.submit_effect = {"id": "t1", "kind": "agentic"}
+        await _ingest_one(f, service, self.processed, self.failed, retries, max_retries=3)
+        self.assertFalse(f.exists())
+        self.assertTrue((self.processed / "t.t1.md").exists())
+        self.assertEqual(retries, {})
 
 
 if __name__ == "__main__":

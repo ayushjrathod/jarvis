@@ -1,6 +1,11 @@
 """Drop-a-markdown-file task queue. Files in queue/*.md with optional YAML
 frontmatter (mode, area, ...) become tasks; processed files move to
 queue/.processed/<name>.<task_id>.md, unparseable ones to queue/.failed/.
+
+Transient failures (disk hiccup, dispatcher momentarily overloaded) are
+retried in place for up to `max_retries` polls before falling back to
+.failed; terminal failures (bad frontmatter, empty body) move to .failed
+immediately.
 """
 
 from __future__ import annotations
@@ -11,6 +16,47 @@ import logging
 import yaml
 
 log = logging.getLogger("dispatcher.queue")
+
+# Whitelist: only these are treated as transient (worth retrying). Anything
+# else (YAML errors, empty body, bad task shape) is terminal on first try.
+TRANSIENT_EXCEPTIONS = (OSError, ConnectionError, TimeoutError)
+
+DEFAULT_MAX_RETRIES = 3
+
+
+async def _ingest_one(f, service, processed, failed, retries: dict, max_retries: int) -> None:
+    try:
+        meta, body = parse_task_file(f.read_text())
+        if not body:
+            raise ValueError("empty task body")
+        task = await service.submit(
+            text=body,
+            source="queue",
+            mode=meta.get("mode", "auto"),
+            area=meta.get("area"),
+            metadata=meta or None,
+        )
+        f.rename(processed / f"{f.stem}.{task['id']}.md")
+        retries.pop(f.name, None)
+        log.info("queued %s as task %s (%s)", f.name, task["id"], task["kind"])
+    except Exception as exc:
+        if isinstance(exc, TRANSIENT_EXCEPTIONS):
+            n = retries.get(f.name, 0) + 1
+            if n <= max_retries:
+                retries[f.name] = n
+                log.warning(
+                    "transient error ingesting %s (attempt %d/%d), will retry: %s",
+                    f.name, n, max_retries, exc,
+                )
+                return
+            log.error("giving up on %s after %d transient retries: %s", f.name, max_retries, exc)
+        else:
+            log.exception("failed to ingest %s", f.name)
+        retries.pop(f.name, None)
+        try:
+            f.rename(failed / f.name)
+        except OSError:
+            pass
 
 
 def parse_task_file(text: str) -> tuple[dict, str]:
@@ -32,25 +78,9 @@ async def watch(service):
     for d in (qdir, processed, failed):
         d.mkdir(parents=True, exist_ok=True)
 
+    max_retries = getattr(cfg, "queue_max_retries", DEFAULT_MAX_RETRIES)
+    retries: dict[str, int] = {}
     while True:
         for f in sorted(qdir.glob("*.md")):
-            try:
-                meta, body = parse_task_file(f.read_text())
-                if not body:
-                    raise ValueError("empty task body")
-                task = await service.submit(
-                    text=body,
-                    source="queue",
-                    mode=meta.get("mode", "auto"),
-                    area=meta.get("area"),
-                    metadata=meta or None,
-                )
-                f.rename(processed / f"{f.stem}.{task['id']}.md")
-                log.info("queued %s as task %s (%s)", f.name, task["id"], task["kind"])
-            except Exception:
-                log.exception("failed to ingest %s", f.name)
-                try:
-                    f.rename(failed / f.name)
-                except OSError:
-                    pass
+            await _ingest_one(f, service, processed, failed, retries, max_retries)
         await asyncio.sleep(cfg.poll_interval_s)
