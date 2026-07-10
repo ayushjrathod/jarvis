@@ -1,0 +1,7 @@
+[Unit]
+Description=Mission Control nightly SQLite backup
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Documents/code/jarvis
+ExecStart=%h/Documents/code/jarvis/scripts/backup_db.sh

@@ -1,7 +1,7 @@
 [Unit]
 Description=Mission Control: submit the daily brief agent to the dispatcher
-# Phase E adds the dispatcher unit + After=/Requires= ordering; until then a
-# failed run just journals "dispatcher unreachable".
+After=mission-dispatcher.service
+Wants=mission-dispatcher.service
 
 [Service]
 Type=oneshot

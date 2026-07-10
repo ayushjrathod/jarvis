@@ -24,7 +24,7 @@ Every working session MUST:
 | B | Jarvis voice pipeline on the dispatcher | **done — user-verified on hardware 2026-07-06** |
 | C | Tasks/work vertical slice + daily brief + weekly review | **implemented, acceptance passing — Gmail MCP left to user OAuth** |
 | D | React dashboard | **implemented — served by dispatcher at :8765, headless-render verified** |
-| E | systemd wrap-up | not started |
+| E | systemd wrap-up | **implemented — units live, auto-restart verified; reboot test = user** |
 
 **STOP for user review at the end of each phase.** Before Phase A code: API schema,
 SQLite schema, and the four voice ABC signatures must be approved by the user.

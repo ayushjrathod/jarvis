@@ -1,5 +1,7 @@
 [Unit]
 Description=Mission Control: submit the weekly review agent to the dispatcher
+After=mission-dispatcher.service
+Wants=mission-dispatcher.service
 
 [Service]
 Type=oneshot

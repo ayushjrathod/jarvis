@@ -1,46 +1,43 @@
 # STATE — read me first each session
 
-_Last updated: 2026-07-06 (session 1, end)_
+_Last updated: 2026-07-06 (session 2, end)_
 
 ## Current phase
 
-**Phase B (Jarvis voice pipeline) — implemented, headless acceptance 10/10.
-STOPPED per user instruction ("do phase B and stop").** User granted autonomy
-through the remaining phases earlier but then scoped this session to B; get a
-go-ahead before starting Phase C. User will hardware-test everything at the end.
+**ALL FIVE PHASES BUILT AND VERIFIED.** v1 is feature-complete per the spec.
+The system is live under systemd user services right now. Awaiting the user's
+end-to-end hardware test (their stated plan) and reboot test.
 
-## What exists and works
+## What runs where (verified live)
 
-- Phase A dispatcher (see 2026-07-05 log) — unchanged, still passing.
-- Phase B voice pipeline: engines behind the four ABCs (faster-whisper,
-  openwakeword 0.4.0, Piper, DispatcherBrain), VAD utility, audio I/O with
-  interruptible player, evdev hotkey, sanitizer+chunker, main loop (PTT + wake
-  + barge-in), dictation mode. 24 unit tests green; smoke_phase_b.py 10/10
-  against a live dispatcher (TTS-synthesized speech drives wake/VAD/STT).
-- Voice models cached under data/models/ (silero_vad.onnx, piper voice) and
-  in-package (hey_jarvis) / HF cache (whisper small.en).
+- `mission-dispatcher.service` — enabled + running; dashboard at
+  http://127.0.0.1:8765/; crash auto-restart verified (kill -9 → new PID).
+- Timers enabled: mission-daily-brief 07:30, mission-weekly-review Sun 18:00,
+  mission-backup 03:30 (first backup already in data/backups/).
+- `mission-jarvis.service` — installed, **deliberately not enabled** (user
+  must be in `input` group + audio ready): `systemctl --user enable --now
+  mission-jarvis`. Manual run still works (`python -m jarvis.main`).
+- 31 unit tests green; smoke_phase_a.sh + smoke_phase_b.py both pass.
 
-## Hardware still untested (user, at the end)
+## What the user still needs to do
 
-Mic capture, F9 hold (needs `input` group), speakers, real barge-in (echo
-caveat: use headphones or PipeWire echo-cancel — noted in CLAUDE.md).
+1. `sudo usermod -aG input $USER` + re-login → then enable mission-jarvis.
+2. Reboot test (Phase E acceptance): after reboot,
+   `journalctl --user -u mission-* -b` should show clean startups. Consider
+   `loginctl enable-linger ayra` for boot-without-login.
+3. Optional: Gmail MCP (`claude-per mcp add gmail …`) → email section appears
+   in daily briefs automatically.
+4. Optional: `ANTHROPIC_API_KEY` → quick path switches to low-latency
+   Messages API (set it in mission-dispatcher.service env or shell).
 
-## Next action
+## Known caveats (details in CLAUDE.md + session logs)
 
-1. User go-ahead → Phase C: areas/tasks skill, area-aware agentic dispatch
-   (inject area SKILL.md into claude -p runs), task capture into vault/tasks/,
-   daily-brief + weekly-review agents, systemd user timers. Gmail MCP optional
-   (needs user OAuth; brief must degrade gracefully without it).
-2. Then Phase D (React dashboard over /events + /task), Phase E (systemd).
+- Barge-in needs headphones or PipeWire echo-cancel.
+- `Write(path)` allowedTools rules silently ignored — use `Edit(path/**)`.
+- Area triggers match as in-order word subsequences (dispatcher/areas.py).
+- Timers no-op (journal an error) if the dispatcher is down.
 
-## Open questions for the user
+## Deferred (per spec, do not build unprompted)
 
-- eleanorkonik build-a-dashboard gist URL still unknown (non-blocking).
-- Phase C daily-brief timer time-of-day preference (defaulting to 07:30 local
-  unless told otherwise).
-
-## Standing decisions
-
-- Monorepo root = this dir; git on main. openwakeword pinned 0.4.0 (Py 3.14 /
-  tflite); Silero VAD context-sample fix in jarvis/vad.py; wake reset flushes
-  zeros — details in CLAUDE.md operational notes + session logs.
+Other life areas, cloud Routines, multi-agent fan-out, media area (mpv/yt-dlp),
+Kokoro TTS swap.

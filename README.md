@@ -13,11 +13,11 @@ this machine — models on CPU, no cloud scheduling.
 
 | Phase | What | Status |
 |---|---|---|
-| A | Dispatcher (API, queue, classifier, headless runner, refusal fallback) | ✅ built + tested |
-| B | Jarvis voice pipeline (PTT, wake word, VAD, TTS, barge-in) | ✅ built, headless-tested — **your mic/keyboard test pending** |
-| C | Tasks area + daily brief + weekly review timers | not started |
-| D | React dashboard | not started |
-| E | systemd services + install script | not started |
+| A | Dispatcher (API, queue, classifier, headless runner, refusal fallback) | ✅ |
+| B | Jarvis voice pipeline (PTT, wake word, VAD, TTS, barge-in) | ✅ user-verified |
+| C | Tasks area + daily brief + weekly review timers | ✅ |
+| D | React dashboard (served by the dispatcher) | ✅ |
+| E | systemd services + install script + nightly backup | ✅ — **reboot test pending** |
 
 ## One-time setup
 
@@ -48,9 +48,30 @@ on subscription): a quick answer logs ~$0.04–0.10, an agentic task ~$0.40–1.
 
 ## Running
 
-### 1. Dispatcher (start this first, keep it running)
+**Everything runs as systemd user services now.** One-time install:
 
 ```bash
+./systemd/install.sh      # dispatcher + dashboard + all timers, auto-restart
+loginctl enable-linger $USER   # optional: start at boot without logging in
+```
+
+That starts the dispatcher (with the dashboard at **http://127.0.0.1:8765/**)
+and schedules: daily brief 07:30, weekly review Sun 18:00, DB backup 03:30
+(kept 14 days in `data/backups/`). Jarvis voice is installed but disabled
+until your mic/input-group setup is done: `systemctl --user enable --now
+mission-jarvis`. Logs: `journalctl --user -u mission-dispatcher -f` (same for
+`mission-jarvis`, `mission-daily-brief`, …).
+
+### Dashboard
+
+Open **http://127.0.0.1:8765/** — today's brief, task list (checkboxes update
+the vault files), live agent monitor, and a command box that behaves exactly
+like talking to Jarvis ("add a task: …" works typed).
+
+### Dispatcher by hand (dev)
+
+```bash
+systemctl --user stop mission-dispatcher   # get the port back first
 .venv/bin/python -m dispatcher.main        # serves 127.0.0.1:8765
 ```
 
@@ -80,7 +101,19 @@ mode: agentic
 Summarize this week's notes.
 ```
 
-### 2. Jarvis (voice)
+### Talking to the tasks area
+
+Voice or command box, same phrases: "add a task: renew the domain by friday" ·
+"list my open tasks" · "mark the domain task as done" · "morning brief" (reads
+today's brief aloud/streamed). Trigger words match loosely — "can you add a
+new task for me" works. Task files live in `vault/tasks/`, briefs in
+`vault/briefs/`.
+
+**Gmail in the daily brief (optional):** register a read-only Gmail MCP server
+in Claude Code (`claude-per mcp add gmail …` + OAuth). The brief agent uses it
+automatically when present and silently skips email when not.
+
+### Jarvis by hand (voice, dev)
 
 ```bash
 .venv/bin/python -m jarvis.main              # PTT + wake word
@@ -102,7 +135,7 @@ Summarize this week's notes.
   request. ⚠️ With speakers the mic hears Jarvis itself — use headphones, or:
   `pactl load-module module-echo-cancel` and select the echo-cancel source.
 
-### 3. Dictation mode (your original workflow)
+### Dictation mode (your original workflow)
 
 ```bash
 .venv/bin/python -m jarvis.dictate   # hold F9 → speak → types at cursor
@@ -113,7 +146,7 @@ Summarize this week's notes.
 ## Tests
 
 ```bash
-.venv/bin/python -m unittest discover tests   # 24 unit tests, no network
+.venv/bin/python -m unittest discover tests   # 31 unit tests, no network
 ./scripts/smoke_phase_a.sh                    # dispatcher acceptance (server must be up)
 .venv/bin/python scripts/smoke_phase_b.py     # voice acceptance, no mic needed
 ```
