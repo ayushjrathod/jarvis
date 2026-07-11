@@ -1,0 +1,79 @@
+// Dispatcher API helpers. POST /task answers either as SSE (quick) or JSON
+// 202 (agentic) — postTask() normalizes both.
+
+export const getJSON = (url) =>
+  fetch(url).then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status} ${url}`))));
+
+export const postJSON = (url, body) =>
+  fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body ?? {}),
+  }).then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status} ${url}`))));
+
+function parseSSEBlock(block) {
+  let event = null;
+  const data = [];
+  for (const line of block.split("\n")) {
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    else if (line.startsWith("data:")) data.push(line.slice(5).trim());
+  }
+  if (!event) return null;
+  try {
+    return { event, data: data.length ? JSON.parse(data.join("\n")) : {} };
+  } catch {
+    return { event, data: {} };
+  }
+}
+
+export async function postTask(text, { onDelta } = {}) {
+  const resp = await fetch("/task", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text, source: "ui" }),
+  });
+  const ctype = resp.headers.get("content-type") || "";
+  if (ctype.startsWith("application/json")) {
+    return { kind: "agentic", ...(await resp.json()) };
+  }
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  const result = { kind: "quick", text: "" };
+  let buf = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf("\n\n")) >= 0) {
+      const ev = parseSSEBlock(buf.slice(0, idx));
+      buf = buf.slice(idx + 2);
+      if (!ev) continue;
+      if (ev.event === "delta") {
+        result.text += ev.data.text ?? "";
+        onDelta?.(ev.data.text ?? "");
+      } else if (ev.event === "done") {
+        Object.assign(result, ev.data, { kind: "quick" });
+      } else if (ev.event === "task") {
+        result.task_id = ev.data.task_id;
+      }
+    }
+  }
+  return result;
+}
+
+const EVENT_NAMES = ["queued", "started", "done", "failed", "refused", "cancelled"];
+
+export function subscribeEvents(onEvent) {
+  const es = new EventSource("/events");
+  for (const name of EVENT_NAMES) {
+    es.addEventListener(name, (e) => {
+      try {
+        onEvent({ ...JSON.parse(e.data), event: name });
+      } catch {
+        onEvent({ event: name });
+      }
+    });
+  }
+  return () => es.close();
+}

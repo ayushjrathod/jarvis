@@ -23,7 +23,7 @@ Every working session MUST:
 | A | Dispatcher core (API, queue watcher, classifier, headless runner, refusal fallback, SQLite logging, hooks) | **implemented, acceptance passing — awaiting user review** |
 | B | Jarvis voice pipeline on the dispatcher | **done — user-verified on hardware 2026-07-06** |
 | C | Tasks/work vertical slice + daily brief + weekly review | **implemented, acceptance passing — Gmail MCP left to user OAuth** |
-| D | React dashboard | not started |
+| D | React dashboard | **implemented — served by dispatcher at :8765, headless-render verified** |
 | E | systemd wrap-up | not started |
 
 **STOP for user review at the end of each phase.** Before Phase A code: API schema,
