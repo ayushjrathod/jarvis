@@ -16,9 +16,11 @@ dispatcher:
 
   models:
     # quick path: Messages API when credentials exist, else claude -p stream-json
-    quick: claude-fable-5
-    # null = let the CLI use its configured default (currently Fable 5)
-    agentic: null
+    quick: claude-sonnet-5
+    # explicit so dispatcher runs don't inherit the CLI default (~/.claude-per settings)
+    agentic: claude-sonnet-5
+    # passed as --effort on all claude -p runs (quick CLI backend + agentic)
+    effort: medium
     # refusal fallback (locked decision #3)
     fallback: claude-opus-4-8
     classifier: claude-haiku-4-5
@@ -47,14 +49,18 @@ dispatcher:
   prices:
     claude-fable-5:   { input: 10.0, output: 50.0 }
     claude-opus-4-8:  { input: 5.0,  output: 25.0 }
+    claude-sonnet-5:  { input: 3.0,  output: 15.0 }
     claude-haiku-4-5: { input: 1.0,  output: 5.0 }
 
 jarvis:
   trigger_key: KEY_F9
   sample_rate: 16000
   wake_word: hey_jarvis        # stock openWakeWord model name
-  wake_threshold: 0.5
+  wake_threshold: 0.2            # tuned from near-miss logs: user's natural "hey jarvis" scores 0.21-0.25
+                                 # on the stock model; raise if false wakes appear (journal shows scores)
   wake_prebuffer_ms: 400       # rolling audio kept before wake fires, spliced onto capture
+  wake_beep_ms: 120            # fallback beep on wake (used only if wake_ack_phrases is [])
+  wake_ack_phrases: ["Hmm?", "Yes?"]   # spoken wake acknowledgment, random pick
   stt:
     engine: faster_whisper
     model: small.en

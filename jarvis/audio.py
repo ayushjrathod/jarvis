@@ -92,6 +92,38 @@ class MicStream:
                 break
 
 
+def beep(sample_rate: int = 16000, ms: int = 120, freq: float = 880.0) -> np.ndarray:
+    """Short sine tone with a 10ms fade in/out (no clicks), int16 mono."""
+    n = max(1, int(sample_rate * ms / 1000))
+    tone = np.sin(2 * np.pi * freq * np.arange(n) / sample_rate)
+    fade = min(n // 2, int(sample_rate * 0.01))
+    if fade > 0:
+        tone[:fade] *= np.linspace(0.0, 1.0, fade)
+        tone[-fade:] *= np.linspace(1.0, 0.0, fade)
+    return (tone * 0.7 * 32767).astype(np.int16)
+
+
+def play_async(samples: np.ndarray, sample_rate: int):
+    """Fire-and-forget playback of a short int16 clip (wake acknowledgments).
+    Runs in its own thread so it can't delay capture; a failed play (device
+    busy, no sink) is never fatal."""
+    # trailing silence so closing the stream can't clip the clip's tail
+    data = np.concatenate([samples, np.zeros(sample_rate // 10, dtype=np.int16)])
+
+    def run():
+        try:
+            with sd.OutputStream(samplerate=sample_rate, channels=1, dtype="int16") as out:
+                out.write(data.reshape(-1, 1))
+        except Exception:
+            pass
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def play_beep_async(sample_rate: int = 16000, ms: int = 120, freq: float = 880.0):
+    play_async(beep(sample_rate, ms, freq), sample_rate)
+
+
 class Player:
     """Blocking chunk player with an interrupt flag checked between chunks —
     this is what makes <200ms barge-in possible."""

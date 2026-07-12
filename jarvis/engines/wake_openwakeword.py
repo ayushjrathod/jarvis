@@ -10,6 +10,7 @@ inference backend. Feed int16 frames; scores update as internal buffers fill —
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 from jarvis.plugins.base import Frame, WakeWordEngine
@@ -25,6 +26,7 @@ class OpenWakeWordEngine(WakeWordEngine):
         self.threshold = threshold
         self._model = None
         self._key = None
+        self._last_miss_log = 0.0
 
     def load(self) -> None:
         from openwakeword import get_pretrained_model_paths
@@ -47,8 +49,15 @@ class OpenWakeWordEngine(WakeWordEngine):
         log.info("wake model %s loaded (key=%s)", Path(path).name, self._key)
 
     def process(self, frame: Frame) -> bool:
-        scores = self._model.predict(frame)
-        return scores[self._key] >= self.threshold
+        score = self._model.predict(frame)[self._key]
+        if 0.2 <= score < self.threshold:
+            # near-miss: the phrase registered but didn't clear the bar.
+            # Logged (rate-limited) so wake_threshold can be tuned from data.
+            now = time.monotonic()
+            if now - self._last_miss_log > 1.0:
+                self._last_miss_log = now
+                log.info("wake near-miss: score %.2f < threshold %.2f", score, self.threshold)
+        return score >= self.threshold
 
     def reset(self) -> None:
         # 0.4.0's reset() clears the prediction buffer but NOT the mel-spec

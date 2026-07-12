@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Install/refresh all Mission Control systemd user units.
 # Enables: dispatcher (+ dashboard), daily-brief/weekly-review/backup timers.
-# Jarvis voice is installed but NOT enabled — needs mic + `input` group first:
-#   systemctl --user enable --now mission-jarvis
+# Jarvis voice + dictation are installed but NOT enabled — need mic/`input`
+# group (and ydotool for dictation) first:
+#   systemctl --user enable --now mission-jarvis mission-dictate
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -22,5 +23,6 @@ echo
 systemctl --user list-timers --no-pager | grep -E 'NEXT|mission'
 echo
 echo "Dashboard: http://127.0.0.1:8765/"
-echo "Jarvis (after input-group + audio setup): systemctl --user enable --now mission-jarvis"
+echo "Jarvis wake word (after input-group + audio setup): systemctl --user enable --now mission-jarvis"
+echo "Dictation on F9 (after ydotool setup): systemctl --user enable --now mission-dictate"
 echo "Survive logout/reboot without login: loginctl enable-linger $USER"

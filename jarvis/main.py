@@ -14,13 +14,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import random
 import sys
 import threading
 
+import httpx
 import numpy as np
 
 from jarvis import engines
-from jarvis.audio import MicStream, Player, Recorder
+from jarvis.audio import MicStream, Player, Recorder, play_async, play_beep_async
 from jarvis.config import JarvisConfig
 from jarvis.hotkey import HotkeyWatcher
 from jarvis.sanitize import SentenceChunker, sanitize
@@ -53,6 +55,7 @@ class Jarvis:
         self.vad = SileroVAD(cfg.models_dir / "silero_vad.onnx", cfg.vad_threshold)
         self.recorder = Recorder(cfg.sample_rate)
         self.player: Player | None = None
+        self.wake_acks: list[np.ndarray] = []
 
         self.loop: asyncio.AbstractEventLoop | None = None
         self.busy = asyncio.Lock()          # one interaction at a time
@@ -67,6 +70,12 @@ class Jarvis:
         log.info("loading TTS (%s)…", self.cfg.tts.get("voice"))
         self.tts.load()
         self.player = Player(self.tts.sample_rate)
+        # pre-synthesize wake acknowledgments so on_wake can play one instantly
+        self.wake_acks = []
+        for phrase in self.cfg.wake_ack_phrases:
+            chunks = list(self.tts.synthesize(phrase))
+            if chunks:
+                self.wake_acks.append(np.concatenate(chunks))
         log.info("loading VAD…")
         self.vad.load()
         if self.wake:
@@ -165,6 +174,10 @@ class Jarvis:
                             q.put_nowait(s)
                 for s in chunker.flush():
                     q.put_nowait(s)
+            except httpx.HTTPError as e:
+                # Expected when a barge-in cancels the task server-side and the
+                # SSE stream dies under us; never let one interaction kill the loop.
+                log.warning("brain stream dropped (%s)", e)
             finally:
                 q.put_nowait(None)
                 await speaker
@@ -210,11 +223,18 @@ class Jarvis:
                 mic.drain()
                 threading.Event().wait(0.2)
 
+            def on_wake():
+                log.info("wake word detected, listening…")
+                if self.wake_acks:
+                    play_async(random.choice(self.wake_acks), self.tts.sample_rate)
+                elif self.cfg.wake_beep_ms > 0:
+                    play_beep_async(ms=self.cfg.wake_beep_ms)
+
             return capture_after_wake(
                 mic.read, self.wake, self.vad, self.cfg,
                 prebuffer_frames=prebuffer_frames,
                 is_busy=self.busy.locked, on_busy=on_busy,
-                on_wake=lambda: log.info("wake word detected, listening…"),
+                on_wake=on_wake,
             )
 
     async def notices_loop(self):

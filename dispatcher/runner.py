@@ -91,6 +91,9 @@ async def _attempt(text: str, cfg: Config, model: str | None, tools: list[str],
         cmd += ["--allowedTools", ",".join(tools)]
     if model:
         cmd += ["--model", model]
+    effort = cfg.models.get("effort")
+    if effort:
+        cmd += ["--effort", effort]
     env = dict(os.environ)
     if cfg.claude_config_dir:
         env["CLAUDE_CONFIG_DIR"] = cfg.claude_config_dir

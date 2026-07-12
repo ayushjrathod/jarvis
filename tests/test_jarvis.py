@@ -90,6 +90,25 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(cfg.dispatcher_url, "http://127.0.0.1:8765")
         self.assertEqual(cfg.stt["model"], "small.en")
         self.assertGreaterEqual(cfg.barge_in_frames, 1)
+        self.assertGreaterEqual(cfg.wake_beep_ms, 0)
+
+
+class TestBeep(unittest.TestCase):
+    def test_tone_shape_and_fades(self):
+        from jarvis.audio import beep
+
+        tone = beep(sample_rate=16000, ms=120)
+        self.assertEqual(tone.dtype.name, "int16")
+        self.assertEqual(len(tone), 16000 * 120 // 1000)
+        # fade in/out: endpoints silent, middle loud
+        self.assertEqual(tone[0], 0)
+        self.assertEqual(tone[-1], 0)
+        self.assertGreater(abs(int(tone[len(tone) // 2])), 1000)
+
+    def test_zero_ms_still_returns_audio(self):
+        from jarvis.audio import beep
+
+        self.assertGreaterEqual(len(beep(ms=0)), 1)
 
 
 class TestBrainSSEParsing(unittest.TestCase):

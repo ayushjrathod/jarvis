@@ -105,8 +105,12 @@ async def _stream_cli(text: str, cfg: Config, model_override: str | None,
     ]
     if tools:
         cmd += ["--allowedTools", ",".join(tools)]
-    if model_override:
-        cmd += ["--model", model_override]
+    model = model_override or cfg.models.get("quick")
+    if model:
+        cmd += ["--model", model]
+    effort = cfg.models.get("effort")
+    if effort:
+        cmd += ["--effort", effort]
     env = dict(os.environ)
     if cfg.claude_config_dir:
         env["CLAUDE_CONFIG_DIR"] = cfg.claude_config_dir
@@ -115,7 +119,7 @@ async def _stream_cli(text: str, cfg: Config, model_override: str | None,
         *cmd, cwd=cfg.root, env=env,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
-    meta = {"backend": "claude_cli", "model": model_override or "cli-default",
+    meta = {"backend": "claude_cli", "model": model or "cli-default",
             "status": "failed", "retry_on_refusal": False}
     saw_delta = False
     timeout = cfg.budgets.get("quick_timeout_s", 120)

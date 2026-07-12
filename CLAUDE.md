@@ -35,8 +35,9 @@ SQLite schema, and the four voice ABC signatures must be approved by the user.
 - One Python venv for backend/voice; Node for the React UI.
 - Everything runs as systemd **user** services/timers. No cloud scheduling in v1.
 - Voice hotkey capture via **raw evdev** (settled — compositor hotkey APIs don't
-  expose keyup, breaking hold-to-talk). Text injection via ydotool (ydotoold
-  already runs as a user service).
+  expose keyup, breaking hold-to-talk). Text injection via ydotool — NOT
+  installed as of 2026-07-10 (`sudo pacman -S ydotool` + enable the ydotool
+  user service); dictation typing fails until then.
 - Claude Code with Fable 5 is both the builder and the agent runtime.
 
 ## Locked-in architecture decisions (do NOT re-evaluate)
@@ -139,6 +140,11 @@ before writing from scratch.
 - Warm-load times (this CPU): all four models ~3s; STT of a short utterance
   ~1.1s; TTS starts instantly. Quick-path first delta ~3-5s on the CLI
   backend (Messages API path will cut this substantially).
+- **Trigger layout (settled 2026-07-10)**: `mission-jarvis` runs `--mode wake`
+  ("hey jarvis" → assistant, spoken reply); `mission-dictate` owns hold-F9
+  (speech typed at cursor via ydotool). Both share `trigger_key`/models via
+  config.yaml; don't run the assistant in `ptt`/`both` mode while
+  mission-dictate is up or F9 will trigger both.
 
 ## Known quirks / open items
 

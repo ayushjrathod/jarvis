@@ -25,7 +25,7 @@ header { display: flex; align-items: baseline; gap: 0.75rem; margin: 0.5rem 0 1r
 header h1 { font-size: 1.3rem; margin: 0; }
 header .sub { color: var(--dim); font-size: 0.85rem; }
 
-.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+.grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1rem; }
 .card-command { grid-column: 1 / -1; }
 @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
 
@@ -35,12 +35,13 @@ header .sub { color: var(--dim); font-size: 0.85rem; }
   border-radius: 10px;
   padding: 0.9rem 1.1rem;
   min-height: 6rem;
+  min-width: 0; /* let grid items shrink below their content width */
 }
 .card h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--dim); margin: 0 0 0.6rem; }
 
 .empty, .meta, .note { color: var(--dim); font-size: 0.9rem; }
 .note { margin: 0.5rem 0 0; }
-.answer { white-space: pre-wrap; margin: 0.6rem 0 0; }
+.answer { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0.6rem 0 0; }
 
 .command-form { display: flex; gap: 0.5rem; }
 .command-form input {
@@ -67,6 +68,7 @@ header .sub { color: var(--dim); font-size: 0.85rem; }
 
 pre.brief {
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
   font: 0.9rem/1.5 inherit;
   margin: 0.4rem 0 0;
 }
@@ -79,14 +81,35 @@ ul.tasks li.done .title { text-decoration: line-through; color: var(--dim); }
 ul.tasks .due { margin-left: auto; color: var(--dim); font-size: 0.85rem; }
 ul.tasks .due.overdue { color: var(--bad); font-weight: 600; }
 
-ul.monitor li {
-  display: flex; align-items: center; gap: 0.5rem;
-  padding: 0.3rem 0; border-bottom: 1px solid var(--border);
-  font-size: 0.9rem;
-}
+ul.monitor li { border-bottom: 1px solid var(--border); font-size: 0.9rem; }
 ul.monitor li:last-child { border-bottom: none; }
-ul.monitor .text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+ul.monitor .row {
+  display: flex; align-items: center; gap: 0.5rem;
+  width: 100%; padding: 0.3rem 0;
+  background: none; border: none; color: inherit;
+  font: inherit; text-align: left; cursor: pointer;
+}
+ul.monitor .row:hover .text { color: var(--accent); }
+ul.monitor .text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
 ul.monitor .cost { color: var(--dim); font-size: 0.85rem; }
+ul.monitor .caret { color: var(--dim); font-size: 0.75rem; flex-shrink: 0; }
+
+ul.monitor .detail {
+  margin: 0 0 0.5rem; padding: 0.5rem 0.7rem;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+}
+ul.monitor .detail .full-text {
+  margin: 0 0 0.4rem;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+ul.monitor .detail dl {
+  display: grid; grid-template-columns: auto 1fr;
+  gap: 0.1rem 0.8rem; margin: 0;
+  font-size: 0.82rem;
+}
+ul.monitor .detail dt { color: var(--dim); text-transform: uppercase; font-size: 0.7rem; letter-spacing: 0.05em; align-self: baseline; }
+ul.monitor .detail dd { margin: 0; overflow-wrap: anywhere; }
+ul.monitor .detail dd.err { color: var(--bad); }
 
 .chip {
   font-size: 0.72rem; font-weight: 600;

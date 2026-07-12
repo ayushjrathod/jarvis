@@ -1,0 +1,17 @@
+[Unit]
+Description=Mission Control dictation (hold F9, speech typed at cursor via ydotool)
+# Needs the user in the `input` group (F9 via evdev) and a running ydotoold
+# (pacman -S ydotool; systemctl --user enable --now ydotool). If ydotoold won't
+# start, see the /dev/uinput quirk in CLAUDE.md. Not enabled by default:
+#   systemctl --user enable --now mission-dictate
+After=pipewire.service ydotool.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Documents/code/jarvis
+ExecStart=%h/Documents/code/jarvis/.venv/bin/python -m jarvis.dictate
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

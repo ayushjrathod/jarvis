@@ -21,6 +21,11 @@ class JarvisConfig:
     # rolling audio kept before wake-word detection fires, spliced onto the
     # front of the capture so the first word isn't clipped
     wake_prebuffer_ms: int = 400
+    # acknowledgment beep when the wake word fires; 0 disables
+    wake_beep_ms: int = 120
+    # spoken wake acknowledgments (random pick, pre-synthesized at startup);
+    # empty list falls back to the beep
+    wake_ack_phrases: list = field(default_factory=lambda: ["Hmm?", "Yes?", "Mm-hmm?"])
     stt: dict = field(default_factory=lambda: {"engine": "faster_whisper", "model": "small.en", "compute": "int8"})
     tts: dict = field(default_factory=lambda: {"engine": "piper", "voice": "en_US-lessac-medium"})
     dispatcher_url: str = "http://127.0.0.1:8765"
@@ -45,6 +50,8 @@ class JarvisConfig:
         cfg.wake_word = j.get("wake_word", cfg.wake_word)
         cfg.wake_threshold = j.get("wake_threshold", cfg.wake_threshold)
         cfg.wake_prebuffer_ms = j.get("wake_prebuffer_ms", cfg.wake_prebuffer_ms)
+        cfg.wake_beep_ms = j.get("wake_beep_ms", cfg.wake_beep_ms)
+        cfg.wake_ack_phrases = j.get("wake_ack_phrases", cfg.wake_ack_phrases)
         cfg.stt = {**cfg.stt, **(j.get("stt") or {})}
         cfg.tts = {**cfg.tts, **(j.get("tts") or {})}
         cfg.vad_threshold = j.get("vad_threshold", cfg.vad_threshold)

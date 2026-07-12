@@ -68,6 +68,36 @@ Open **http://127.0.0.1:8765/** — today's brief, task list (checkboxes update
 the vault files), live agent monitor, and a command box that behaves exactly
 like talking to Jarvis ("add a task: …" works typed).
 
+### Service control (start / stop / status / logs)
+
+The dispatcher (and the daily-brief / weekly-review / backup timers) runs as
+a systemd **user** service — it does not need a terminal open, and restarts
+itself on crash.
+
+```bash
+systemctl --user start   mission-dispatcher   # start
+systemctl --user stop    mission-dispatcher   # stop (also frees port 8765)
+systemctl --user restart mission-dispatcher   # apply a config.yaml change
+systemctl --user status  mission-dispatcher   # is it up? recent log tail
+journalctl --user -u mission-dispatcher -f    # live logs (Ctrl-C to stop watching)
+```
+
+Same verbs work for `mission-jarvis`, `mission-daily-brief.timer`,
+`mission-weekly-review.timer`, `mission-backup.timer`. `stop` only pauses it
+for the current boot; `disable` (`systemctl --user disable mission-dispatcher`)
+stops it from auto-starting on future logins, `enable` reverses that. Check
+`systemctl --user is-enabled mission-dispatcher` if you're not sure which
+state it's in.
+
+**Restart after any change to `config.yaml`** (model, budgets, tool
+allowlists, etc.) — the dispatcher reads it once at startup and won't notice
+an edit until restarted.
+
+Model in use is whichever is set in `config.yaml`'s `dispatcher.models` block
+(quick / agentic / fallback) plus the CLI default in
+`~/.claude-per/settings.json` (the `CLAUDE_CONFIG_DIR` the dispatcher execs
+`claude` with — separate from your own interactive `claude` config).
+
 ### Dispatcher by hand (dev)
 
 ```bash
