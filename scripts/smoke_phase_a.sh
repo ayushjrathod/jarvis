@@ -15,7 +15,12 @@ out=$(curl -sN --max-time 180 -X POST "$BASE/task" \
   -H 'content-type: application/json' \
   -d '{"text": "what is the capital of France?", "source": "api"}')
 echo "$out" | tail -5
-echo "$out" | grep -qi paris && ok "quick answer contains Paris" || bad "quick answer"
+# join the streamed deltas first: "Paris" may arrive split across SSE lines
+answer=$(echo "$out" | python3 -c '
+import json, sys
+print("".join(json.loads(l[5:]).get("text") or "" for l in sys.stdin
+              if l.startswith("data:")))')
+echo "$answer" | grep -qi paris && ok "quick answer contains Paris" || bad "quick answer"
 echo "$out" | grep -q 'event: done' && ok "quick stream closed with done" || bad "quick done event"
 
 echo "== agentic task (202 + background run) =="
