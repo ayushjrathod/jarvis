@@ -5,10 +5,13 @@ and anything requiring judgment stays on the dispatch path).
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 from pathlib import Path
 
 from .queue_watcher import parse_task_file
+
+log = logging.getLogger("dispatcher.vault")
 
 
 def _task_files(vault: Path):
@@ -18,7 +21,12 @@ def _task_files(vault: Path):
 def list_tasks(vault: Path) -> list[dict]:
     out = []
     for f in _task_files(vault):
-        meta, body = parse_task_file(f.read_text())
+        try:
+            meta, body = parse_task_file(f.read_text())
+        except Exception:
+            # one hand-mangled frontmatter must not take down the whole list
+            log.warning("skipping unparseable task file %s", f.name)
+            continue
         out.append({
             "file": f.name,
             "title": meta.get("title", f.stem),

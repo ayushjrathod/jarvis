@@ -31,6 +31,9 @@ class Service:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.db = Database(cfg.db_path)
+        orphans = self.db.reconcile_orphans()
+        if orphans:
+            log.warning("marked %d orphaned task(s) from a previous run as failed", orphans)
         self.bus = EventBus()
         self.hooks = HookRegistry()
         self.hooks.register(self.bus.publish)  # SSE broadcaster is the first hook
@@ -80,55 +83,73 @@ class Service:
 
     async def stream_quick(self, task: dict):
         """Async generator of (event_name, payload) pairs; writes run rows and
-        retries once on the fallback model when the backend asks for it."""
+        retries once on the fallback model when the backend asks for it.
+
+        The finally block settles the books when the client vanishes mid-stream
+        (barge-in closes the connection, browser tab dies): GeneratorExit /
+        CancelledError land at a yield, so without it the task and run rows
+        would sit 'running' forever. DB calls only — no awaits are safe there.
+        """
         self.db.set_task_status(task["id"], "running")
         await self.fire("started", task)
-        yield ("task", {"task_id": task["id"], "kind": "quick"})
+        finished = False
+        open_run = None
+        try:
+            yield ("task", {"task_id": task["id"], "kind": "quick"})
 
-        area = self.areas.get(task["area"]) if task.get("area") else None
-        q_tools = area.quick_allowed_tools if area else None
-        q_context = area.context() if area else ""
+            area = self.areas.get(task["area"]) if task.get("area") else None
+            q_tools = area.quick_allowed_tools if area else None
+            q_context = area.context() if area else ""
 
-        models = [None, self.cfg.models.get("fallback", "claude-opus-4-8")]
-        for attempt, model_override in enumerate(models, start=1):
-            label = model_override or self.cfg.models.get("quick") or "cli-default"
-            run_id = self.db.create_run(task["id"], attempt, label)
-            meta, collected = {}, []
-            try:
-                async for kind, payload in quick.stream(
-                    task["text"], self.cfg, model_override,
-                    tools=q_tools, context=q_context,
-                ):
-                    if kind == "delta":
-                        collected.append(payload)
-                        yield ("delta", {"text": payload})
-                    else:
-                        meta = payload
-            except Exception as e:
-                log.exception("quick run failed for %s", task["id"])
-                meta = {"status": "failed", "error": f"{type(e).__name__}: {e}"}
+            models = [None, self.cfg.models.get("fallback", "claude-opus-4-8")]
+            for attempt, model_override in enumerate(models, start=1):
+                label = model_override or self.cfg.models.get("quick") or "cli-default"
+                run_id = self.db.create_run(task["id"], attempt, label)
+                open_run = run_id
+                meta, collected = {}, []
+                try:
+                    async for kind, payload in quick.stream(
+                        task["text"], self.cfg, model_override,
+                        tools=q_tools, context=q_context,
+                    ):
+                        if kind == "delta":
+                            collected.append(payload)
+                            yield ("delta", {"text": payload})
+                        else:
+                            meta = payload
+                except Exception as e:
+                    log.exception("quick run failed for %s", task["id"])
+                    meta = {"status": "failed", "error": f"{type(e).__name__}: {e}"}
 
-            status = meta.get("status", "failed")
-            self.db.finish_run(
-                run_id, status,
-                stop_reason=meta.get("stop_reason"), cost_usd=meta.get("cost_usd"),
-                input_tokens=meta.get("input_tokens"), output_tokens=meta.get("output_tokens"),
-                session_id=meta.get("session_id"), error=meta.get("error"),
-                output_text="".join(collected) or None,
-            )
-            if status == "refused" and meta.get("retry_on_refusal") and attempt == 1:
-                await self.fire("refused", task, attempt=attempt, model=label)
-                continue
+                status = meta.get("status", "failed")
+                self.db.finish_run(
+                    run_id, status,
+                    stop_reason=meta.get("stop_reason"), cost_usd=meta.get("cost_usd"),
+                    input_tokens=meta.get("input_tokens"), output_tokens=meta.get("output_tokens"),
+                    session_id=meta.get("session_id"), error=meta.get("error"),
+                    output_text="".join(collected) or None,
+                )
+                open_run = None
+                if status == "refused" and meta.get("retry_on_refusal") and attempt == 1:
+                    await self.fire("refused", task, attempt=attempt, model=label)
+                    continue
 
-            final = "done" if status == "done" else "failed"
-            self.db.set_task_status(task["id"], final)
-            await self.fire(final, task, cost_usd=meta.get("cost_usd"), model=label)
-            yield ("done", {
-                "task_id": task["id"], "status": final,
-                "cost_usd": meta.get("cost_usd"), "model": meta.get("model", label),
-                "error": meta.get("error"),
-            })
-            return
+                final = "done" if status == "done" else "failed"
+                self.db.set_task_status(task["id"], final)
+                finished = True
+                await self.fire(final, task, cost_usd=meta.get("cost_usd"), model=label)
+                yield ("done", {
+                    "task_id": task["id"], "status": final,
+                    "cost_usd": meta.get("cost_usd"), "model": meta.get("model", label),
+                    "error": meta.get("error"),
+                })
+                return
+        finally:
+            if not finished:
+                if open_run is not None:
+                    self.db.finish_run(open_run, "cancelled",
+                                       error="client disconnected mid-stream")
+                self.db.set_task_status(task["id"], "cancelled")
 
     async def _drain_quick(self, task: dict):
         """Run a quick task with no streaming client; the run row keeps the answer."""
@@ -184,6 +205,11 @@ class Service:
                     task["text"], self.cfg, model, tools, self.procs, task["id"],
                     system_extra=system_extra,
                 )
+            # cancel() may have killed the subprocess and closed the books while
+            # run_once was returning; don't overwrite 'cancelled' with 'failed'
+            current = self.db.get_task(task["id"])
+            if current and current["status"] == "cancelled":
+                return
             output_path = runner.guess_output_path(task["text"], self.cfg.root)
             self.db.finish_run(
                 run_id, result["status"],

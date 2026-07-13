@@ -3,6 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p data/backups
-sqlite3 data/mission.db ".backup 'data/backups/mission-$(date +%F).db'"
+# .timeout: don't fail if the dispatcher holds a write lock at 03:30
+sqlite3 -cmd '.timeout 5000' data/mission.db ".backup 'data/backups/mission-$(date +%F).db'"
 find data/backups -name 'mission-*.db' -mtime +14 -delete
 echo "backup written: data/backups/mission-$(date +%F).db"

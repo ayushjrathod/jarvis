@@ -16,9 +16,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from pathlib import Path
 
 from .config import Config
+
+# stdout line budget for stream-json: asyncio's 64KiB readline default is too
+# small once quick tools are allowed (one Read result arrives as one JSON line)
+STREAM_LIMIT = 4 * 1024 * 1024
 
 QUICK_SYSTEM = (
     "You are Jarvis, a concise personal voice assistant. Answer directly in "
@@ -32,10 +35,10 @@ FALLBACK_BETA = "server-side-fallback-2026-06-01"
 def resolve_backend(cfg: Config) -> str:
     if cfg.quick_backend in ("messages_api", "claude_cli"):
         return cfg.quick_backend
+    # env vars only: they are what the SDK actually reads — a credentials file
+    # on disk proves nothing and would route to a backend that can't auth
     has_creds = bool(
-        os.environ.get("ANTHROPIC_API_KEY")
-        or os.environ.get("ANTHROPIC_AUTH_TOKEN")
-        or (Path.home() / ".config" / "anthropic" / "credentials").exists()
+        os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
     )
     return "messages_api" if has_creds else "claude_cli"
 
@@ -56,7 +59,6 @@ async def stream(text: str, cfg: Config, model_override: str | None = None,
 async def _stream_api(text: str, cfg: Config, model_override: str | None):
     from anthropic import AsyncAnthropic
 
-    client = AsyncAnthropic()
     model = model_override or cfg.models.get("quick", "claude-fable-5")
     kwargs = dict(
         model=model,
@@ -64,20 +66,21 @@ async def _stream_api(text: str, cfg: Config, model_override: str | None):
         system=QUICK_SYSTEM,
         messages=[{"role": "user", "content": text}],
     )
-    if model.startswith("claude-fable"):
-        ctx = client.beta.messages.stream(
-            **kwargs,
-            betas=[FALLBACK_BETA],
-            fallbacks=[{"model": cfg.models.get("fallback", "claude-opus-4-8")}],
-        )
-        retry_on_refusal = False  # server already tried the fallback chain
-    else:
-        ctx = client.messages.stream(**kwargs)
-        retry_on_refusal = True
-    async with ctx as s:
-        async for delta in s.text_stream:
-            yield ("delta", delta)
-        final = await s.get_final_message()
+    async with AsyncAnthropic() as client:
+        if model.startswith("claude-fable"):
+            ctx = client.beta.messages.stream(
+                **kwargs,
+                betas=[FALLBACK_BETA],
+                fallbacks=[{"model": cfg.models.get("fallback", "claude-opus-4-8")}],
+            )
+            retry_on_refusal = False  # server already tried the fallback chain
+        else:
+            ctx = client.messages.stream(**kwargs)
+            retry_on_refusal = True
+        async with ctx as s:
+            async for delta in s.text_stream:
+                yield ("delta", delta)
+            final = await s.get_final_message()
     usage = final.usage
     refused = final.stop_reason == "refusal"
     yield ("meta", {
@@ -118,7 +121,11 @@ async def _stream_cli(text: str, cfg: Config, model_override: str | None,
     proc = await asyncio.create_subprocess_exec(
         *cmd, cwd=cfg.root, env=env,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        limit=STREAM_LIMIT,
     )
+    # drain stderr concurrently: with only stdout being read, a chatty CLI can
+    # fill the 64KiB stderr pipe and deadlock until the timeout kills it
+    stderr_task = asyncio.create_task(proc.stderr.read())
     meta = {"backend": "claude_cli", "model": model or "cli-default",
             "status": "failed", "retry_on_refusal": False}
     saw_delta = False
@@ -161,8 +168,11 @@ async def _stream_cli(text: str, cfg: Config, model_override: str | None,
     finally:
         if proc.returncode is None:
             proc.kill()
-    if proc.returncode not in (0, None) and meta["status"] == "failed" and "error" not in meta:
-        stderr = (await proc.stderr.read())[:500].decode(errors="replace")
+    if proc.returncode not in (0, None) and meta["status"] == "failed" and not meta.get("error"):
+        try:
+            stderr = (await asyncio.wait_for(stderr_task, 5))[:500].decode(errors="replace")
+        except TimeoutError:
+            stderr = ""
         meta["error"] = f"claude exited {proc.returncode}: {stderr}"
     yield ("meta", meta)
 

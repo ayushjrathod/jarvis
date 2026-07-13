@@ -148,7 +148,11 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
 def main():
     cfg = Config.load()
-    uvicorn.run(create_app(cfg), host=cfg.host, port=cfg.port, log_level="info")
+    # graceful-shutdown cap: the always-open /events SSE streams otherwise hold
+    # shutdown until systemd's stop timeout SIGKILLs us — which is what used to
+    # orphan 'running' task rows on every restart
+    uvicorn.run(create_app(cfg), host=cfg.host, port=cfg.port, log_level="info",
+                timeout_graceful_shutdown=5)
 
 
 if __name__ == "__main__":

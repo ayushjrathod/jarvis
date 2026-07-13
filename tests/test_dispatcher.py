@@ -81,6 +81,25 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(got["runs"][0]["status"], "cancelled")
         self.assertIsNotNone(got["runs"][0]["finished_at"])
 
+    def test_reconcile_orphans(self):
+        stuck = self.db.create_task("interrupted", "timer", "agentic")
+        self.db.set_task_status(stuck["id"], "running")
+        self.db.create_run(stuck["id"], 1, "m")
+        queued = self.db.create_task("never started", "queue", "agentic")
+        finished = self.db.create_task("fine", "api", "quick")
+        self.db.set_task_status(finished["id"], "done")
+
+        self.assertEqual(self.db.reconcile_orphans(), 2)
+
+        self.assertEqual(self.db.get_task(stuck["id"])["status"], "failed")
+        run = self.db.get_task(stuck["id"])["runs"][0]
+        self.assertEqual(run["status"], "failed")
+        self.assertIn("interrupted", run["error"])
+        self.assertIsNotNone(run["finished_at"])
+        self.assertEqual(self.db.get_task(queued["id"])["status"], "failed")
+        self.assertEqual(self.db.get_task(finished["id"])["status"], "done")
+        self.assertEqual(self.db.reconcile_orphans(), 0)  # idempotent
+
 
 class TestQueueParsing(unittest.TestCase):
     def test_frontmatter(self):
@@ -289,6 +308,72 @@ class TestRunnerTransientRetry(unittest.IsolatedAsyncioTestCase):
             result = await run_once("do it", cfg, None, [], {}, "task1")
         self.assertEqual(result["status"], "failed")
         self.assertEqual(mock_spawn.call_count, 1)
+
+
+class TestStreamQuickBookkeeping(unittest.IsolatedAsyncioTestCase):
+    """stream_quick must settle task/run rows on every exit path — including
+    the client vanishing mid-stream (barge-in closes the SSE connection)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        cfg = Config(root=Path(self.tmp.name))
+        cfg.db_path = Path(self.tmp.name) / "test.db"
+        from dispatcher.service import Service
+        self.svc = Service(cfg)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    @staticmethod
+    def _fake_stream(*events):
+        async def stream(text, cfg, model_override=None, tools=None, context=""):
+            for ev in events:
+                yield ev
+        return stream
+
+    async def test_completed_stream_marks_done(self):
+        task = await self.svc.create_task("q", "voice", "quick")
+        fake = self._fake_stream(
+            ("delta", "hi "), ("delta", "there"),
+            ("meta", {"status": "done", "cost_usd": 0.01}),
+        )
+        with patch("dispatcher.service.quick.stream", fake):
+            events = [e async for e in self.svc.stream_quick(task)]
+        self.assertEqual(events[-1][0], "done")
+        got = self.svc.db.get_task(task["id"])
+        self.assertEqual(got["status"], "done")
+        self.assertEqual(got["runs"][0]["status"], "done")
+        self.assertEqual(got["runs"][0]["output_text"], "hi there")
+
+    async def test_client_disconnect_settles_rows_as_cancelled(self):
+        task = await self.svc.create_task("q", "voice", "quick")
+        fake = self._fake_stream(("delta", "hi "), ("delta", "never consumed"))
+        with patch("dispatcher.service.quick.stream", fake):
+            agen = self.svc.stream_quick(task)
+            self.assertEqual((await agen.__anext__())[0], "task")
+            self.assertEqual((await agen.__anext__())[0], "delta")
+            await agen.aclose()  # what a dropped SSE connection does
+        got = self.svc.db.get_task(task["id"])
+        self.assertEqual(got["status"], "cancelled")
+        self.assertEqual(got["runs"][0]["status"], "cancelled")
+        self.assertIn("disconnected", got["runs"][0]["error"])
+
+
+class TestVaultTolerance(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.vault = Path(self.tmp.name)
+        (self.vault / "tasks").mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_one_bad_file_does_not_break_listing(self):
+        from dispatcher import vault
+        (self.vault / "tasks" / "good.md").write_text("---\ntitle: Good\nstatus: open\n---\nok\n")
+        (self.vault / "tasks" / "bad.md").write_text("---\ntitle: [unclosed\n---\nbody\n")
+        tasks = vault.list_tasks(self.vault)
+        self.assertEqual([t["title"] for t in tasks], ["Good"])
 
 
 if __name__ == "__main__":

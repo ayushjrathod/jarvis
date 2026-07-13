@@ -1,6 +1,7 @@
 """Phase C unit tests: area registry parsing + trigger routing (uses the real
 areas/tasks/SKILL.md so the shipped frontmatter stays valid)."""
 
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -57,6 +58,36 @@ class TestAreaRegistry(unittest.TestCase):
         reg = AreaRegistry(ROOT / "no-such-dir")
         self.assertEqual(reg.load(), {})
         self.assertEqual(reg.match("add a task: x"), (None, None))
+
+
+class TestMalformedTriggers(unittest.TestCase):
+    """Hand-edited frontmatter must not be able to 500 every /task: empty and
+    non-string trigger entries are dropped at parse time (an empty trigger
+    used to IndexError inside _subsequence on every match call)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        area = Path(self.tmp.name) / "broken"
+        area.mkdir()
+        (area / "SKILL.md").write_text(
+            "---\nname: broken\ntriggers:\n  - ''\n  - '   '\n  - 42\n"
+            "  - real trigger\nquick_triggers:\n  - ''\n---\nbody\n"
+        )
+        self.reg = AreaRegistry(Path(self.tmp.name))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_empty_and_nonstring_triggers_dropped(self):
+        area = self.reg.load()["broken"]
+        self.assertEqual(area.triggers, ["real trigger"])
+        self.assertEqual(area.quick_triggers, [])
+
+    def test_match_does_not_crash(self):
+        area, hint = self.reg.match("this mentions a real trigger phrase")
+        self.assertEqual(area.name, "broken")
+        self.assertEqual(hint, "agentic")
+        self.assertEqual(self.reg.match("unrelated text"), (None, None))
 
 
 if __name__ == "__main__":

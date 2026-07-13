@@ -75,12 +75,17 @@ async def watch(service):
     qdir = cfg.queue_dir
     processed = qdir / ".processed"
     failed = qdir / ".failed"
-    for d in (qdir, processed, failed):
-        d.mkdir(parents=True, exist_ok=True)
-
     max_retries = getattr(cfg, "queue_max_retries", DEFAULT_MAX_RETRIES)
     retries: dict[str, int] = {}
+    # never let one bad scan kill the watcher: it runs as a fire-and-forget
+    # task nobody observes, so an escaped exception would silently stop queue
+    # ingestion while the dispatcher keeps looking healthy
     while True:
-        for f in sorted(qdir.glob("*.md")):
-            await _ingest_one(f, service, processed, failed, retries, max_retries)
+        try:
+            for d in (qdir, processed, failed):
+                d.mkdir(parents=True, exist_ok=True)
+            for f in sorted(qdir.glob("*.md")):
+                await _ingest_one(f, service, processed, failed, retries, max_retries)
+        except Exception:
+            log.exception("queue scan failed; retrying next poll")
         await asyncio.sleep(cfg.poll_interval_s)

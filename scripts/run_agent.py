@@ -11,6 +11,7 @@ systemd journals the failure.
 
 import json
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import date, timedelta
@@ -19,6 +20,13 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# Persistent= timers fire right at boot, often before the dispatcher has bound
+# its port (this lost the 2026-07-09/11/12 briefs). Connection-level failures
+# are retried for a while; an HTTP error response is not (the server got the
+# request — retrying could duplicate the task).
+RETRIES = 12
+RETRY_DELAY_S = 5
 
 
 def main():
@@ -59,11 +67,18 @@ def main():
     req = urllib.request.Request(
         url, json.dumps(body).encode(), {"content-type": "application/json"}
     )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            out = json.load(resp)
-    except urllib.error.URLError as e:
-        sys.exit(f"dispatcher unreachable at {url}: {e}")
+    for attempt in range(1, RETRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                out = json.load(resp)
+            break
+        except urllib.error.HTTPError as e:
+            sys.exit(f"dispatcher rejected {area}/{agent}: {e}")
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt == RETRIES:
+                sys.exit(f"dispatcher unreachable at {url} after {RETRIES} attempts: {e}")
+            print(f"dispatcher not ready ({e}); retry {attempt}/{RETRIES} in {RETRY_DELAY_S}s")
+            time.sleep(RETRY_DELAY_S)
     print(f"submitted {area}/{agent} as task {out['task_id']}")
 
 

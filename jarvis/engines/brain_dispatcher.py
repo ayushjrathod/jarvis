@@ -11,6 +11,7 @@ the only component that invokes Claude; Jarvis is just a client).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import AsyncIterator
@@ -97,10 +98,10 @@ class DispatcherBrain(Brain):
                             yield BrainEvent("notice", f"Done: {summary}", data.get("task_id"))
                         elif event == "failed":
                             yield BrainEvent("notice", f"Task failed: {summary}", data.get("task_id"))
-            except httpx.HTTPError as e:
+            except (httpx.HTTPError, httpx.StreamError) as e:
+                # StreamError is a RuntimeError, not an HTTPError — a stream
+                # torn down between reads raises it and must also reconnect
                 log.warning("events stream dropped (%s); reconnecting", e)
-                import asyncio
-
                 await asyncio.sleep(3)
 
     async def aclose(self):

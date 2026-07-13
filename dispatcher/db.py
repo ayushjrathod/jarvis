@@ -96,6 +96,20 @@ class Database:
         with self._conn() as c:
             c.execute("UPDATE tasks SET status=? WHERE id=?", (status, task_id))
 
+    def reconcile_orphans(self) -> int:
+        """Close out tasks/runs a previous process left non-terminal. Called
+        once at startup, before any new work is accepted — at that moment
+        every 'queued'/'running' row is an orphan from a dead dispatcher."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE runs SET status='failed', finished_at=?, error=? WHERE status='running'",
+                (now(), "interrupted: dispatcher stopped mid-run"),
+            )
+            cur = c.execute(
+                "UPDATE tasks SET status='failed' WHERE status IN ('queued','running')"
+            )
+            return cur.rowcount
+
     def get_task(self, task_id: str) -> dict | None:
         with self._conn() as c:
             t = c.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()

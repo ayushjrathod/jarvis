@@ -39,7 +39,7 @@ if [ -e /dev/uinput ]; then
 else
   bad "/dev/uinput does not exist — modprobe uinput"
 fi
-if systemctl --user is-active --quiet ydotoold 2>/dev/null; then
+if systemctl --user is-active --quiet ydotool 2>/dev/null || systemctl --user is-active --quiet ydotoold 2>/dev/null; then
   ok "ydotoold running (user service)"
 elif pgrep -x ydotoold >/dev/null 2>&1; then
   ok "ydotoold running (process)"

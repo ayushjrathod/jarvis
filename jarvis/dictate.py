@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import sys
 import threading
 
 from jarvis import engines
@@ -20,7 +21,14 @@ log = logging.getLogger("jarvis.dictate")
 
 
 def type_text(text: str):
-    subprocess.run(["ydotool", "type", "--", text])
+    try:
+        res = subprocess.run(["ydotool", "type", "--", text])
+    except FileNotFoundError:
+        log.error("ydotool not installed — sudo pacman -S ydotool")
+        return
+    if res.returncode != 0:
+        log.error("ydotool exited %d — is ydotoold up? (systemctl --user status ydotool)",
+                  res.returncode)
 
 
 def main():
@@ -56,6 +64,10 @@ def main():
         watcher.join()
     except KeyboardInterrupt:
         print("bye")
+    else:
+        # the watcher only returns via stop(); anything else is a crash — exit
+        # nonzero so systemd's Restart=on-failure actually fires
+        sys.exit("hotkey watcher exited unexpectedly")
 
 
 if __name__ == "__main__":

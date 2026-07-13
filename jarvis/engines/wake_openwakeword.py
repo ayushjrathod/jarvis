@@ -50,9 +50,11 @@ class OpenWakeWordEngine(WakeWordEngine):
 
     def process(self, frame: Frame) -> bool:
         score = self._model.predict(frame)[self._key]
-        if 0.2 <= score < self.threshold:
+        if self.threshold * 0.5 <= score < self.threshold:
             # near-miss: the phrase registered but didn't clear the bar.
             # Logged (rate-limited) so wake_threshold can be tuned from data.
+            # Band scales with the threshold — a fixed floor stops producing
+            # tuning data once the threshold is lowered to meet it.
             now = time.monotonic()
             if now - self._last_miss_log > 1.0:
                 self._last_miss_log = now

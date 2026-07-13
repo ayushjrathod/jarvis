@@ -86,10 +86,13 @@ class Jarvis:
     # -- speaking with barge-in ----------------------------------------------
 
     async def speak_sentences(self, sentence_queue: asyncio.Queue) -> bool:
-        """Consume sentences until None sentinel; True if finished unbarged."""
+        """Consume sentences until None sentinel; True if finished unbarged.
+        Playback/TTS errors (sink vanished mid-reply) drop the utterance and
+        return False — they must never propagate and kill the main loop."""
         self.player.resume()
         barge = asyncio.Event()
-        monitor = asyncio.create_task(self._barge_monitor(barge))
+        monitor_stop = threading.Event()
+        monitor = asyncio.create_task(self._barge_monitor(barge, monitor_stop))
         interrupted = False
         try:
             while True:
@@ -99,29 +102,40 @@ class Jarvis:
                 if barge.is_set():
                     interrupted = True
                     break
-                ok = await asyncio.to_thread(
-                    self.player.play, self.tts.synthesize(sentence)
-                )
+                try:
+                    ok = await asyncio.to_thread(
+                        self.player.play, self.tts.synthesize(sentence)
+                    )
+                except Exception:
+                    log.exception("playback failed (audio device gone?); dropping reply")
+                    interrupted = True
+                    break
                 if not ok:
                     interrupted = True
                     break
         finally:
+            monitor_stop.set()  # watcher thread exits within one mic-read timeout
             monitor.cancel()
         if interrupted:
             await self.brain.cancel()
         return not interrupted
 
-    async def _barge_monitor(self, barge: asyncio.Event):
+    async def _barge_monitor(self, barge: asyncio.Event, stop: threading.Event):
         """VAD on the mic while TTS plays; sets `barge` and stops the player.
 
         Known limitation (documented): without echo cancellation the mic hears
         Jarvis itself. Run PipeWire's echo-cancel module or use headphones.
+
+        `stop` is this monitor's own exit flag. The thread must not key off
+        player.interrupt alone: the next utterance's resume() clears that flag,
+        which would leave a stale thread (and its late player.stop()) racing
+        the new playback.
         """
         def watch():
             consecutive = 0
             self.vad.reset()
             with MicStream(self.cfg.sample_rate, FRAME_SAMPLES) as mic:
-                while not self.player.interrupt.is_set():
+                while not stop.is_set() and not self.player.interrupt.is_set():
                     frame = mic.read(timeout=0.2)
                     if frame is None:
                         continue
@@ -138,9 +152,9 @@ class Jarvis:
                 log.info("barge-in detected")
                 barge.set()
                 self.player.stop()
-        except asyncio.CancelledError:
-            self.player.stop()  # unblock the watcher thread promptly
-            raise
+        except Exception:
+            # mic unavailable: this utterance plays without barge-in, that's all
+            log.warning("barge-in monitor failed; playback continues", exc_info=True)
 
     async def say(self, text: str):
         q = asyncio.Queue()
@@ -174,9 +188,12 @@ class Jarvis:
                             q.put_nowait(s)
                 for s in chunker.flush():
                     q.put_nowait(s)
-            except httpx.HTTPError as e:
+            except (httpx.HTTPError, httpx.StreamError) as e:
                 # Expected when a barge-in cancels the task server-side and the
-                # SSE stream dies under us; never let one interaction kill the loop.
+                # SSE stream dies under us; never let one interaction kill the
+                # loop. StreamError is NOT an HTTPError (it's a RuntimeError):
+                # it's what iterating the response raises when cancel() closed
+                # it between reads rather than during one.
                 log.warning("brain stream dropped (%s)", e)
             finally:
                 q.put_nowait(None)
@@ -202,18 +219,32 @@ class Jarvis:
         log.info("PTT ready: hold %s to talk", self.cfg.trigger_key)
         return watcher
 
+    async def _handle_safely(self, audio: np.ndarray):
+        """One interaction, fully contained: STT/dispatcher/audio failures are
+        logged and dropped — a single bad exchange must not kill the service."""
+        try:
+            await self.handle_utterance(audio)
+        except Exception:
+            log.exception("interaction failed; recovering")
+
     async def ptt_loop(self):
         while True:
             audio = await self.ptt_audio.get()
-            await self.handle_utterance(audio)
+            await self._handle_safely(audio)
 
     async def wake_loop(self):
         """Wake word → VAD-endpointed capture → same handler as PTT."""
         log.info("wake word ready: say '%s'", self.cfg.wake_word.replace("_", " "))
         while True:
-            audio = await asyncio.to_thread(self._wake_capture_once)
+            try:
+                audio = await asyncio.to_thread(self._wake_capture_once)
+            except Exception:
+                # mic device lost (BT dropout, replug): keep retrying until it's back
+                log.exception("wake capture failed; retrying in 5s")
+                await asyncio.sleep(5)
+                continue
             if audio is not None:
-                await self.handle_utterance(audio)
+                await self._handle_safely(audio)
 
     def _wake_capture_once(self) -> np.ndarray | None:
         sr = self.cfg.sample_rate
@@ -239,11 +270,14 @@ class Jarvis:
 
     async def notices_loop(self):
         async for ev in self.brain.notices():
-            if self.busy.locked():
-                self.pending_notices.append(ev.text)
-            else:
-                async with self.busy:
-                    await self.say(ev.text)
+            try:
+                if self.busy.locked():
+                    self.pending_notices.append(ev.text)
+                else:
+                    async with self.busy:
+                        await self.say(ev.text)
+            except Exception:
+                log.exception("failed to speak notice; dropping it")
 
     # -- entry ------------------------------------------------------------------
 

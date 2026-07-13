@@ -24,6 +24,8 @@ def _subsequence(trigger: str, words: list[str]) -> bool:
     "mark task done" matches "mark the domain task as done". Spoken phrasing
     never matches exact substrings reliably."""
     needles = trigger.split()
+    if not needles:
+        return False
     i = 0
     for w in words:
         if w == needles[i]:
@@ -63,11 +65,16 @@ def _parse_skill(path: Path) -> Area | None:
                 log.warning("bad frontmatter in %s", path)
                 return None
             body = parts[2].strip()
+    def phrases(key):
+        # tolerate hand-edited frontmatter: drop empty/non-string entries
+        # rather than letting one of them 500 every /task at match time
+        return [t.lower() for t in meta.get(key) or [] if isinstance(t, str) and t.strip()]
+
     return Area(
         name=meta.get("name", path.parent.name),
         path=path.parent,
-        triggers=[t.lower() for t in meta.get("triggers", [])],
-        quick_triggers=[t.lower() for t in meta.get("quick_triggers", [])],
+        triggers=phrases("triggers"),
+        quick_triggers=phrases("quick_triggers"),
         allowed_tools=meta.get("allowed_tools", []),
         quick_allowed_tools=meta.get("quick_allowed_tools", []),
         skill_body=body,
