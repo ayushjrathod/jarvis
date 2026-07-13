@@ -1,12 +1,98 @@
 # STATE — read me first each session
 
-_Last updated: 2026-07-10 (session 7, end)_
+_Last updated: 2026-07-13 (session 10, end)_
 
 ## Current phase
 
 **ALL FIVE PHASES BUILT AND VERIFIED.** v1 is feature-complete per the spec.
 The system runs under systemd user services. Awaiting the user's end-to-end
 hardware test (their stated plan) and reboot test.
+
+## Session 10: OpenClaw adoptions implemented (all 4 approved items live)
+
+User approved session 9's proposals ("go ahead"). One commit each, all
+tested, deployed, and live-verified — log: `context/sessions/2026-07-13-1.md`:
+
+- **d64e0fa** — session-8 hardening committed first (was sitting uncommitted;
+  needed so the per-item commits stay clean — still reviewable as one diff).
+- **23d3c13** — sanitizer: snake_case survives to TTS (`backup_db.sh` no
+  longer spoken as "backupdb.sh"); `_really_` emphasis still strips.
+- **eb13aef** — quick-path continuity: follow-ups within
+  `quick_session_idle_minutes` (config, 10) resume the source's previous CLI
+  session via `claude -p --resume`; vanished session → one fresh retry.
+  Live-verified twice (module + full HTTP path: codeword recalled; resumed
+  turn ~6× cheaper via prompt cache, $0.0076 vs $0.048).
+- **521eb8d** — usage-limit classification: model-scoped cap retries once on
+  the fallback model (like refusal); plan-wide session cap fails fast with a
+  spoken reason incl. parsed reset time (Jarvis now voices `speech` from
+  done/failed events). Budget-cap errors explicitly excluded.
+- **c771fdb** — timer tasks that die on a session limit requeue ~2min after
+  the parsed reset (30min default, 6h cap, max 2 tries). In-memory: a
+  dispatcher restart drops the pending retry (by design; journal + `requeued`
+  SSE event record it).
+- **2993047** — smoke_phase_a joins SSE deltas before asserting (grep-per-line
+  missed answers split across delta events; surfaced by resume shifting token
+  boundaries).
+
+73 unit tests green (+8). smoke_phase_a 7/7, smoke_phase_b 12/12.
+dispatcher+jarvis restarted on the new code; journals clean. Caveats:
+continuity is CLI-backend only (messages_api would need its own history
+store — noted in quick.py); `smoke-resume`/`api` sources now share context
+within the idle window like any source does.
+
+## Session 9: OpenClaw re-audit (approved session 10; all items implemented)
+
+User asked what else `references/openclaw` offers. Clone refreshed to
+a7b086df7 (2026-07-12, ~2.5k commits past the session-3 snapshot). Findings
+appended to `context/adaptation-audit.md` ("OpenClaw-focused re-audit").
+No code changed. Proposed, in rank order:
+
+1. Quick-path conversation continuity — resume the CLI session
+   (`claude -p --resume`, flag verified on 2.1.201) while fresh under an
+   idle-minutes policy (their `reset-policy.ts`); session_id is already
+   logged but unused, so every voice follow-up starts cold.
+2. Usage-limit failure classification — our own runs table holds
+   "session limit · resets 2:30pm" + 2× "Fable 5 limit" failures surfaced
+   as generic "Sorry, that didn't work"; classify → model-scoped limit
+   retries once on the fallback model, plan-wide limit speaks the reset
+   time. Optional 2b: requeue timer tasks at reset time.
+3. Sanitizer underscore fix (XS) — `_EMPHASIS` mangles snake_case
+   (`backup_db.sh` → "backupdb.sh" spoken); lift their boundary guards.
+
+Skipped with reasons (in the audit file): TTS directives, talk-mode
+fast-context, steering/queued follow-ups, multi-provider failover; prior
+skips re-affirmed.
+
+## Session 8: fragility audit → hardening pass (implemented + verified)
+
+Audit found, and the same session fixed, the whole robustness cluster —
+details and file list in `context/sessions/2026-07-12-1.md`:
+
+- **Startup reconciliation** of orphaned 'queued'/'running' rows (the
+  07-09 daily-brief task had sat 'running' for 3 days) + `stream_quick`
+  finally so client disconnects settle rows as 'cancelled'.
+- **Root cause of the orphans found during deploy**: open /events SSE
+  streams block uvicorn shutdown → systemd SIGKILL after 90s. Fixed with
+  `timeout_graceful_shutdown=5`; dispatcher restarts now take ~5s.
+- **run_agent.py retries connection failures 12×5s** (closes the "timer
+  fires before dispatcher binds" open item from session 5) — reproduced
+  the boot race live, watched it recover, and backfilled today's brief.
+- **Voice service crash paths closed**: `httpx.StreamError` caught (it's
+  a RuntimeError, not HTTPError — residual session-7 barge-in window);
+  playback/TTS/mic errors contained per-interaction instead of killing
+  the process; barge monitor got its own stop flag (stale-thread race).
+- **Hotkey watcher supervised** (device unplug, late boot enumeration,
+  callback errors) and **mission-dictate exits nonzero** on watcher death
+  so Restart=on-failure actually fires.
+- Quick CLI stream: 4MiB line limit + concurrent stderr drain. Queue
+  watcher supervised. Empty SKILL.md triggers can no longer 500 /task.
+  One bad vault file no longer breaks /vault/tasks. Near-miss wake band
+  now scales with the threshold. Backup gets a sqlite busy timeout.
+
+52 unit tests green (+6 new). All three services restarted on the new
+code; smoke_phase_b 12/12. **Working tree uncommitted, awaiting user
+review.** Untested-by-design: the messages_api quick backend (no API key
+here) — verify it manually before exporting ANTHROPIC_API_KEY.
 
 `mission-dispatcher.service`, `mission-jarvis.service` (now **wake-only**),
 and the new `mission-dictate.service` are all **running and enabled**.

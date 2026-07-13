@@ -263,3 +263,84 @@ changed by this audit — report only.
 
 New references cloned into `references/`: `agentic-os` (MIT),
 `lifeos-template` (CC BY 4.0).
+
+---
+
+# OpenClaw-focused re-audit — 2026-07-12 (session 9)
+
+Scope: OpenClaw only, per user request. Clone refreshed 3ad77774 (2026-07-06,
+the snapshot the first audit saw) → a7b086df7 (2026-07-12), ~2,500 new commits.
+Method as before: match their code against real weak spots in our build.
+Report only — no code changed. **User approved all items next session
+(2026-07-13); all four implemented, tested, and deployed — see the table at
+the end and `context/sessions/2026-07-13-1.md`.**
+
+## Proposed adoptions (ranked)
+
+1. **Quick-path conversation continuity (`--resume` + freshness policy)** — S/M, low-med risk
+   - Source: `src/config/sessions/reset-policy.ts` — a session is "fresh" until
+     an idle window since last interaction expires (`idleMinutes`) or a daily
+     boundary passes (`atHour`, their default 4am); stale → start new session.
+   - Our gap (verified): every quick turn is a cold start. `session_id` from the
+     CLI result is logged to SQLite (`dispatcher/quick.py:158`) and never used.
+     Voice follow-ups ("what about tomorrow?") have no context.
+   - Verified viable: our pinned CLI 2.1.201 supports `-r/--resume <session-id>`
+     with `-p`. Messages API backend would need its own history mechanism —
+     out of scope while the machine has no API key (CLI backend is what runs).
+   - Land: dispatcher/service.py remembers (session_id, last_at) per source;
+     fresh → `--resume` in `_stream_cli`; config `quick_session_idle_minutes`
+     (0 = off = today's behavior). Resume failure → transparent fresh start.
+   - Risk: resumed context grows per turn (quick budget cap still applies);
+     must verify a barged/cancelled stream leaves a resumable session.
+
+2. **Usage-limit failure classification + reset-aware handling** — S (+S optional), low risk
+   - Source: `src/agents/embedded-agent-helpers/errors.ts` (hint-list
+     classification, not exact strings), `auth-profiles/usage.ts` (reset-window
+     parsing), `session-suspension.ts` (quota suspension + auto-resume,
+     default 30 min when reset unknown).
+   - Our gap (verified in `data/mission.db` runs table): three limit failures
+     logged as generic errors — `You've hit your session limit · resets 2:30pm
+     (Asia/Kolkata)` (2026-07-10) and 2× `You've reached your Fable 5 limit.
+     Run /usage-credits … or switch models with /model.` (2026-07-09). Voice
+     says "Sorry, that didn't work"; a timer-fired brief would just be lost.
+   - Land: small classifier on failure text in the dispatcher →
+     `usage_limit_model` (model-scoped) auto-retries once on the fallback
+     model, reusing the existing refusal-fallback loop; `usage_limit_session`
+     (plan-wide) never retries, parses the reset time, and surfaces it in the
+     spoken/dashboard error ("Claude's session limit is hit — resets 2:30pm").
+   - Optional extension (own approval): timer-sourced agentic tasks requeue at
+     reset time (their suspension/auto-resume pattern) instead of losing the
+     day's run.
+
+3. **Sanitizer: stop deleting underscores inside identifiers** — XS, no risk
+   - Source: `src/shared/text/strip-markdown.ts` — the italic-underscore rule
+     is boundary-guarded: `(?<![\p{L}\p{N}])_(?!_)(.+?)(?<!_)_(?![\p{L}\p{N}])`.
+   - Our bug (verified live): `jarvis/sanitize.py` `_EMPHASIS` turns
+     `backup_db.sh` → "backupdb.sh", `wake_prebuffer_ms` → "wakeprebufferms"
+     before Piper reads it. `_really_` should still become "really".
+   - Land: split `_`-emphasis from `*`/`~~` in `_EMPHASIS`, add their boundary
+     guards + tests. Their file is otherwise a subset of ours — nothing else
+     to take back.
+
+## Checked and skipped
+
+- **TTS directives** (`src/tts/directives.ts`) — inline `[[tts:…]]` tags to
+  switch voice/provider mid-reply; we have one Piper voice. No use.
+- **Talk-mode fast-context / agent-consult split** (`src/talk/…`) — low-latency
+  voice answers via their memory-search plugin while the full agent consults;
+  our quick-latency root cause is CLI startup (documented fix: API key), and
+  this is an architecture change, not a lift.
+- **Steering / queued follow-ups while the agent is busy** (auto-reply queue
+  modes) — chat-channel problem; voice barge-in already cancels, single user.
+- **Multi-provider failover / auth-profile rotation / cooldown scoring** —
+  solves multi-account fleets; we have one subscription + refusal fallback.
+  Only the classification idea (item 2) transfers.
+- **Re-affirmed prior skips** — heartbeat-ack suppression, command-poll
+  backoff, barge-in replay-on-interrupt: unchanged by the new commits.
+
+| # | Item | Effort | Risk | Verdict |
+|---|------|--------|------|---------|
+| 1 | Quick-path continuity via --resume + idle policy | S/M | low-med | **implemented** (eb13aef), live-verified |
+| 2 | Usage-limit classification + reset-aware errors | S | low | **implemented** (521eb8d) |
+| 2b | Requeue timer tasks at limit-reset time | S | low-med | **implemented** (c771fdb), in-memory by design |
+| 3 | Sanitizer underscore boundary guards | XS | none | **implemented** (23d3c13) |

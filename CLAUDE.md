@@ -35,9 +35,9 @@ SQLite schema, and the four voice ABC signatures must be approved by the user.
 - One Python venv for backend/voice; Node for the React UI.
 - Everything runs as systemd **user** services/timers. No cloud scheduling in v1.
 - Voice hotkey capture via **raw evdev** (settled — compositor hotkey APIs don't
-  expose keyup, breaking hold-to-talk). Text injection via ydotool — NOT
-  installed as of 2026-07-10 (`sudo pacman -S ydotool` + enable the ydotool
-  user service); dictation typing fails until then.
+  expose keyup, breaking hold-to-talk). Text injection via ydotool — installed
+  and user-verified working 2026-07-11 (if ydotoold won't start, see the
+  /dev/uinput quirk under Known quirks).
 - Claude Code with Fable 5 is both the builder and the agent runtime.
 
 ## Locked-in architecture decisions (do NOT re-evaluate)
