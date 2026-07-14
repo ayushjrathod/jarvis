@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import time
+from datetime import datetime, timezone
 
 from . import limits, quick, runner
 from .areas import AreaRegistry
@@ -299,11 +300,51 @@ class Service:
             final = "done" if result["status"] == "done" else "failed"
             speech = (limits.limit_speech(limit)
                       if final == "failed" and limit else None)
+            requeue_delay = None
+            if (final == "failed" and limit and task["source"] == "timer"
+                    and meta.get("limit_requeues", 0) < 2):
+                requeue_delay = self._limit_requeue_delay(limit)
+                speech += " I'll retry the task after that."
             self.db.set_task_status(task["id"], final)
             await self.fire(final, task, cost_usd=result.get("cost_usd"),
                             model=label, output_path=output_path,
                             error=result.get("error"), speech=speech)
+            if requeue_delay is not None:
+                self._schedule_limit_requeue(task, meta, requeue_delay)
+                await self.fire("requeued", task, delay_s=int(requeue_delay))
             return
+
+    def _limit_requeue_delay(self, limit: limits.LimitInfo) -> float:
+        """Seconds until a limit-failed timer task is worth retrying: shortly
+        after the advertised reset when one was parsed, else 30 minutes (the
+        openclaw quota-suspension default)."""
+        if limit.resets_at:
+            secs = (limit.resets_at - datetime.now(timezone.utc)).total_seconds() + 120
+            return min(max(secs, 60.0), 6 * 3600.0)
+        return 1800.0
+
+    def _schedule_limit_requeue(self, task: dict, meta: dict, delay: float):
+        """Re-submit a timer task once the usage-limit window has reset, so a
+        daily brief isn't lost to a morning limit. In-memory by design: a
+        dispatcher restart drops the pending retry (startup reconciliation
+        would fail a persisted queued row anyway); the journal and the
+        'requeued' event record that it was scheduled."""
+        key = f"requeue:{task['id']}"
+
+        async def later():
+            try:
+                await asyncio.sleep(delay)
+                await self.submit(
+                    task["text"], source="timer", mode="agentic",
+                    area=task.get("area"),
+                    metadata={**meta, "limit_requeues": meta.get("limit_requeues", 0) + 1},
+                )
+            finally:
+                self.bg.pop(key, None)
+
+        self.bg[key] = asyncio.create_task(later())
+        log.warning("task %s: usage limit hit; retry scheduled in %ds",
+                    task["id"], int(delay))
 
     # -- cancel / shutdown ----------------------------------------------------
 

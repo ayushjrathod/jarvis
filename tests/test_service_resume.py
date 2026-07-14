@@ -5,6 +5,7 @@ Same no-network rules as test_dispatcher: quick.stream and runner.run_once are
 faked; nothing invokes claude.
 """
 
+import asyncio
 import tempfile
 import time
 import unittest
@@ -189,13 +190,62 @@ class TestAgenticLimitHandling(unittest.IsolatedAsyncioTestCase):
 
         self.svc.hooks.register(lambda p: seen.append(p))
         with patch("dispatcher.service.runner.run_once", fake_run):
-            task = await self.svc.create_task("daily brief", "timer", "agentic")
+            task = await self.svc.create_task("daily brief", "api", "agentic")
             await self.svc._run_agentic_inner(task)
         got = self.svc.db.get_task(task["id"])
         self.assertEqual(got["status"], "failed")
         self.assertEqual(len(got["runs"]), 1)  # session-wide: no fallback try
         failed = [p for p in seen if p["event"] == "failed"]
         self.assertIn("session limit", failed[0]["speech"])
+
+    async def test_timer_session_limit_requeues_after_reset(self):
+        results = [{"status": "failed", "error": SESSION_MSG}, {"status": "done"}]
+        seen = []
+
+        async def fake_run(*a, **kw):
+            return results.pop(0)
+
+        self.svc.hooks.register(lambda p: seen.append(p))
+        with patch("dispatcher.service.runner.run_once", fake_run), \
+             patch.object(Service, "_limit_requeue_delay", return_value=0.05):
+            task = await self.svc.create_task("daily brief", "timer", "agentic")
+            await self.svc._run_agentic_inner(task)
+            requeued = [p for p in seen if p["event"] == "requeued"]
+            self.assertEqual(len(requeued), 1)
+            failed = [p for p in seen if p["event"] == "failed"]
+            self.assertIn("retry the task", failed[0]["speech"])
+            await asyncio.sleep(0.4)  # let the requeue fire and the retry run
+        retries = [t for t in self.svc.db.list_tasks()
+                   if t["id"] != task["id"] and t["text"] == "daily brief"]
+        self.assertEqual(len(retries), 1)
+        self.assertEqual(retries[0]["status"], "done")
+        self.assertIn('"limit_requeues": 1', retries[0]["metadata"])
+
+    async def test_requeue_capped_after_two_attempts(self):
+        async def fake_run(*a, **kw):
+            return {"status": "failed", "error": SESSION_MSG}
+
+        seen = []
+        self.svc.hooks.register(lambda p: seen.append(p))
+        with patch("dispatcher.service.runner.run_once", fake_run):
+            task = await self.svc.create_task(
+                "daily brief", "timer", "agentic",
+                metadata={"limit_requeues": 2})
+            await self.svc._run_agentic_inner(task)
+        self.assertEqual([p for p in seen if p["event"] == "requeued"], [])
+        self.assertNotIn(f"requeue:{task['id']}", self.svc.bg)
+
+    async def test_non_timer_session_limit_does_not_requeue(self):
+        async def fake_run(*a, **kw):
+            return {"status": "failed", "error": SESSION_MSG}
+
+        seen = []
+        self.svc.hooks.register(lambda p: seen.append(p))
+        with patch("dispatcher.service.runner.run_once", fake_run):
+            task = await self.svc.create_task("do the thing", "api", "agentic")
+            await self.svc._run_agentic_inner(task)
+        self.assertEqual([p for p in seen if p["event"] == "requeued"], [])
+        self.assertEqual(self.svc.db.get_task(task["id"])["status"], "failed")
 
 
 if __name__ == "__main__":
