@@ -1,8 +1,8 @@
 """Service-level tests for quick-path session continuity (claude -p --resume
-within an idle window).
+within an idle window) and usage-limit fallback wiring.
 
-Same no-network rules as test_dispatcher: quick.stream is faked; nothing
-invokes claude.
+Same no-network rules as test_dispatcher: quick.stream and runner.run_once are
+faked; nothing invokes claude.
 """
 
 import tempfile
@@ -13,6 +13,10 @@ from unittest.mock import patch
 
 from dispatcher.config import Config
 from dispatcher.service import Service
+
+SESSION_MSG = "You've hit your session limit · resets 2:30pm (Asia/Kolkata)"
+MODEL_MSG = ("You've reached your Fable 5 limit. Run /usage-credits to "
+             "continue or switch models with /model.")
 
 
 def make_service(tmp, **cfg_over):
@@ -108,6 +112,90 @@ class TestQuickContinuity(unittest.IsolatedAsyncioTestCase):
         got = self.svc.db.get_task(task["id"])
         self.assertEqual([r["status"] for r in got["runs"]], ["failed", "done"])
         self.assertEqual(self.svc.quick_sessions["voice"][0], "sess-new")
+
+
+class TestQuickLimitFallback(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.svc = make_service(self.tmp.name)
+
+    async def asyncTearDown(self):
+        await self.svc.shutdown()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    async def test_model_limit_retries_on_fallback(self):
+        fake = RecordingStream({"status": "failed", "error": MODEL_MSG},
+                               {"status": "done", "session_id": "s"})
+        with patch("dispatcher.service.quick.stream", fake):
+            task = await self.svc.create_task("q", "voice", "quick")
+            events = await drain(self.svc, task)
+        self.assertEqual(fake.calls[1]["model"], "claude-opus-4-8")
+        self.assertEqual(events[-1][1]["status"], "done")
+        got = self.svc.db.get_task(task["id"])
+        self.assertEqual([r["status"] for r in got["runs"]], ["failed", "done"])
+
+    async def test_session_limit_fails_once_with_speech(self):
+        fake = RecordingStream({"status": "failed", "error": SESSION_MSG})
+        with patch("dispatcher.service.quick.stream", fake):
+            task = await self.svc.create_task("q", "voice", "quick")
+            events = await drain(self.svc, task)
+        self.assertEqual(len(fake.calls), 1)  # no pointless fallback attempt
+        done = events[-1][1]
+        self.assertEqual(done["status"], "failed")
+        self.assertIn("session limit", done["speech"])
+        self.assertIn("2:30pm", done["speech"])
+
+    async def test_budget_failure_gets_no_limit_treatment(self):
+        fake = RecordingStream(
+            {"status": "failed", "error": "Budget limit exceeded your max of $0.10"})
+        with patch("dispatcher.service.quick.stream", fake):
+            task = await self.svc.create_task("q", "voice", "quick")
+            events = await drain(self.svc, task)
+        self.assertEqual(len(fake.calls), 1)
+        self.assertIsNone(events[-1][1].get("speech"))
+
+
+class TestAgenticLimitHandling(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.svc = make_service(self.tmp.name)
+
+    async def asyncTearDown(self):
+        await self.svc.shutdown()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    async def test_model_limit_falls_back_like_refusal(self):
+        results = [{"status": "failed", "error": MODEL_MSG}, {"status": "done"}]
+
+        async def fake_run(*a, **kw):
+            return results.pop(0)
+
+        with patch("dispatcher.service.runner.run_once", fake_run):
+            task = await self.svc.create_task("do the thing", "api", "agentic")
+            await self.svc._run_agentic_inner(task)
+        got = self.svc.db.get_task(task["id"])
+        self.assertEqual(got["status"], "done")
+        self.assertEqual([r["status"] for r in got["runs"]], ["failed", "done"])
+
+    async def test_session_limit_fails_with_speech_event(self):
+        seen = []
+
+        async def fake_run(*a, **kw):
+            return {"status": "failed", "error": SESSION_MSG}
+
+        self.svc.hooks.register(lambda p: seen.append(p))
+        with patch("dispatcher.service.runner.run_once", fake_run):
+            task = await self.svc.create_task("daily brief", "timer", "agentic")
+            await self.svc._run_agentic_inner(task)
+        got = self.svc.db.get_task(task["id"])
+        self.assertEqual(got["status"], "failed")
+        self.assertEqual(len(got["runs"]), 1)  # session-wide: no fallback try
+        failed = [p for p in seen if p["event"] == "failed"]
+        self.assertIn("session limit", failed[0]["speech"])
 
 
 if __name__ == "__main__":

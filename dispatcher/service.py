@@ -9,7 +9,7 @@ import json
 import logging
 import time
 
-from . import quick, runner
+from . import limits, quick, runner
 from .areas import AreaRegistry
 from .classifier import classify
 from .config import Config
@@ -164,8 +164,19 @@ class Service:
                     output_text="".join(collected) or None,
                 )
                 open_run = None
+                limit = (limits.classify_limit(meta.get("error"))
+                         if status == "failed" else None)
                 if status == "refused" and meta.get("retry_on_refusal") and idx == 0:
                     await self.fire("refused", task, attempt=attempt, model=label)
+                    idx += 1
+                    continue
+                if limit and limit.scope == "model" and idx == 0:
+                    # one model's usage cap, not the plan's ("switch models
+                    # with /model"): retry once on the fallback, like a refusal
+                    log.warning("task %s hit the %s usage limit; retrying on fallback",
+                                task["id"], label)
+                    await self.fire("refused", task, attempt=attempt, model=label,
+                                    reason="usage_limit")
                     idx += 1
                     continue
                 if status == "failed" and resume_id and is_resume_error(meta.get("error")):
@@ -183,13 +194,16 @@ class Service:
                         and self.cfg.quick_session_idle_minutes):
                     self.quick_sessions[task["source"]] = (
                         meta["session_id"], time.monotonic())
+                speech = (limits.limit_speech(limit)
+                          if final == "failed" and limit else None)
                 self.db.set_task_status(task["id"], final)
                 finished = True
-                await self.fire(final, task, cost_usd=meta.get("cost_usd"), model=label)
+                await self.fire(final, task, cost_usd=meta.get("cost_usd"),
+                                model=label, error=meta.get("error"), speech=speech)
                 yield ("done", {
                     "task_id": task["id"], "status": final,
                     "cost_usd": meta.get("cost_usd"), "model": meta.get("model", label),
-                    "error": meta.get("error"),
+                    "error": meta.get("error"), "speech": speech,
                 })
                 return
         finally:
@@ -267,16 +281,28 @@ class Service:
                 output_text=result.get("output_text"), error=result.get("error"),
                 output_path=output_path,
             )
+            limit = (limits.classify_limit(result.get("error"))
+                     if result["status"] == "failed" else None)
             if result["status"] == "refused" and attempt == 1:
                 log.warning("task %s refused on %s; retrying on fallback", task["id"], label)
                 await self.fire("refused", task, attempt=attempt, model=label)
                 continue
+            if limit and limit.scope == "model" and attempt == 1:
+                # one model's usage cap, not the plan's: retry once on the
+                # fallback model, like a refusal
+                log.warning("task %s hit the %s usage limit; retrying on fallback",
+                            task["id"], label)
+                await self.fire("refused", task, attempt=attempt, model=label,
+                                reason="usage_limit")
+                continue
 
             final = "done" if result["status"] == "done" else "failed"
+            speech = (limits.limit_speech(limit)
+                      if final == "failed" and limit else None)
             self.db.set_task_status(task["id"], final)
             await self.fire(final, task, cost_usd=result.get("cost_usd"),
                             model=label, output_path=output_path,
-                            error=result.get("error"))
+                            error=result.get("error"), speech=speech)
             return
 
     # -- cancel / shutdown ----------------------------------------------------

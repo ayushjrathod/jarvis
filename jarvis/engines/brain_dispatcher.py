@@ -66,7 +66,10 @@ class DispatcherBrain(Brain):
                     yield BrainEvent("delta", data.get("text", ""), self._current_task_id)
                 elif event == "done":
                     if data.get("status") != "done":
-                        yield BrainEvent("error", "Sorry, that didn't work.", data.get("task_id"))
+                        # the dispatcher supplies a speakable reason when it
+                        # has one (e.g. "Claude's session limit is hit…")
+                        why = data.get("speech") or "Sorry, that didn't work."
+                        yield BrainEvent("error", why, data.get("task_id"))
                     yield BrainEvent("done", "", data.get("task_id"))
         finally:
             await resp.aclose()
@@ -97,7 +100,10 @@ class DispatcherBrain(Brain):
                         if event == "done":
                             yield BrainEvent("notice", f"Done: {summary}", data.get("task_id"))
                         elif event == "failed":
-                            yield BrainEvent("notice", f"Task failed: {summary}", data.get("task_id"))
+                            msg = f"Task failed: {summary}."
+                            if data.get("speech"):
+                                msg += " " + data["speech"]
+                            yield BrainEvent("notice", msg, data.get("task_id"))
             except (httpx.HTTPError, httpx.StreamError) as e:
                 # StreamError is a RuntimeError, not an HTTPError — a stream
                 # torn down between reads raises it and must also reconnect
