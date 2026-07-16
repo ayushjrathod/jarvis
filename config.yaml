@@ -28,6 +28,13 @@ dispatcher:
   # messages_api | claude_cli | auto (auto: messages_api if API credentials found)
   quick_backend: auto
 
+  # Quick-path conversation continuity (CLI backend): a follow-up within this
+  # window resumes the previous claude session (`claude -p --resume`), so
+  # "what about tomorrow?" keeps context. Tracked per source (voice/api/…);
+  # 0 disables — every turn starts fresh. Idle-freshness pattern per openclaw
+  # src/config/sessions/reset-policy.ts.
+  quick_session_idle_minutes: 10
+
   # Note: a bare `claude -p` invocation carries ~$0.15-0.25 of notional cost
   # (Claude Code system prompt overhead), so caps below that always trip.
   budgets:

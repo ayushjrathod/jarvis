@@ -44,14 +44,18 @@ def resolve_backend(cfg: Config) -> str:
 
 
 async def stream(text: str, cfg: Config, model_override: str | None = None,
-                 tools: list[str] | None = None, context: str = ""):
+                 tools: list[str] | None = None, context: str = "",
+                 resume_session_id: str | None = None):
     backend = resolve_backend(cfg)
     if tools and backend == "messages_api":
         backend = "claude_cli"  # file-reading quick queries need CLI tool access
     if backend == "messages_api":
+        # no conversation continuity on this backend yet: it would need its own
+        # message-history store, and this machine runs the CLI backend anyway
         agen = _stream_api(text, cfg, model_override)
     else:
-        agen = _stream_cli(text, cfg, model_override, tools, context)
+        agen = _stream_cli(text, cfg, model_override, tools, context,
+                           resume_session_id)
     async for item in agen:
         yield item
 
@@ -96,7 +100,8 @@ async def _stream_api(text: str, cfg: Config, model_override: str | None):
 
 
 async def _stream_cli(text: str, cfg: Config, model_override: str | None,
-                      tools: list[str] | None = None, context: str = ""):
+                      tools: list[str] | None = None, context: str = "",
+                      resume_session_id: str | None = None):
     system = QUICK_SYSTEM + ("\n\n" + context if context else "")
     cmd = [
         cfg.claude_bin, "-p", text,
@@ -106,6 +111,8 @@ async def _stream_cli(text: str, cfg: Config, model_override: str | None,
         "--max-budget-usd", str(cfg.budgets.get("quick_max_cost_usd", 0.10)),
         "--system-prompt", system,
     ]
+    if resume_session_id:
+        cmd += ["--resume", resume_session_id]
     if tools:
         cmd += ["--allowedTools", ",".join(tools)]
     model = model_override or cfg.models.get("quick")
@@ -148,6 +155,12 @@ async def _stream_cli(text: str, cfg: Config, model_override: str | None,
                         yield ("delta", delta.get("text", ""))
                 elif obj.get("type") == "result":
                     refused = _cli_refused(obj)
+                    error = None
+                    if obj.get("is_error"):
+                        # a failed run may carry its message in "result" or only
+                        # in the "errors" array (e.g. a dead --resume session)
+                        error = obj.get("result") or "; ".join(
+                            str(e) for e in obj.get("errors") or []) or None
                     meta.update({
                         "status": "refused" if refused
                         else ("failed" if obj.get("is_error") else "done"),
@@ -157,7 +170,7 @@ async def _stream_cli(text: str, cfg: Config, model_override: str | None,
                         "output_tokens": (obj.get("usage") or {}).get("output_tokens"),
                         "session_id": obj.get("session_id"),
                         "retry_on_refusal": refused,
-                        "error": obj.get("result") if obj.get("is_error") else None,
+                        "error": error,
                     })
                     if not saw_delta and not obj.get("is_error") and obj.get("result"):
                         yield ("delta", obj["result"])

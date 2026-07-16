@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 
 from . import quick, runner
 from .areas import AreaRegistry
@@ -27,6 +28,13 @@ def make_ack(text: str) -> str:
     return f"On it — {short}{'…' if len(words) > 8 else ''}"
 
 
+def is_resume_error(error: str | None) -> bool:
+    """True when a failure is the resumed session having vanished (CLI session
+    GC / config wipe): 'No conversation found with session ID: …'. The right
+    reaction is a fresh-session retry, not a user-facing failure."""
+    return "no conversation found" in (error or "").lower()
+
+
 class Service:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -41,6 +49,10 @@ class Service:
         self.procs: dict = {}      # task_id -> subprocess (for cancel/barge-in)
         self.bg: dict = {}         # task_id -> asyncio.Task
         self.areas = AreaRegistry(cfg.root / "areas")
+        # quick-path continuity: source -> (last CLI session_id, monotonic time
+        # of last completed turn). In-memory on purpose — the idle window is
+        # minutes, a restart just means one fresh start.
+        self.quick_sessions: dict[str, tuple[str, float]] = {}
 
     async def fire(self, event: str, task: dict, **extra):
         payload = {
@@ -81,9 +93,26 @@ class Service:
 
     # -- quick path ---------------------------------------------------------
 
+    def _fresh_quick_session(self, source: str) -> str | None:
+        """Session to resume for a follow-up turn, or None for a fresh start.
+        Idle-freshness per openclaw reset-policy.ts: the source's last session
+        holds until quick_session_idle_minutes pass without a completed turn
+        (0 = continuity off)."""
+        idle_min = self.cfg.quick_session_idle_minutes
+        entry = self.quick_sessions.get(source)
+        if not idle_min or not entry:
+            return None
+        session_id, last_used = entry
+        if time.monotonic() - last_used > idle_min * 60:
+            self.quick_sessions.pop(source, None)
+            return None
+        return session_id
+
     async def stream_quick(self, task: dict):
         """Async generator of (event_name, payload) pairs; writes run rows and
         retries once on the fallback model when the backend asks for it.
+        Follow-ups within the idle window resume the source's previous CLI
+        session (`claude -p --resume`) so short back-and-forths keep context.
 
         The finally block settles the books when the client vanishes mid-stream
         (barge-in closes the connection, browser tab dies): GeneratorExit /
@@ -102,7 +131,11 @@ class Service:
             q_context = area.context() if area else ""
 
             models = [None, self.cfg.models.get("fallback", "claude-opus-4-8")]
-            for attempt, model_override in enumerate(models, start=1):
+            resume_id = self._fresh_quick_session(task["source"])
+            attempt, idx = 0, 0
+            while idx < len(models):
+                model_override = models[idx]
+                attempt += 1
                 label = model_override or self.cfg.models.get("quick") or "cli-default"
                 run_id = self.db.create_run(task["id"], attempt, label)
                 open_run = run_id
@@ -111,6 +144,7 @@ class Service:
                     async for kind, payload in quick.stream(
                         task["text"], self.cfg, model_override,
                         tools=q_tools, context=q_context,
+                        resume_session_id=resume_id,
                     ):
                         if kind == "delta":
                             collected.append(payload)
@@ -130,11 +164,25 @@ class Service:
                     output_text="".join(collected) or None,
                 )
                 open_run = None
-                if status == "refused" and meta.get("retry_on_refusal") and attempt == 1:
+                if status == "refused" and meta.get("retry_on_refusal") and idx == 0:
                     await self.fire("refused", task, attempt=attempt, model=label)
+                    idx += 1
+                    continue
+                if status == "failed" and resume_id and is_resume_error(meta.get("error")):
+                    # the saved session vanished under us: forget it and rerun
+                    # the same model fresh — at most once, resume_id only goes
+                    # one way (to None)
+                    log.warning("task %s: resume of %s failed; retrying fresh",
+                                task["id"], resume_id)
+                    self.quick_sessions.pop(task["source"], None)
+                    resume_id = None
                     continue
 
                 final = "done" if status == "done" else "failed"
+                if (final == "done" and meta.get("session_id")
+                        and self.cfg.quick_session_idle_minutes):
+                    self.quick_sessions[task["source"]] = (
+                        meta["session_id"], time.monotonic())
                 self.db.set_task_status(task["id"], final)
                 finished = True
                 await self.fire(final, task, cost_usd=meta.get("cost_usd"), model=label)

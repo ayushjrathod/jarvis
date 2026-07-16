@@ -326,7 +326,8 @@ class TestStreamQuickBookkeeping(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def _fake_stream(*events):
-        async def stream(text, cfg, model_override=None, tools=None, context=""):
+        async def stream(text, cfg, model_override=None, tools=None, context="",
+                         resume_session_id=None):
             for ev in events:
                 yield ev
         return stream
