@@ -17,7 +17,12 @@ _INLINE_CODE = re.compile(r"`([^`]*)`")
 _LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 _URL = re.compile(r"https?://\S+")
 _HEADER = re.compile(r"^#{1,6}\s*", re.M)
-_EMPHASIS = re.compile(r"(\*{1,3}|_{1,3}|~~)(?=\S)(.+?)(?<=\S)\1")
+_EMPHASIS = re.compile(r"(\*{1,3}|~~|__)(?=\S)(.+?)(?<=\S)\1")
+# Single-underscore italics only at word edges ([^\W_] = letter/digit, the
+# re equivalent of \p{L}\p{N} in openclaw's strip-markdown.ts): _really_ is
+# emphasis, but the underscores in backup_db.sh are part of the name and must
+# reach the TTS intact.
+_UNDERSCORE_EMPHASIS = re.compile(r"(?<![^\W_])_(?!_)(?=\S)(.+?)(?<=\S)(?<!_)_(?![^\W_])")
 _BULLET = re.compile(r"^\s*[-*+]\s+", re.M)
 _NUMBERED = re.compile(r"^\s*\d+\.\s+", re.M)
 _BLOCKQUOTE = re.compile(r"^>\s?", re.M)
@@ -37,6 +42,7 @@ def sanitize(text: str) -> str:
     text = _URL.sub(" a link ", text)
     text = _HEADER.sub("", text)
     text = _EMPHASIS.sub(r"\2", text)
+    text = _UNDERSCORE_EMPHASIS.sub(r"\1", text)
     text = _BULLET.sub("", text)
     text = _NUMBERED.sub("", text)
     text = _BLOCKQUOTE.sub("", text)

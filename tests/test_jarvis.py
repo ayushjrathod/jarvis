@@ -33,6 +33,17 @@ class TestSanitize(unittest.TestCase):
         self.assertIn("code block omitted", out)
         self.assertNotIn("x = 1", out)
 
+    def test_identifiers_keep_underscores(self):
+        # boundary-guarded per openclaw strip-markdown.ts: snake_case names
+        # survive to the TTS, real _emphasis_ is still stripped
+        self.assertEqual(sanitize("run backup_db.sh now"), "run backup_db.sh now")
+        self.assertEqual(sanitize("wake_prebuffer_ms controls it"),
+                         "wake_prebuffer_ms controls it")
+        self.assertEqual(sanitize("a _really_ good idea"), "a really good idea")
+        self.assertEqual(sanitize("the __init__ method"), "the init method")
+        self.assertEqual(sanitize("set wake_prebuffer_ms to _400_"),
+                         "set wake_prebuffer_ms to 400")
+
     def test_plain_prose_untouched(self):
         self.assertEqual(sanitize("The capital of France is Paris."),
                          "The capital of France is Paris.")
