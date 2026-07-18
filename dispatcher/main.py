@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import ingest, memory, queue_watcher, vault
+from . import curator, ingest, memory, queue_watcher, vault
 from .quick import resolve_backend
 from .config import Config
 from .service import Service, make_ack
@@ -36,6 +36,11 @@ class TaskIn(BaseModel):
     mode: str = "auto"      # auto | quick | agentic
     area: str | None = None
     metadata: dict | None = None
+
+
+class LearnIn(BaseModel):
+    request: str = ""       # empty: learn from the source's recent conversation
+    source: str = "api"
 
 
 def create_app(cfg: Config | None = None) -> FastAPI:
@@ -197,6 +202,50 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             "task_id": task["id"], "status": "queued",
             "episodes": len(job["episode_ids"]), "export": job["export_path"],
         })
+
+    # -- learning endpoints (Phase G) ---------------------------------------
+
+    @app.post("/learn")
+    async def learn(l: LearnIn):
+        """Author an area skill from a described workflow; with an empty
+        request, distill the source's recent quick conversation instead
+        (rides the same session-resume machinery as voice follow-ups)."""
+        resume = svc._fresh_quick_session(l.source)
+        text = l.request.strip() or (
+            "Distill the workflow from our conversation above into an area skill.")
+        if not l.request.strip() and not resume:
+            raise HTTPException(400, "empty request and no recent conversation to learn from")
+        meta = {"task_type": "learn"}
+        if resume:
+            meta["resume_session_id"] = resume
+        task = await svc.submit(text, source=l.source, mode="agentic",
+                                area="learn", metadata=meta)
+        return JSONResponse(status_code=202, content={
+            "task_id": task["id"], "status": "queued", "resumed": bool(resume)})
+
+    @app.get("/skills")
+    async def skills():
+        usage = {u["name"]: u for u in svc.db.skill_usage_all()}
+        out = []
+        for name, area in sorted(svc.areas.load().items()):
+            row = usage.get(name) or {}
+            out.append({
+                "name": name,
+                "triggers": area.triggers, "quick_triggers": area.quick_triggers,
+                "use_count": row.get("use_count", 0),
+                "patch_count": row.get("patch_count", 0),
+                "last_used_at": row.get("last_used_at"),
+                "last_patched_at": row.get("last_patched_at"),
+                "state": row.get("state", "active"),
+                "pinned": bool(row.get("pinned", 0)),
+            })
+        return out
+
+    @app.post("/skills/curate")
+    async def skills_curate():
+        report = await asyncio.to_thread(curator.run, svc.db, cfg)
+        await svc.hooks.fire({"event": "curated", **report})
+        return report
 
     # serve the built dashboard, if present (mounted last: API routes win)
     ui_dist = cfg.root / "ui" / "dist"

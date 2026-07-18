@@ -10,7 +10,7 @@ import logging
 import time
 from datetime import datetime, timezone
 
-from . import limits, memory, quick, runner
+from . import limits, memory, quick, reflection, runner
 from .areas import AreaRegistry
 from .classifier import classify
 from .config import Config
@@ -89,9 +89,15 @@ class Service:
         except Exception:
             log.exception("episode capture failed for %s", task["id"])
 
-    def route(self, text: str, mode: str, area: str | None = None) -> tuple[str, str | None]:
+    def route(self, text: str, mode: str, area: str | None = None,
+              match_area: bool = True) -> tuple[str, str | None]:
         """(kind, area). Area quick_triggers beat triggers beat the classifier;
-        an explicit mode always wins the kind, an explicit area wins the area."""
+        an explicit mode always wins the kind, an explicit area wins the area.
+        match_area=False skips trigger matching entirely — meta-tasks like
+        reflection would otherwise match areas on their own prompt text."""
+        if not match_area:
+            kind = mode if mode in ("quick", "agentic") else classify(text)
+            return kind, area
         matched, hint = self.areas.match(text)
         area_name = area or (matched.name if matched else None)
         if mode in ("quick", "agentic"):
@@ -100,14 +106,20 @@ class Service:
 
     async def create_task(self, text, source, kind, area=None, metadata=None) -> dict:
         task = self.db.create_task(text, source, kind, area, metadata)
+        if area:  # skill telemetry (Phase G) — best-effort, never blocks dispatch
+            try:
+                self.db.record_skill_use(area)
+            except Exception:
+                log.exception("skill-use bump failed for %s", area)
         await self.fire("queued", task)
         return task
 
-    async def submit(self, text, source="api", mode="auto", area=None, metadata=None) -> dict:
+    async def submit(self, text, source="api", mode="auto", area=None,
+                     metadata=None, match_area=True) -> dict:
         """Fire-and-forget entry point (queue watcher, timers). Quick tasks run
         in the background with output stored in the run row; HTTP clients that
         want streamed quick answers go through create_task + stream_quick."""
-        kind, area_name = self.route(text, mode, area)
+        kind, area_name = self.route(text, mode, area, match_area)
         task = await self.create_task(text, source, kind, area_name, metadata)
         if kind == "agentic":
             self.start_agentic(task)
@@ -267,6 +279,7 @@ class Service:
     async def _run_agentic_inner(self, task: dict):
         self.db.set_task_status(task["id"], "running")
         await self.fire("started", task)
+        run_started = time.time()
         meta = json.loads(task["metadata"]) if task.get("metadata") else {}
         area = self.areas.get(task["area"]) if task.get("area") else None
         tools = (
@@ -291,6 +304,8 @@ class Service:
                 result = await runner.run_once(
                     task["text"], self.cfg, model, tools, self.procs, task["id"],
                     system_extra=system_extra,
+                    resume_session_id=meta.get("resume_session_id"),
+                    max_cost_usd=meta.get("max_cost_usd"),
                 )
             # cancel() may have killed the subprocess and closed the books while
             # run_once was returning; don't overwrite 'cancelled' with 'failed'
@@ -337,7 +352,52 @@ class Service:
             if requeue_delay is not None:
                 self._schedule_limit_requeue(task, meta, requeue_delay)
                 await self.fire("requeued", task, delay_s=int(requeue_delay))
+            if final == "done":
+                if meta.get("task_type") in ("reflection", "learn"):
+                    self._record_skill_patches(run_started)
+                await self._maybe_reflect(task, meta, result)
             return
+
+    async def _maybe_reflect(self, task: dict, task_meta: dict, result: dict):
+        """Queue the post-task reflection fork (Phase G) when the run was
+        complex enough to have taught something. The reflection resumes the
+        run's own CLI session (warm cache) with areas/**-scoped edit tools."""
+        lcfg = getattr(self.cfg, "learning", None) or {}
+        if not reflection.should_reflect(lcfg, task, task_meta, result):
+            return
+        log.info("task %s: %s turns — queueing reflection",
+                 task["id"], result.get("num_turns"))
+        await self.submit(
+            reflection.PROMPT, source="reflection", mode="agentic",
+            match_area=False,  # the prompt's own text must not match triggers
+            metadata={
+                "task_type": "reflection",
+                "resume_session_id": result["session_id"],
+                "allowed_tools": list(reflection.REFLECTION_TOOLS),
+                "max_cost_usd": lcfg.get("reflection_max_cost_usd", 1.00),
+            })
+
+    def _record_skill_patches(self, since: float):
+        """Attribute area edits made by a reflection/learn run to skill
+        telemetry: any area dir with a file modified after the run started
+        counts as patched. mtime-based on purpose — the JSON output format
+        carries no per-tool events (a run_steps table is Phase H)."""
+        areas_dir = self.cfg.root / "areas"
+        if not areas_dir.is_dir():
+            return
+        for d in areas_dir.iterdir():
+            if not d.is_dir() or d.name.startswith("."):
+                continue
+            try:
+                touched = any(f.is_file() and f.stat().st_mtime >= since - 1
+                              for f in d.rglob("*"))
+            except OSError:
+                continue
+            if touched:
+                try:
+                    self.db.record_skill_patch(d.name)
+                except Exception:
+                    log.exception("skill-patch bump failed for %s", d.name)
 
     def _limit_requeue_delay(self, limit: limits.LimitInfo) -> float:
         """Seconds until a limit-failed timer task is worth retrying: shortly

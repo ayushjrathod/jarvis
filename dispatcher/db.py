@@ -91,6 +91,21 @@ CREATE TABLE IF NOT EXISTS entry_dates (
   date     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_entry_dates ON entry_dates(date);
+
+-- Skill lifecycle telemetry (Phase G, after hermes-agent tools/skill_usage.py,
+-- MIT): one row per area skill; the deterministic curator ages state
+-- active → stale → archived from these timestamps. Best-effort counters —
+-- a failed bump must never fail the task that caused it.
+CREATE TABLE IF NOT EXISTS skill_usage (
+  name            TEXT PRIMARY KEY,
+  use_count       INTEGER NOT NULL DEFAULT 0,
+  patch_count     INTEGER NOT NULL DEFAULT 0,
+  last_used_at    TEXT,
+  last_patched_at TEXT,
+  first_seen_at   TEXT NOT NULL,
+  state           TEXT NOT NULL DEFAULT 'active',
+  pinned          INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -279,6 +294,40 @@ class Database:
         args.append(limit)
         with self._conn() as c:
             return [dict(r) for r in c.execute(sql, args).fetchall()]
+
+    # -- skill usage (Phase G) ---------------------------------------------
+
+    def _touch_skill(self, c, name: str):
+        c.execute(
+            "INSERT INTO skill_usage (name, first_seen_at) VALUES (?,?)"
+            " ON CONFLICT(name) DO NOTHING", (name, now()))
+
+    def record_skill_use(self, name: str):
+        with self._conn() as c:
+            self._touch_skill(c, name)
+            c.execute(
+                "UPDATE skill_usage SET use_count=use_count+1, last_used_at=?,"
+                " state=CASE WHEN state='stale' THEN 'active' ELSE state END"
+                " WHERE name=?", (now(), name))
+
+    def record_skill_patch(self, name: str):
+        with self._conn() as c:
+            self._touch_skill(c, name)
+            c.execute(
+                "UPDATE skill_usage SET patch_count=patch_count+1,"
+                " last_patched_at=?,"
+                " state=CASE WHEN state='stale' THEN 'active' ELSE state END"
+                " WHERE name=?", (now(), name))
+
+    def skill_usage_all(self) -> list[dict]:
+        with self._conn() as c:
+            return [dict(r) for r in
+                    c.execute("SELECT * FROM skill_usage ORDER BY name").fetchall()]
+
+    def set_skill_state(self, name: str, state: str):
+        with self._conn() as c:
+            self._touch_skill(c, name)
+            c.execute("UPDATE skill_usage SET state=? WHERE name=?", (state, name))
 
     # -- vault entries (search index) --------------------------------------
 

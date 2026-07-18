@@ -55,12 +55,17 @@ SPAWN_ERRORS = (OSError,)
 
 
 async def run_once(text: str, cfg: Config, model: str | None, tools: list[str],
-                   procs: dict, task_id: str, system_extra: str = "") -> dict:
+                   procs: dict, task_id: str, system_extra: str = "",
+                   resume_session_id: str | None = None,
+                   max_cost_usd: float | None = None) -> dict:
     """One `claude -p` attempt (with one internal retry on a transient
-    spawn/timeout error). Returns normalized result fields."""
+    spawn/timeout error). Returns normalized result fields.
+    resume_session_id continues an earlier CLI session (reflection forks ride
+    the warm prompt cache); max_cost_usd overrides the default budget cap."""
     for attempt in (1, 2):
         try:
-            return await _attempt(text, cfg, model, tools, procs, task_id, system_extra)
+            return await _attempt(text, cfg, model, tools, procs, task_id,
+                                  system_extra, resume_session_id, max_cost_usd)
         except _Timeout as exc:
             if attempt == 2:
                 return {"status": "timeout", "error": str(exc)}
@@ -78,15 +83,19 @@ class _Timeout(Exception):
         self.seconds = seconds
 
 
-async def _attempt(text: str, cfg: Config, model: str | None, tools: list[str],
-                    procs: dict, task_id: str, system_extra: str = "") -> dict:
+def build_cmd(text: str, cfg: Config, model: str | None, tools: list[str],
+              system_extra: str = "", resume_session_id: str | None = None,
+              max_cost_usd: float | None = None) -> list[str]:
     system = AGENT_SYSTEM + ("\n\n" + system_extra if system_extra else "")
+    budget = max_cost_usd or cfg.budgets.get("max_cost_per_task_usd", 0.50)
     cmd = [
         cfg.claude_bin, "-p", text,
         "--output-format", "json",
-        "--max-budget-usd", str(cfg.budgets.get("max_cost_per_task_usd", 0.50)),
+        "--max-budget-usd", str(budget),
         "--append-system-prompt", system,
     ]
+    if resume_session_id:
+        cmd += ["--resume", resume_session_id]
     if tools:
         cmd += ["--allowedTools", ",".join(tools)]
     if model:
@@ -94,6 +103,15 @@ async def _attempt(text: str, cfg: Config, model: str | None, tools: list[str],
     effort = cfg.models.get("effort")
     if effort:
         cmd += ["--effort", effort]
+    return cmd
+
+
+async def _attempt(text: str, cfg: Config, model: str | None, tools: list[str],
+                    procs: dict, task_id: str, system_extra: str = "",
+                    resume_session_id: str | None = None,
+                    max_cost_usd: float | None = None) -> dict:
+    cmd = build_cmd(text, cfg, model, tools, system_extra,
+                    resume_session_id, max_cost_usd)
     env = dict(os.environ)
     if cfg.claude_config_dir:
         env["CLAUDE_CONFIG_DIR"] = cfg.claude_config_dir

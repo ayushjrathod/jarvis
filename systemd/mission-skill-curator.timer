@@ -1,0 +1,9 @@
+[Unit]
+Description=Mission Control: skill lifecycle pass on the 1st of each month
+
+[Timer]
+OnCalendar=*-*-01 04:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

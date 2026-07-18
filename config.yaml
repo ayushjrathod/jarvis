@@ -64,6 +64,21 @@ dispatcher:
     index_dirs: [vault]            # ingest walks these for /memory/search
     reindex_on_start: true
 
+  # Learning loop (Phase G): a complex agentic run (>= min turns) triggers a
+  # reflection fork that resumes the run's own CLI session with areas/**-scoped
+  # edit tools and patches/creates skills (hermes-agent review pattern, MIT).
+  # The deterministic curator ages unused areas active -> stale -> archived
+  # (moved to areas/.archive/, recoverable); protected/pinned/timer areas are
+  # exempt, as are never-used areas younger than the stale window.
+  learning:
+    reflection: true
+    reflection_min_turns: 12      # num_turns >= this queues a reflection
+    reflection_max_cost_usd: 1.00  # budget cap for the reflection run
+    curator:
+      stale_after_days: 30
+      archive_after_days: 90       # stale this long -> areas/.archive/
+      protected: [tasks, memory, learn]
+
   # USD per million tokens, for quick-path cost computation (agentic cost comes
   # from the CLI's total_cost_usd). Cached from docs 2026-07-05.
   prices:

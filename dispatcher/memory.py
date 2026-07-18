@@ -77,8 +77,9 @@ def should_capture(cfg: Config, task: dict, status: str) -> bool:
         meta = json.loads(task["metadata"]) if task.get("metadata") else {}
     except (TypeError, ValueError):
         meta = {}
-    # the consolidation agent's own run must not become next night's input
-    return meta.get("task_type") != "memory-consolidate"
+    # meta-work must not feed back into memory: the consolidator's own run
+    # would become next night's input, reflections are private review passes
+    return meta.get("task_type") not in ("memory-consolidate", "reflection")
 
 
 def build_consolidation(cfg: Config, db: Database) -> dict | None:
