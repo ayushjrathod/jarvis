@@ -25,7 +25,8 @@ Every working session MUST:
 | C | Tasks/work vertical slice + daily brief + weekly review | **implemented, acceptance passing — Gmail MCP left to user OAuth** |
 | D | React dashboard | **implemented — served by dispatcher at :8765, headless-render verified** |
 | E | systemd wrap-up | **implemented — units live, auto-restart verified; reboot test = user** |
-| F | v2 memory foundation (episode capture, core blocks, vault FTS index, /memory API, nightly consolidation) | **implemented, acceptance passing — awaiting user review** |
+| F | v2 memory foundation (episode capture, core blocks, vault FTS index, /memory API, nightly consolidation) | **implemented, acceptance passing** (user waived review) |
+| G | v2 learning loop (reflection fork on complex runs, skill telemetry, /learn + learn area, deterministic curator) | **implemented, acceptance passing — awaiting user review** |
 
 v2 (phases F–J: memory, learning loop, observability, personal OS, graph) is
 planned in `context/v2-plan.md` (user approved the direction 2026-07-18);
@@ -177,6 +178,28 @@ before writing from scratch.
 - Verifying memory recall: use a **fresh source name** — within
   `quick_session_idle_minutes` the same source resumes its CLI session, which
   can answer from conversation context and mask whether block injection works.
+
+## Operational notes (learned Phase G)
+
+- Learning loop: an agentic run finishing 'done' with `num_turns >=
+  learning.reflection_min_turns` (12) auto-queues a **reflection** task that
+  resumes the run's CLI session (`--resume`, warm cache — measured $0.019)
+  with `Edit(areas/**)`-scoped tools and the Hermes-derived review prompt in
+  `dispatcher/reflection.py`. "Nothing to save." is a normal outcome.
+  Reflections never reflect, never enter episodes, and never match areas
+  (`match_area=False` — the prompt's own text hits area triggers otherwise;
+  learned live).
+- Skill telemetry: `skill_usage` bumps on every dispatched task with an area
+  and on mtime-detected area edits by reflection/learn runs. `GET /skills`
+  lists areas + counters; `POST /skills/curate` runs the deterministic
+  lifecycle (stale 30d → archived 90d later, move to `areas/.archive/`,
+  never delete); monthly timer `mission-skill-curator` (1st, 04:00).
+  Protected: pinned rows, `learning.curator.protected`, timer areas.
+- `POST /learn {request, source}` authors a skill via the `learn` area; an
+  empty request distills the source's recent quick conversation (session
+  resume). Voice: "learn this as a skill".
+- `claude -p --resume` works from the agentic runner too (same session store
+  as the quick path) — that's what makes reflection nearly free.
 
 ## Known quirks / open items
 

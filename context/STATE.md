@@ -4,10 +4,41 @@ _Last updated: 2026-07-18 (session 11, end)_
 
 ## Current phase
 
-**Phase F (v2 memory foundation) IMPLEMENTED, acceptance passing — awaiting
-user review.** User approved the v2 direction ("go ahead what you think is
-right") same-day after the planning pass; phases G–J remain planned-only in
-`context/v2-plan.md`. Next up after F review: Phase G (learning loop).
+**Phases F AND G (v2 memory foundation + learning loop) IMPLEMENTED, both
+acceptance-passing, live under systemd.** User waived the F review ("i am
+not checking go ahead"), so G was built in the same session. Next: Phase H
+(observability) per `context/v2-plan.md`, pending user go-ahead.
+
+## Session 11 (cont. 2): Phase G — learning loop, live-verified
+
+- **`dispatcher/reflection.py`** — Hermes-derived review prompt (signals,
+  patch-before-create order, anti-capture rules; MIT, attributed) +
+  `should_reflect()` policy gate (pure function, unit-tested).
+- **Trigger**: agentic run 'done' with `num_turns >= 12` (config) →
+  `_maybe_reflect` submits source="reflection" task with
+  `resume_session_id` + `Edit(areas/**)` tools + $1 budget cap.
+  `runner.build_cmd` grew `--resume` + per-task budget (extracted for
+  testability). Meta-tasks (reflection/consolidate/learn) never re-reflect;
+  reflections excluded from episode capture.
+- **Live bug found & fixed**: the reflection prompt's own text matched the
+  tasks area's triggers as a word subsequence → wrong SKILL context injected
+  + telemetry pollution. `route()/submit()` grew `match_area=False`;
+  regression test added.
+- **`skill_usage` table** (hermes pattern): use bump on every area-tagged
+  task, patch bump via mtime scan of areas/ after reflection/learn runs
+  (per-tool events are Phase H). `GET /skills`, `POST /skills/curate`.
+- **`dispatcher/curator.py`** — deterministic lifecycle only (their LLM pass
+  deliberately skipped): active →(30d idle) stale →(90d more) archived =
+  moved to `areas/.archive/` (registry can't see dotdirs; recoverable; no
+  git ops — shows in git status). Protected: pinned, config list, timer
+  areas. Monthly timer `mission-skill-curator` installed + enabled.
+- **`areas/learn/`** + `POST /learn`: skill authoring with our frontmatter
+  format (class-level names, subsequence triggers, least-privilege tools);
+  empty request resumes the source's fresh quick session.
+- **113 tests green (+16).** Live: a real 12-turn-threshold-lowered agentic
+  run auto-spawned its reflection, which resumed the session for **$0.019 /
+  1 turn** and correctly answered "Nothing to save."; curator live-run
+  skipped all three protected areas; /learn 400s without material.
 
 ## Session 11 (cont.): Phase F built, tested, live-verified
 
