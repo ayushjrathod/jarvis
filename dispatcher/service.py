@@ -10,7 +10,7 @@ import logging
 import time
 from datetime import datetime, timezone
 
-from . import limits, quick, runner
+from . import limits, memory, quick, runner
 from .areas import AreaRegistry
 from .classifier import classify
 from .config import Config
@@ -65,6 +65,29 @@ class Service:
             **extra,
         }
         await self.hooks.fire(payload)
+
+    def _with_memory(self, context: str) -> str:
+        """Prepend the always-in-context memory blocks (Phase F) to a run's
+        extra system context. A broken block file must never take down the
+        dispatch path — worst case the run just goes out memoryless."""
+        try:
+            mem = memory.blocks_context(self.cfg)
+        except Exception:
+            log.exception("memory blocks failed to load")
+            mem = ""
+        return "\n\n".join(x for x in (mem, context) if x)
+
+    def _capture_episode(self, task: dict, status: str, answer: str | None):
+        """Append the settled interaction to the episodes table (Phase F).
+        Raw capture is free (no LLM); the nightly consolidation agent distills
+        it. Best-effort by design — capture failure never fails the task."""
+        if not memory.should_capture(self.cfg, task, status):
+            return
+        try:
+            self.db.add_episode(task["id"], task["source"], task["kind"],
+                                task.get("area"), status, task["text"], answer)
+        except Exception:
+            log.exception("episode capture failed for %s", task["id"])
 
     def route(self, text: str, mode: str, area: str | None = None) -> tuple[str, str | None]:
         """(kind, area). Area quick_triggers beat triggers beat the classifier;
@@ -129,7 +152,7 @@ class Service:
 
             area = self.areas.get(task["area"]) if task.get("area") else None
             q_tools = area.quick_allowed_tools if area else None
-            q_context = area.context() if area else ""
+            q_context = self._with_memory(area.context() if area else "")
 
             models = [None, self.cfg.models.get("fallback", "claude-opus-4-8")]
             resume_id = self._fresh_quick_session(task["source"])
@@ -198,6 +221,7 @@ class Service:
                 speech = (limits.limit_speech(limit)
                           if final == "failed" and limit else None)
                 self.db.set_task_status(task["id"], final)
+                self._capture_episode(task, final, "".join(collected) or None)
                 finished = True
                 await self.fire(final, task, cost_usd=meta.get("cost_usd"),
                                 model=label, error=meta.get("error"), speech=speech)
@@ -250,7 +274,7 @@ class Service:
             or (area.allowed_tools if area and area.allowed_tools else None)
             or self.cfg.tools_for(meta.get("task_type"))
         )
-        system_extra = area.context() if area else ""
+        system_extra = self._with_memory(area.context() if area else "")
         attempts = [
             (1, self.cfg.models.get("agentic")),
             (2, self.cfg.models.get("fallback", "claude-opus-4-8")),
@@ -306,6 +330,7 @@ class Service:
                 requeue_delay = self._limit_requeue_delay(limit)
                 speech += " I'll retry the task after that."
             self.db.set_task_status(task["id"], final)
+            self._capture_episode(task, final, result.get("output_text"))
             await self.fire(final, task, cost_usd=result.get("cost_usd"),
                             model=label, output_path=output_path,
                             error=result.get("error"), speech=speech)

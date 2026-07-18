@@ -45,7 +45,60 @@ CREATE TABLE IF NOT EXISTS runs (
   session_id    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task_id);
+
+-- Memory (Phase F). episodes = raw interaction log, one row per settled task;
+-- valid_at is when it happened (bi-temporal capture per graphiti — the one
+-- thing that can't be retrofitted). consolidated_at marks hand-off to the
+-- nightly consolidation agent.
+CREATE TABLE IF NOT EXISTS episodes (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id         TEXT,
+  source          TEXT NOT NULL,
+  kind            TEXT NOT NULL,
+  area            TEXT,
+  status          TEXT NOT NULL,
+  user_text       TEXT NOT NULL,
+  assistant_text  TEXT,
+  valid_at        TEXT NOT NULL,
+  consolidated_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_episodes_consolidated ON episodes(consolidated_at);
+CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(text, episode_id UNINDEXED);
+
+-- Vault search index: heading-ancestry chunks with per-chunk content hashes
+-- (ingest design after khoj's TextToEntries — AGPL, patterns re-implemented,
+-- no code copied). entries_fts is a standalone FTS5 copy: duplicates a small
+-- corpus in exchange for not managing external-content sync triggers.
+CREATE TABLE IF NOT EXISTS vault_files (
+  path       TEXT PRIMARY KEY,
+  mtime      REAL NOT NULL,
+  indexed_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS entries (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  file_path  TEXT NOT NULL,
+  heading    TEXT,
+  line_no    INTEGER,
+  raw        TEXT NOT NULL,
+  compiled   TEXT NOT NULL,
+  hash       TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_entries_file ON entries(file_path);
+CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(compiled, entry_id UNINDEXED);
+CREATE TABLE IF NOT EXISTS entry_dates (
+  entry_id INTEGER NOT NULL,
+  date     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_entry_dates ON entry_dates(date);
 """
+
+
+def fts_query(q: str) -> str:
+    """Every term double-quoted so user text can't hit FTS5 operator syntax
+    (NEAR, AND, column filters, unbalanced quotes)."""
+    terms = [t.replace('"', "") for t in q.split()]
+    return " ".join(f'"{t}"' for t in terms if t)
 
 
 def now() -> str:
@@ -166,3 +219,158 @@ class Database:
         args.append(run_id)
         with self._conn() as c:
             c.execute(f"UPDATE runs SET {', '.join(sets)} WHERE id=?", args)
+
+    # -- episodes (memory capture) -----------------------------------------
+
+    def add_episode(self, task_id, source, kind, area, status,
+                    user_text, assistant_text) -> int:
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO episodes (task_id, source, kind, area, status,"
+                " user_text, assistant_text, valid_at) VALUES (?,?,?,?,?,?,?,?)",
+                (task_id, source, kind, area, status, user_text,
+                 assistant_text, now()),
+            )
+            eid = cur.lastrowid
+            c.execute(
+                "INSERT INTO episodes_fts (text, episode_id) VALUES (?,?)",
+                (f"{user_text}\n{assistant_text or ''}", eid),
+            )
+            return eid
+
+    def unconsolidated_episodes(self, limit: int = 200) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM episodes WHERE consolidated_at IS NULL"
+                " ORDER BY id LIMIT ?", (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def mark_episodes_consolidated(self, ids: list[int]):
+        if not ids:
+            return
+        with self._conn() as c:
+            c.executemany(
+                "UPDATE episodes SET consolidated_at=? WHERE id=?",
+                [(now(), i) for i in ids],
+            )
+
+    def search_episodes(self, q: str, limit: int = 10,
+                        after: str | None = None,
+                        before: str | None = None) -> list[dict]:
+        match = fts_query(q)
+        if not match:
+            return []
+        sql = (
+            "SELECT e.id, e.task_id, e.source, e.kind, e.area, e.status,"
+            " e.user_text, e.assistant_text, e.valid_at,"
+            " bm25(episodes_fts) AS score"
+            " FROM episodes_fts f JOIN episodes e ON e.id = f.episode_id"
+            " WHERE episodes_fts MATCH ?"
+        )
+        args: list = [match]
+        if after:
+            sql += " AND e.valid_at >= ?"
+            args.append(after)
+        if before:
+            sql += " AND e.valid_at <= ?"
+            args.append(before)
+        sql += " ORDER BY score LIMIT ?"
+        args.append(limit)
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(sql, args).fetchall()]
+
+    # -- vault entries (search index) --------------------------------------
+
+    def vault_file_mtimes(self) -> dict[str, float]:
+        with self._conn() as c:
+            rows = c.execute("SELECT path, mtime FROM vault_files").fetchall()
+            return {r["path"]: r["mtime"] for r in rows}
+
+    def replace_file_entries(self, path: str, mtime: float,
+                             chunks: list[dict]) -> tuple[int, int]:
+        """Hash-diff one file's chunks against what's indexed: only chunks
+        whose content hash is new get inserted, vanished hashes get deleted,
+        the rest are untouched (khoj update_embeddings pattern, re-implemented).
+        chunks: [{heading, line_no, raw, compiled, hash, dates}]."""
+        new_by_hash = {ch["hash"]: ch for ch in chunks}
+        added = deleted = 0
+        with self._conn() as c:
+            existing = c.execute(
+                "SELECT id, hash FROM entries WHERE file_path=?", (path,)
+            ).fetchall()
+            seen = set()
+            for row in existing:
+                if row["hash"] in new_by_hash and row["hash"] not in seen:
+                    seen.add(row["hash"])
+                else:  # gone from the file (or a duplicate row): drop it
+                    c.execute("DELETE FROM entries WHERE id=?", (row["id"],))
+                    c.execute("DELETE FROM entries_fts WHERE entry_id=?", (row["id"],))
+                    c.execute("DELETE FROM entry_dates WHERE entry_id=?", (row["id"],))
+                    deleted += 1
+            for ch in chunks:
+                if ch["hash"] in seen:
+                    continue
+                seen.add(ch["hash"])
+                cur = c.execute(
+                    "INSERT INTO entries (file_path, heading, line_no, raw,"
+                    " compiled, hash, created_at) VALUES (?,?,?,?,?,?,?)",
+                    (path, ch.get("heading"), ch.get("line_no"), ch["raw"],
+                     ch["compiled"], ch["hash"], now()),
+                )
+                eid = cur.lastrowid
+                c.execute("INSERT INTO entries_fts (compiled, entry_id) VALUES (?,?)",
+                          (ch["compiled"], eid))
+                for d in ch.get("dates") or []:
+                    c.execute("INSERT INTO entry_dates (entry_id, date) VALUES (?,?)",
+                              (eid, d))
+                added += 1
+            c.execute(
+                "INSERT INTO vault_files (path, mtime, indexed_at) VALUES (?,?,?)"
+                " ON CONFLICT(path) DO UPDATE SET mtime=excluded.mtime,"
+                " indexed_at=excluded.indexed_at",
+                (path, mtime, now()),
+            )
+        return added, deleted
+
+    def delete_file_entries(self, path: str) -> int:
+        with self._conn() as c:
+            ids = [r["id"] for r in c.execute(
+                "SELECT id FROM entries WHERE file_path=?", (path,)).fetchall()]
+            for eid in ids:
+                c.execute("DELETE FROM entries_fts WHERE entry_id=?", (eid,))
+                c.execute("DELETE FROM entry_dates WHERE entry_id=?", (eid,))
+            c.execute("DELETE FROM entries WHERE file_path=?", (path,))
+            c.execute("DELETE FROM vault_files WHERE path=?", (path,))
+            return len(ids)
+
+    def search_entries(self, q: str, limit: int = 10,
+                       file_like: str | None = None,
+                       after: str | None = None,
+                       before: str | None = None) -> list[dict]:
+        match = fts_query(q)
+        if not match:
+            return []
+        sql = (
+            "SELECT e.id, e.file_path, e.heading, e.line_no, e.raw,"
+            " bm25(entries_fts) AS score"
+            " FROM entries_fts f JOIN entries e ON e.id = f.entry_id"
+            " WHERE entries_fts MATCH ?"
+        )
+        args: list = [match]
+        if file_like:
+            sql += " AND e.file_path LIKE ?"
+            args.append(file_like.replace("*", "%"))
+        if after or before:
+            dsql = "SELECT entry_id FROM entry_dates WHERE 1=1"
+            if after:
+                dsql += " AND date >= ?"
+                args.append(after)
+            if before:
+                dsql += " AND date <= ?"
+                args.append(before)
+            sql += f" AND e.id IN ({dsql})"
+        sql += " ORDER BY score LIMIT ?"
+        args.append(limit)
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(sql, args).fetchall()]

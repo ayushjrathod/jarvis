@@ -51,6 +51,19 @@ dispatcher:
     summarize:
       allowed_tools: [Read, Glob, Grep, Write]
 
+  # Memory (Phase F): raw episode capture + always-in-context blocks + vault
+  # search index. Blocks are plain markdown in blocks_dir — edit them freely;
+  # budgets are chars (~4 per token), enforced at prompt-build time.
+  memory:
+    capture: true                  # log settled interactions to the episodes table
+    capture_exclude_sources: []    # sources never captured, e.g. [smoke]
+    blocks_dir: vault/memory
+    block_budgets:
+      USER.md: 2000
+      MEMORY.md: 3200
+    index_dirs: [vault]            # ingest walks these for /memory/search
+    reindex_on_start: true
+
   # USD per million tokens, for quick-path cost computation (agentic cost comes
   # from the CLI's total_cost_usd). Cached from docs 2026-07-05.
   prices:

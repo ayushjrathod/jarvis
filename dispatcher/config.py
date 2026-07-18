@@ -28,6 +28,7 @@ class Config:
     default_tools: list = field(default_factory=list)
     task_types: dict = field(default_factory=dict)
     prices: dict = field(default_factory=dict)
+    memory: dict = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "Config":
@@ -57,6 +58,7 @@ class Config:
         cfg.default_tools = (d.get("task_defaults") or {}).get("allowed_tools", [])
         cfg.task_types = d.get("task_types", {})
         cfg.prices = d.get("prices", {})
+        cfg.memory = d.get("memory", {})
         return cfg
 
     def tools_for(self, task_type: str | None) -> list[str]:

@@ -16,6 +16,7 @@ systemctl --user enable --now mission-dispatcher.service
 systemctl --user enable --now mission-daily-brief.timer
 systemctl --user enable --now mission-weekly-review.timer
 systemctl --user enable --now mission-backup.timer
+systemctl --user enable --now mission-memory-consolidate.timer
 
 echo
 systemctl --user --no-pager status mission-dispatcher.service | head -5

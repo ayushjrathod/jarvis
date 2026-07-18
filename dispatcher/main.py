@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import queue_watcher, vault
+from . import ingest, memory, queue_watcher, vault
 from .quick import resolve_backend
 from .config import Config
 from .service import Service, make_ack
@@ -42,11 +42,26 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     cfg = cfg or Config.load()
     svc = Service(cfg)
 
+    log = logging.getLogger("dispatcher.main")
+
+    async def _startup_reindex():
+        try:
+            stats = await asyncio.to_thread(
+                ingest.ingest_vault, svc.db, cfg.root,
+                cfg.memory.get("index_dirs", ["vault"]))
+            log.info("vault reindex: %s", stats)
+        except Exception:
+            log.exception("startup vault reindex failed")
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         watcher = asyncio.create_task(queue_watcher.watch(svc))
+        reindex = (asyncio.create_task(_startup_reindex())
+                   if cfg.memory.get("reindex_on_start", True) else None)
         yield
         watcher.cancel()
+        if reindex:
+            reindex.cancel()
         await svc.shutdown()
 
     app = FastAPI(title="mission-control dispatcher", lifespan=lifespan)
@@ -137,6 +152,51 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         if not brief:
             raise HTTPException(404, "no briefs yet")
         return brief
+
+    # -- memory endpoints (Phase F) -----------------------------------------
+
+    @app.get("/memory/search")
+    async def memory_search(q: str, limit: int = 10, scope: str = "all",
+                            file: str | None = None,
+                            after: str | None = None,
+                            before: str | None = None):
+        """FTS5 (BM25) over the vault index and the episode log. `file` is a
+        glob-ish path filter (* allowed); after/before hit indexed entry dates
+        resp. episode times (ISO)."""
+        out: dict = {}
+        if scope in ("all", "vault"):
+            out["entries"] = svc.db.search_entries(q, limit, file, after, before)
+        if scope in ("all", "episodes"):
+            out["episodes"] = svc.db.search_episodes(q, limit, after, before)
+        if not out:
+            raise HTTPException(400, "scope must be all|vault|episodes")
+        return out
+
+    @app.post("/memory/reindex")
+    async def memory_reindex():
+        return await asyncio.to_thread(
+            ingest.ingest_vault, svc.db, cfg.root,
+            cfg.memory.get("index_dirs", ["vault"]))
+
+    @app.get("/memory/blocks")
+    async def memory_blocks():
+        return {"context": memory.blocks_context(cfg)}
+
+    @app.post("/memory/consolidate")
+    async def memory_consolidate():
+        """Export unconsolidated episodes and queue the consolidation agent.
+        Episodes are marked at hand-off; the export file in data/consolidation/
+        is the audit trail if the run then fails."""
+        job = memory.build_consolidation(cfg, svc.db)
+        if not job:
+            return {"status": "nothing_to_consolidate"}
+        svc.db.mark_episodes_consolidated(job["episode_ids"])
+        task = await svc.submit(job["text"], source="timer", mode="agentic",
+                                area="memory", metadata=job["metadata"])
+        return JSONResponse(status_code=202, content={
+            "task_id": task["id"], "status": "queued",
+            "episodes": len(job["episode_ids"]), "export": job["export_path"],
+        })
 
     # serve the built dashboard, if present (mounted last: API routes win)
     ui_dist = cfg.root / "ui" / "dist"

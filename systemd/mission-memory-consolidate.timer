@@ -1,0 +1,9 @@
+[Unit]
+Description=Mission Control: consolidate memory nightly (before the 03:30 backup)
+
+[Timer]
+OnCalendar=*-*-* 02:30
+Persistent=true
+
+[Install]
+WantedBy=timers.target
