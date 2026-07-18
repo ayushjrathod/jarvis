@@ -27,6 +27,8 @@ export default function AgentMonitor({ lastEvent }) {
 
   useEffect(() => {
     if (!lastEvent?.task_id) return;
+    // automation/notify events reference a task but aren't status changes
+    if (["notify", "notify_skipped", "automation", "automation_created"].includes(lastEvent.event)) return;
     setRows((rows) => {
       const next = rows.filter((r) => r.task_id !== lastEvent.task_id);
       const prev = rows.find((r) => r.task_id === lastEvent.task_id) ?? {};

@@ -30,6 +30,7 @@ class Config:
     prices: dict = field(default_factory=dict)
     memory: dict = field(default_factory=dict)
     learning: dict = field(default_factory=dict)
+    automations: dict = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "Config":
@@ -61,6 +62,7 @@ class Config:
         cfg.prices = d.get("prices", {})
         cfg.memory = d.get("memory", {})
         cfg.learning = d.get("learning", {})
+        cfg.automations = d.get("automations", {})
         return cfg
 
     def tools_for(self, task_type: str | None) -> list[str]:

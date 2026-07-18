@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import curator, ingest, memory, queue_watcher, vault
+from . import automations, curator, ingest, memory, queue_watcher, vault
 from .quick import resolve_backend
 from .config import Config
 from .service import Service, make_ack
@@ -43,6 +43,11 @@ class LearnIn(BaseModel):
     source: str = "api"
 
 
+class AutomationIn(BaseModel):
+    request: str            # natural language: "every morning, tell me …"
+    source: str = "api"
+
+
 def create_app(cfg: Config | None = None) -> FastAPI:
     cfg = cfg or Config.load()
     svc = Service(cfg)
@@ -63,10 +68,14 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         watcher = asyncio.create_task(queue_watcher.watch(svc))
         reindex = (asyncio.create_task(_startup_reindex())
                    if cfg.memory.get("reindex_on_start", True) else None)
+        scheduler = (asyncio.create_task(automations.loop(svc))
+                     if (cfg.automations or {}).get("enabled") else None)
         yield
         watcher.cancel()
         if reindex:
             reindex.cancel()
+        if scheduler:
+            scheduler.cancel()
         await svc.shutdown()
 
     app = FastAPI(title="mission-control dispatcher", lifespan=lifespan)
@@ -74,6 +83,23 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
     @app.post("/task")
     async def post_task(t: TaskIn):
+        # NL automation divert (Phase I): schedule-phrased requests become
+        # standing automations instead of one-shot tasks. mode=auto only —
+        # an explicit quick/agentic bypasses, so nothing is unreachable.
+        acfg = cfg.automations or {}
+        if (acfg.get("enabled") and acfg.get("nl_detect", True)
+                and t.mode == "auto" and automations.detect(t.text)):
+            row, speech = await svc.create_automation_from_nl(t.text, t.source)
+
+            async def confirm():
+                # no task_id: an automation row isn't cancellable via /task
+                yield sse("task", {"task_id": None, "kind": "automation"})
+                yield sse("delta", {"text": speech})
+                yield sse("done", {"status": "done",
+                                   "automation_id": row["id"] if row else None})
+
+            return StreamingResponse(confirm(), media_type="text/event-stream")
+
         kind, area = svc.route(t.text, t.mode, t.area)
         if kind == "agentic":
             task = await svc.submit(t.text, t.source, "agentic", area, t.metadata)
@@ -215,6 +241,44 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             "task_id": task["id"], "status": "queued",
             "episodes": len(job["episode_ids"]), "export": job["export_path"],
         })
+
+    # -- automation endpoints (Phase I) -------------------------------------
+
+    def _automation_view(row: dict) -> dict:
+        return {**row, "describe": automations.describe(automations.spec_from_row(row))}
+
+    @app.post("/automations")
+    async def create_automation(a: AutomationIn):
+        """NL request → one LLM parse → validated standing automation."""
+        if not a.request.strip():
+            raise HTTPException(400, "empty request")
+        row, speech = await svc.create_automation_from_nl(a.request, a.source)
+        if not row:
+            raise HTTPException(422, speech)
+        return JSONResponse(status_code=201,
+                            content={**_automation_view(row), "speech": speech})
+
+    @app.get("/automations")
+    async def list_automations():
+        return [_automation_view(r) for r in svc.db.list_automations()]
+
+    @app.post("/automations/{automation_id}/toggle")
+    async def toggle_automation(automation_id: int):
+        row = svc.db.get_automation(automation_id)
+        if not row:
+            raise HTTPException(404, "no such automation")
+        enabling = not row["enabled"]
+        # recompute on re-enable: a stale past-due next_run_at must not fire
+        next_at = (automations.next_run_iso(automations.spec_from_row(row))
+                   if enabling else None)
+        svc.db.set_automation_enabled(automation_id, enabling, next_at)
+        return _automation_view(svc.db.get_automation(automation_id))
+
+    @app.delete("/automations/{automation_id}")
+    async def delete_automation(automation_id: int):
+        if not svc.db.delete_automation(automation_id):
+            raise HTTPException(404, "no such automation")
+        return {"automation_id": automation_id, "status": "deleted"}
 
     # -- learning endpoints (Phase G) ---------------------------------------
 

@@ -87,14 +87,22 @@ class DispatcherBrain(Brain):
         self._current_task_id = None
 
     async def notices(self) -> AsyncIterator[BrainEvent]:
-        """Yields a speakable notice when any agentic task completes."""
+        """Yields a speakable notice when a task completes worth mentioning.
+        surface=False events are suppressed server-side (internal meta-work,
+        or the notify gate took over); 'notify' events carry the gate's own
+        spoken summary of an automation/timer result."""
         while True:
             try:
                 async with self._client.stream(
                     "GET", f"{self.base_url}/events", timeout=httpx.Timeout(10, read=None)
                 ) as resp:
                     async for event, data in _sse_events(resp):
+                        if event == "notify" and data.get("speech"):
+                            yield BrainEvent("notice", data["speech"], data.get("task_id"))
+                            continue
                         if data.get("kind") != "agentic":
+                            continue
+                        if data.get("surface") is False:
                             continue
                         summary = (data.get("text") or "your task")[:60]
                         if event == "done":

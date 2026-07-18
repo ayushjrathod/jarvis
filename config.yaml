@@ -79,6 +79,23 @@ dispatcher:
       archive_after_days: 90       # stale this long -> areas/.archive/
       protected: [tasks, memory, learn]
 
+  # Standing automations (Phase I, khoj automations pattern — patterns only,
+  # AGPL): "every morning, tell me X" → automations table row; an in-dispatcher
+  # scheduler submits due rows as normal tasks (source=automation). nl_detect
+  # diverts schedule-phrased /task texts into automation creation (one LLM
+  # parse, then mechanical validation). notify_gate: finished automation/timer
+  # results pass a quick LLM judgment (resumes the run's session — cheap)
+  # before being surfaced; SKIP = logged only, and internal task types
+  # (reflection, consolidation) are never announced. An empty/absent block
+  # disables the whole feature.
+  automations:
+    enabled: true
+    nl_detect: true
+    check_interval_s: 30
+    notify_gate: true
+    notify_sources: [automation, timer]
+    notify_desktop: true          # notify-send, if installed
+
   # USD per million tokens, for quick-path cost computation (agentic cost comes
   # from the CLI's total_cost_usd). Cached from docs 2026-07-05.
   prices:

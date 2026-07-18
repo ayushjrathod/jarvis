@@ -10,7 +10,7 @@ import logging
 import time
 from datetime import datetime, timezone
 
-from . import limits, memory, quick, reflection, runner, telemetry
+from . import automations, limits, memory, notify, quick, reflection, runner, telemetry
 from .areas import AreaRegistry
 from .classifier import classify
 from .config import Config
@@ -21,6 +21,11 @@ from .hooks import HookRegistry
 log = logging.getLogger("dispatcher.service")
 
 TERMINAL = {"done", "failed", "cancelled"}
+
+# Unrelated machine-submitted quick tasks must not chain each other's CLI
+# sessions the way a human source's follow-ups do (Phase G lesson: meta-work
+# leaking into conversational machinery causes weird cross-contamination).
+NO_CONTINUITY_SOURCES = {"automation", "automation-parse", "notify-gate"}
 
 
 def make_ack(text: str) -> str:
@@ -165,9 +170,16 @@ class Service:
             area = self.areas.get(task["area"]) if task.get("area") else None
             q_tools = area.quick_allowed_tools if area else None
             q_context = self._with_memory(area.context() if area else "")
+            try:
+                task_meta = json.loads(task["metadata"]) if task.get("metadata") else {}
+            except (TypeError, ValueError):
+                task_meta = {}
 
             models = [None, self.cfg.models.get("fallback", "claude-opus-4-8")]
-            resume_id = self._fresh_quick_session(task["source"])
+            # metadata override first: the notify gate resumes the settled
+            # run's own session rather than this source's conversation
+            resume_id = (task_meta.get("resume_session_id")
+                         or self._fresh_quick_session(task["source"]))
             attempt, idx = 0, 0
             while idx < len(models):
                 model_override = models[idx]
@@ -230,18 +242,23 @@ class Service:
 
                 final = "done" if status == "done" else "failed"
                 if (final == "done" and meta.get("session_id")
-                        and self.cfg.quick_session_idle_minutes):
+                        and self.cfg.quick_session_idle_minutes
+                        and task["source"] not in NO_CONTINUITY_SOURCES):
                     self.quick_sessions[task["source"]] = (
                         meta["session_id"], time.monotonic())
                 speech = (limits.limit_speech(limit)
                           if final == "failed" and limit else None)
                 self.db.set_task_status(task["id"], final)
-                self._capture_episode(task, final, "".join(collected) or None)
+                answer = "".join(collected) or None
+                self._capture_episode(task, final, answer)
                 finished = True
+                suppress = self._maybe_notify(task, task_meta, final, answer,
+                                              meta.get("session_id"))
                 await self.fire(final, task, cost_usd=meta.get("cost_usd"),
                                 model=label, error=meta.get("error"), speech=speech,
                                 ttft_ms=lat.get("ttft_ms"),
-                                tokens_per_s=lat.get("tokens_per_s"))
+                                tokens_per_s=lat.get("tokens_per_s"),
+                                **({"surface": False} if suppress else {}))
                 yield ("done", {
                     "task_id": task["id"], "status": final,
                     "cost_usd": meta.get("cost_usd"), "model": meta.get("model", label),
@@ -363,9 +380,13 @@ class Service:
                 speech += " I'll retry the task after that."
             self.db.set_task_status(task["id"], final)
             self._capture_episode(task, final, result.get("output_text"))
+            suppress = self._maybe_notify(task, meta, final,
+                                          result.get("output_text"),
+                                          result.get("session_id"))
             await self.fire(final, task, cost_usd=result.get("cost_usd"),
                             model=label, output_path=output_path,
-                            error=result.get("error"), speech=speech)
+                            error=result.get("error"), speech=speech,
+                            **({"surface": False} if suppress else {}))
             if requeue_delay is not None:
                 self._schedule_limit_requeue(task, meta, requeue_delay)
                 await self.fire("requeued", task, delay_s=int(requeue_delay))
@@ -415,6 +436,100 @@ class Service:
                     self.db.record_skill_patch(d.name)
                 except Exception:
                     log.exception("skill-patch bump failed for %s", d.name)
+
+    # -- notify gate + automations (Phase I) --------------------------------
+
+    def _maybe_notify(self, task: dict, task_meta: dict, final: str,
+                      answer: str | None, session_id: str | None) -> bool:
+        """Decide what happens to this settled task's completion event.
+        Returns True when the plain done/failed event should carry
+        surface=False (notice clients stay quiet) — either because the task
+        is internal meta-work or because the notify gate takes over."""
+        try:
+            verdict = notify.surfacing(self.cfg.automations or {},
+                                       task, task_meta, final)
+        except Exception:
+            log.exception("surfacing policy failed for %s", task["id"])
+            return False
+        if verdict == "gate":
+            key = f"notify:{task['id']}"
+            self.bg[key] = asyncio.create_task(
+                self._notify_gate(task, answer, session_id, key))
+            return True
+        return verdict == "silent"
+
+    async def _notify_gate(self, task: dict, answer: str | None,
+                           session_id: str | None, key: str):
+        """Run the notify-or-not judgment as its own quick task (cost stays
+        in the books), resuming the settled run's session when it has one.
+        Fail-open: any breakage notifies with a generic summary rather than
+        silently swallowing a result the user asked for."""
+        fallback = f"Finished: {task['text'][:100]}"
+        try:
+            meta = {"task_type": "notify-gate"}
+            if session_id:
+                meta["resume_session_id"] = session_id
+            gate_task = await self.create_task(
+                notify.gate_prompt(task["text"], answer),
+                "notify-gate", "quick", None, meta)
+            reply, status = await self._collect_quick(gate_task)
+            verdict, text = (notify.parse_gate(reply) if status == "done"
+                             else ("notify", ""))
+            if verdict == "skip":
+                log.info("notify gate: suppressed %s (%s)", task["id"], text)
+                await self.fire("notify_skipped", task, reason=text)
+                return
+            await self._deliver_notice(task, text or fallback)
+        except Exception:
+            log.exception("notify gate crashed for %s; notifying anyway", task["id"])
+            try:
+                await self._deliver_notice(task, fallback)
+            except Exception:
+                log.exception("notify delivery failed for %s", task["id"])
+        finally:
+            self.bg.pop(key, None)
+
+    async def _deliver_notice(self, task: dict, summary: str):
+        log.info("notify: surfacing %s: %s", task["id"], summary[:120])
+        await self.fire("notify", task, speech=summary, summary=summary)
+        if (self.cfg.automations or {}).get("notify_desktop", True):
+            await notify.send_desktop(summary)
+
+    async def _collect_quick(self, task: dict) -> tuple[str, str]:
+        """Drain a quick task synchronously, returning (answer, status) —
+        for machine consumers of quick output (automation parse, notify gate)."""
+        chunks, status = [], "failed"
+        async for event, payload in self.stream_quick(task):
+            if event == "delta":
+                chunks.append(payload["text"])
+            elif event == "done":
+                status = payload.get("status", "failed")
+        return "".join(chunks), status
+
+    async def create_automation_from_nl(self, request: str, source: str
+                                        ) -> tuple[dict | None, str]:
+        """One LLM parse → mechanical validation → automations row.
+        Returns (row_or_None, speakable_confirmation)."""
+        task = await self.create_task(
+            automations.parse_prompt(request), "automation-parse", "quick",
+            None, {"task_type": "automation-parse"})
+        reply, status = await self._collect_quick(task)
+        try:
+            if status != "done":
+                raise ValueError(f"parse task status {status}")
+            spec = automations.validate_spec(automations.parse_response(reply))
+            next_at = automations.next_run_iso(spec)
+        except ValueError as e:
+            log.warning("automation parse failed for %r: %s", request[:80], e)
+            return None, "Sorry, I couldn't set that up as an automation."
+        row = self.db.create_automation(request, source, spec, next_at)
+        await self.hooks.fire({
+            "event": "automation_created", "automation_id": row["id"],
+            "text": spec["task_text"][:200], "next_run_at": next_at,
+        })
+        log.info("automation %s created: %s (%s)", row["id"],
+                 spec["task_text"][:80], automations.describe(spec))
+        return row, f"Scheduled: {spec['task_text']} — {automations.describe(spec)}."
 
     def _limit_requeue_delay(self, limit: limits.LimitInfo) -> float:
         """Seconds until a limit-failed timer task is worth retrying: shortly

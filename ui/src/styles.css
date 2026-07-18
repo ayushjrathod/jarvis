@@ -154,3 +154,24 @@ ul.monitor .steps .ssum { overflow-wrap: anywhere; }
 .stats .reflections li { padding: 0.2rem 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
 .stats .reflections li:last-child { border-bottom: none; }
 .stats .reflections .when { color: var(--dim); font-size: 0.78rem; margin-right: 0.3rem; }
+
+/* Phase I: automations */
+ul.automations { list-style: none; margin: 0; padding: 0; }
+ul.automations li {
+  display: flex; align-items: center; gap: 0.6rem;
+  padding: 0.4rem 0; border-bottom: 1px solid var(--border);
+}
+ul.automations li:last-child { border-bottom: none; }
+ul.automations li.paused .auto-main { opacity: 0.55; }
+.auto-main { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; gap: 0.2rem 0.6rem; align-items: baseline; }
+.auto-main .title { overflow-wrap: anywhere; }
+.auto-main .sched { color: var(--accent); font-size: 0.8rem; white-space: nowrap; }
+.auto-main .next { color: var(--dim); font-size: 0.78rem; white-space: nowrap; }
+.auto-actions { display: flex; gap: 0.3rem; flex-shrink: 0; }
+.auto-actions button {
+  font-size: 0.75rem; padding: 0.15rem 0.55rem;
+  background: var(--bg); color: var(--fg);
+  border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
+}
+.auto-actions button:hover { border-color: var(--accent); }
+.auto-actions button.danger:hover { border-color: var(--bad); color: var(--bad); }

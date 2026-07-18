@@ -117,6 +117,29 @@ CREATE TABLE IF NOT EXISTS run_steps (
   summary    TEXT,
   PRIMARY KEY (run_id, step_index)
 );
+
+-- Standing automations (Phase I, khoj automations pattern re-implemented):
+-- schedule fields are local-time (at_time HH:MM, weekday 0=Monday);
+-- next_run_at is UTC ISO so the scheduler compares against now() strings.
+-- NULL next_run_at = spent (a fired 'once') — never due again.
+CREATE TABLE IF NOT EXISTS automations (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at       TEXT NOT NULL,
+  source           TEXT NOT NULL,
+  request          TEXT NOT NULL,
+  task_text        TEXT NOT NULL,
+  kind             TEXT NOT NULL,
+  at_time          TEXT,
+  weekday          INTEGER,
+  interval_minutes INTEGER,
+  once_at          TEXT,
+  next_run_at      TEXT,
+  last_run_at      TEXT,
+  last_task_id     TEXT,
+  enabled          INTEGER NOT NULL DEFAULT 1,
+  notify           INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_automations_due ON automations(enabled, next_run_at);
 """
 
 # Additive, idempotent column migrations (openjarvis _MIGRATE_COLUMNS habit):
@@ -414,6 +437,71 @@ class Database:
         with self._conn() as c:
             self._touch_skill(c, name)
             c.execute("UPDATE skill_usage SET state=? WHERE name=?", (state, name))
+
+    # -- automations (Phase I) ---------------------------------------------
+
+    def create_automation(self, request: str, source: str, spec: dict,
+                          next_run_at: str | None) -> dict:
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO automations (created_at, source, request,"
+                " task_text, kind, at_time, weekday, interval_minutes,"
+                " once_at, next_run_at, notify) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (now(), source, request, spec["task_text"], spec["kind"],
+                 spec.get("time"), spec.get("weekday"),
+                 spec.get("interval_minutes"), spec.get("once_at"),
+                 next_run_at, int(spec.get("notify", True))))
+            row = c.execute("SELECT * FROM automations WHERE id=?",
+                            (cur.lastrowid,)).fetchone()
+            return dict(row)
+
+    def list_automations(self) -> list[dict]:
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM automations ORDER BY id").fetchall()]
+
+    def get_automation(self, automation_id: int) -> dict | None:
+        with self._conn() as c:
+            r = c.execute("SELECT * FROM automations WHERE id=?",
+                          (automation_id,)).fetchone()
+            return dict(r) if r else None
+
+    def due_automations(self, now_iso: str) -> list[dict]:
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM automations WHERE enabled=1"
+                " AND next_run_at IS NOT NULL AND next_run_at<=?"
+                " ORDER BY next_run_at", (now_iso,)).fetchall()]
+
+    def automation_fired(self, automation_id: int, next_run_at: str | None):
+        with self._conn() as c:
+            c.execute(
+                "UPDATE automations SET last_run_at=?, next_run_at=? WHERE id=?",
+                (now(), next_run_at, automation_id))
+
+    def automation_task_started(self, automation_id: int, task_id: str):
+        with self._conn() as c:
+            c.execute("UPDATE automations SET last_task_id=? WHERE id=?",
+                      (task_id, automation_id))
+
+    def set_automation_enabled(self, automation_id: int, enabled: bool,
+                               next_run_at: str | None = None) -> bool:
+        """Re-enabling passes a freshly computed next_run_at so a long-disabled
+        daily doesn't instantly fire on a stale past-due timestamp."""
+        with self._conn() as c:
+            if enabled and next_run_at is not None:
+                cur = c.execute(
+                    "UPDATE automations SET enabled=1, next_run_at=? WHERE id=?",
+                    (next_run_at, automation_id))
+            else:
+                cur = c.execute("UPDATE automations SET enabled=? WHERE id=?",
+                                (int(enabled), automation_id))
+            return cur.rowcount > 0
+
+    def delete_automation(self, automation_id: int) -> bool:
+        with self._conn() as c:
+            cur = c.execute("DELETE FROM automations WHERE id=?", (automation_id,))
+            return cur.rowcount > 0
 
     # -- vault entries (search index) --------------------------------------
 
