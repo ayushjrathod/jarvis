@@ -28,10 +28,13 @@ Every working session MUST:
 | F | v2 memory foundation (episode capture, core blocks, vault FTS index, /memory API, nightly consolidation) | **implemented, acceptance passing** (user waived review) |
 | G | v2 learning loop (reflection fork on complex runs, skill telemetry, /learn + learn area, deterministic curator) | **implemented, acceptance passing** (user waived review) |
 | H | v2 observability (run-step timeline + live SSE steps, TTFT/ITL latency, /stats, dashboard X-ray + stats widget) | **implemented, acceptance passing — awaiting user review** |
+| I | v2 personal OS (txt/html ingest + vault/inbox, NL→standing automations, notify-or-not gate) | **implemented, acceptance passing** (review waived) — **PDF/image ingest still dep-gated** (pymupdf, rapidocr) |
 
 v2 (phases F–J: memory, learning loop, observability, personal OS, graph) is
 planned in `context/v2-plan.md` (user approved the direction 2026-07-18);
-research audits behind it live in `context/research/`.
+research audits behind it live in `context/research/`. Phase J (embeddings +
+knowledge graph) is **blocked on dependency approval** (sqlite-vec,
+onnxruntime/fastembed), as is Phase I's OCR/PDF sub-item.
 
 **STOP for user review at the end of each phase.** Before Phase A code: API schema,
 SQLite schema, and the four voice ABC signatures must be approved by the user.
@@ -222,6 +225,40 @@ before writing from scratch.
   with `allowedTools: [Read, Glob, Grep]` executed a read-only `Bash` find
   without prompting — headless CLI seems to auto-permit some safe Bash.
   Worth investigating when tightening the safety layer.
+
+## Operational notes (learned Phase I)
+
+- **Automations**: `POST /automations {request}` or any schedule-phrased text
+  ("every morning, …") through `POST /task` mode=auto (nl_detect divert;
+  questions never divert) → one LLM parse (task_type `automation-parse`,
+  ~$0.06) → mechanical validation → `automations` row. An **in-dispatcher
+  asyncio scheduler** (30s checks — deliberate deviation from the plan's
+  systemd timer: the dispatcher must be up for tasks anyway, and this gets
+  catch-up for free via past-due next_run_at) submits due rows as
+  source=`automation` tasks. Schedule kinds: daily/weekly/interval/once;
+  local-time fields, UTC next_run_at; 'once' rows spend themselves
+  (next_run_at NULL). Re-enable via toggle recomputes next_run_at so a stale
+  past-due row can't instant-fire. Empty/absent `automations:` config block
+  disables the whole feature (that's what keeps unit tests LLM-free).
+- **Notify gate**: 'done' automation/timer results run a `notify-gate` quick
+  task that **resumes the settled run's own session** (measured $0.009 —
+  cheaper than reflection) → `NOTIFY: <summary>` fires an SSE `notify` event
+  (with `speech`) + notify-send; `SKIP:` is logged + `notify_skipped` event
+  only. Fail-open: gate breakage notifies with a generic summary. done/failed
+  events suppressed by policy carry `surface: false`; the jarvis brain
+  honors both — **reflection/consolidation completions are no longer spoken**
+  (before Phase I every agentic 'done' was announced when jarvis was up).
+- Internal quick sources (`automation`, `automation-parse`, `notify-gate`)
+  are excluded from quick-session continuity — unrelated machine tasks must
+  not chain each other's CLI sessions. The gate resumes via metadata
+  `resume_session_id`, which stream_quick now honors ahead of per-source
+  continuity.
+- **Ingest formats**: `.txt/.text` (paragraph chunks) and `.html/.htm`
+  (stdlib-parser → markdown-ish → heading chunker; bookmark links keep URLs)
+  now index alongside `.md`; drop exports in `vault/inbox/` (see its README).
+  PDF/images are counted as `dep_gated` in reindex stats, not indexed.
+- First scheduled 02:30 memory consolidation ran clean on 2026-07-19 (the
+  Phase F timer's first unattended fire).
 
 ## Known quirks / open items
 

@@ -1,16 +1,69 @@
 # STATE — read me first each session
 
-_Last updated: 2026-07-18 (session 11, end)_
+_Last updated: 2026-07-19 (session 12, end)_
 
 ## Current phase
 
-**Phases F, G, AND H (memory + learning loop + observability) IMPLEMENTED,
-all acceptance-passing, live under systemd.** User waived phase reviews
-("i am not checking go ahead"). Remaining from the v2 plan: Phase I
-(personal-OS ingest + NL automations) and Phase J (embeddings + knowledge
-graph) — **both need dependency approvals the user hasn't given yet**
-(sqlite-vec, onnxruntime/fastembed, rapidocr, pymupdf), so building them
-unprompted would violate the ask-before-deps rule. STOPPED here on purpose.
+**Phases F–I implemented, all acceptance-passing, live under systemd.**
+User waived phase reviews ("i am not checking go ahead"; session 12
+"continue" = keep building). Phase I was built in its **dependency-free
+scope**: txt/html ingest + vault/inbox, NL→standing automations,
+notify-or-not gate. Remaining from the v2 plan, **all blocked on dependency
+approvals the user hasn't given**: Phase I's OCR/PDF ingest (pymupdf,
+rapidocr-onnxruntime) and all of Phase J (sqlite-vec, onnxruntime/fastembed,
+optional spacy). Building those unprompted would violate the ask-before-deps
+rule — STOPPED here on purpose.
+
+## Session 12 (2026-07-19): Phase I — personal OS, dep-free scope, live-verified
+
+- **Ingest expansion** (`dispatcher/ingest.py`): per-format processors —
+  `.txt/.text` paragraph chunks, `.html/.htm` via stdlib HTMLParser →
+  markdown-ish (headings → ancestry, links keep URLs, script/style dropped)
+  → existing chunker; walk generalized from `*.md` to a CHUNKERS map;
+  PDF/images counted as `dep_gated` in stats (the visible cost of unapproved
+  deps). `vault/inbox/` convention dir + README. Live: .txt indexed +
+  searchable + deletion-swept.
+- **Standing automations** (`dispatcher/automations.py`, khoj pattern
+  re-implemented): one LLM parse (prompt with local now/tz/weekday; vague
+  times pinned: morning=07:30 etc.) → `parse_response` JSON extraction →
+  `validate_spec` mechanical sanitizing → `automations` table (daily/weekly/
+  interval/once; local at_time, UTC next_run_at). **In-dispatcher asyncio
+  scheduler loop** (30s) instead of the planned systemd timer — deviation
+  justified: dispatcher must be up anyway, catch-up free (past-due fires on
+  first check), no boot race. Advance-before-submit so a failing submit
+  can't tight-loop. Endpoints: POST/GET /automations, /toggle (re-enable
+  recomputes next_run_at), DELETE. **NL divert** in POST /task (mode=auto +
+  nl_detect): "every morning at 8, …" → automation + spoken confirmation
+  SSE; question-openers veto the divert. Voice source never touches it
+  otherwise.
+- **Notify-or-not gate** (`dispatcher/notify.py`, khoj notify-check
+  pattern): settled automation/timer 'done' results → `notify-gate` quick
+  task resuming the run's own session → `NOTIFY: <one spoken sentence>` →
+  SSE `notify` event (speech) + notify-send; `SKIP:` → log +
+  `notify_skipped` event. Fail-open. `surfacing()` policy is a pure function
+  (unit-tested): meta task types (reflection, memory-consolidate,
+  notify-gate, automation-parse) are **never announced** — fixes
+  pre-existing noise where jarvis spoke "Done: …" for every agentic task
+  incl. reflections. done/failed events carry `surface: false` when
+  suppressed; `brain_dispatcher.notices()` honors surface + speaks `notify`
+  events. Quick-session continuity now skips internal sources and honors
+  metadata `resume_session_id`.
+- **Dashboard**: Automations widget (list/pause/resume/delete, next-run);
+  AgentMonitor ignores the new event names; EVENT_NAMES += notify,
+  notify_skipped, automation, automation_created. ui/dist rebuilt.
+- **Config**: `dispatcher.automations` block (enabled, nl_detect,
+  check_interval_s, notify_gate, notify_sources, notify_desktop). Empty
+  block = feature fully off (keeps tests hermetic).
+- **163 tests green (+36 in tests/test_personal_os.py).** Live-verified
+  end-to-end: NL parse built a correct once-row (tz-aware) for +3min →
+  scheduler fired it on the next tick → quick task answered → gate resumed
+  its session ($0.0093) → "NOTIFY: Saturn's rings…" delivered (SSE +
+  notify-send). POST /task divert spoke "Scheduled: … daily at 08:00."
+  Parse cost $0.064. Test rows deleted after verify.
+- **First scheduled 02:30 consolidation ran clean tonight** (Phase F timer's
+  first unattended fire).
+- README.md mystery solved: the user pasted a `claude --resume <session-id>`
+  scratch note at the top — left uncommitted, it's theirs.
 
 ## Session 11 (cont. 3): Phase H — observability, live-verified
 
