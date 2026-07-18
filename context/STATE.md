@@ -1,12 +1,93 @@
 # STATE — read me first each session
 
-_Last updated: 2026-07-13 (session 10, end)_
+_Last updated: 2026-07-18 (session 11, end)_
 
 ## Current phase
 
-**ALL FIVE PHASES BUILT AND VERIFIED.** v1 is feature-complete per the spec.
-The system runs under systemd user services. Awaiting the user's end-to-end
-hardware test (their stated plan) and reboot test.
+**Phase F (v2 memory foundation) IMPLEMENTED, acceptance passing — awaiting
+user review.** User approved the v2 direction ("go ahead what you think is
+right") same-day after the planning pass; phases G–J remain planned-only in
+`context/v2-plan.md`. Next up after F review: Phase G (learning loop).
+
+## Session 11 (cont.): Phase F built, tested, live-verified
+
+All zero-new-dependency: SQLite FTS5 + stdlib + existing infra.
+
+- **`dispatcher/db.py`** — new tables: `episodes` (+`episodes_fts`),
+  `vault_files`, `entries` (+`entries_fts`), `entry_dates`; episode CRUD,
+  hash-diff `replace_file_entries`, BM25 search with file/date filters;
+  `fts_query()` quotes terms so user text can't hit FTS5 operators.
+- **`dispatcher/ingest.py`** — heading-ancestry chunking (256-word budget,
+  khoj pattern re-implemented — AGPL, no code lifted), ISO date extraction,
+  mtime-prefilter + per-chunk MD5 diff incremental reindex.
+- **`dispatcher/memory.py`** — letta-style bounded core blocks
+  (`vault/memory/USER.md` 2000 / `MEMORY.md` 3200 chars) rendered into a
+  `<memory_blocks>` prompt section; capture policy (skips cancelled,
+  excluded sources, and the consolidator's own runs); consolidation export
+  builder (episodes → `data/consolidation/<ts>.md`, gitignored).
+- **`dispatcher/service.py`** — `_with_memory()` prepends blocks to quick +
+  agentic context; `_capture_episode()` on both settle paths, best-effort.
+- **`dispatcher/main.py`** — `/memory/search|reindex|blocks|consolidate`
+  endpoints + startup reindex task. **`config.yaml`** — `dispatcher.memory`
+  section (capture on by default per user's "what you think is right").
+- **`areas/memory/`** — SKILL.md (voice: "remember that…"/"what do you
+  remember…") + `agents/consolidate.md` (prompt discipline from letta
+  sleeptime_v2 + mem0 additive extraction + Hermes memory guidance, with
+  attribution). Seed blocks in `vault/memory/`.
+- **systemd** — `mission-memory-consolidate.{service,timer}` 02:30 nightly,
+  installed + enabled (next fire verified); `scripts/run_memory_consolidate.py`
+  with the run_agent.py boot-race retry loop.
+- **97 unit tests green (+24 in `tests/test_memory.py`).** Live-verified end
+  to end: real quick task captured → `POST /memory/consolidate` ran the agent
+  (sonnet, $0.14, 4 turns) → it wrote "favorite editor is Neovim" to USER.md
+  with an absolute date and correctly judged trivia non-durable → fresh-source
+  quick task answered "Neovim." from block injection alone (first recall test
+  was invalidated by quick-session resume — caveat now in CLAUDE.md).
+
+## Session 11 (2026-07-18): v2 planning + reference-repo research
+
+User supplied a 14-layer v2 vision (modular brain, memory-as-most-important,
+Hermes-style learning loop, skills, planner, personal OS, observability…)
+and asked to plan it out with subagents cloning + auditing open-source repos.
+
+- **Cloned into `references/` (gitignored)**: `hermes-agent` (NousResearch,
+  MIT), `openjarvis` (Stanford, Apache-2.0), `mem0`, `graphiti`, `letta`
+  (all Apache-2.0), `khoj` (**AGPL — patterns only, never lift code**).
+- **Four subagent audit reports** saved under `context/research/2026-07-18-*.md`
+  (memory-repos, hermes-agent, openjarvis, khoj). All four agents were killed
+  once mid-run by the plan session limit (reset 5:50pm IST) and resumed
+  staggered afterwards — worth remembering: don't run 4 parallel deep-read
+  subagents on this subscription.
+- **Deliverable**: `context/v2-plan.md` — gap analysis, research synthesis,
+  and a phased roadmap:
+  - **F** memory foundation (episodes table, letta-style core blocks in
+    `vault/memory/`, khoj-pattern vault ingest + FTS5, `/memory/search`,
+    nightly consolidation agent) — zero new deps;
+  - **G** learning loop (Hermes review-prompt reflection fork via
+    `claude -p --resume`, skill usage telemetry, `/learn`, deterministic
+    curator);
+  - **H** observability + graded brain (run_steps timeline, TTFT/ITL,
+    `/stats`, X-ray footer, complexity tiers, self-improvement view);
+  - **I** personal OS + NL→automations + notify-or-not gate;
+  - **J** sqlite-vec + local ONNX embeddings + graphiti-style bi-temporal
+    knowledge graph (dep approvals needed only here and I).
+- Headline research findings: Hermes' learning loop is prompt-driven (their
+  warm-cache review fork ≡ our `--resume` continuity, so reflection is cheap
+  plumbing for us); memory needs no graph DB or cloud embeddings (letta runs
+  sqlite-vec on SQLite in production; FTS5-only is a valid first step);
+  OpenJarvis' parallel/hybrid execution doesn't transfer (GPU workers,
+  per-token economics) but its observability package does; khoj's hash-diff
+  ingest + heading-ancestry chunks are the Layer-11 spine.
+
+## Open decisions for the user (v2)
+
+1. ~~Approve/reorder phases~~ — user said "go ahead what you think is right";
+   F→G→H→I→J kept, Phase F built. **Review Phase F before G starts.**
+2. ~~Episode capture scope~~ — defaulted to capture-all (local-only data;
+   `memory.capture` / `capture_exclude_sources` in config.yaml to change).
+3. Dependency gates (sqlite-vec, onnxruntime/fastembed, rapidocr, pymupdf,
+   spacy) — still open, only needed at Phases I/J.
+4. ~~CLAUDE.md tracker/reuse-table updates~~ — done with the Phase F commit.
 
 ## Session 10: OpenClaw adoptions implemented (all 4 approved items live)
 

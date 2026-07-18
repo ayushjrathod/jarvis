@@ -25,6 +25,11 @@ Every working session MUST:
 | C | Tasks/work vertical slice + daily brief + weekly review | **implemented, acceptance passing — Gmail MCP left to user OAuth** |
 | D | React dashboard | **implemented — served by dispatcher at :8765, headless-render verified** |
 | E | systemd wrap-up | **implemented — units live, auto-restart verified; reboot test = user** |
+| F | v2 memory foundation (episode capture, core blocks, vault FTS index, /memory API, nightly consolidation) | **implemented, acceptance passing — awaiting user review** |
+
+v2 (phases F–J: memory, learning loop, observability, personal OS, graph) is
+planned in `context/v2-plan.md` (user approved the direction 2026-07-18);
+research audits behind it live in `context/research/`.
 
 **STOP for user review at the end of each phase.** Before Phase A code: API schema,
 SQLite schema, and the four voice ABC signatures must be approved by the user.
@@ -95,6 +100,10 @@ Clone reference repos into `references/`, read, and lift specific code/patterns
 | eleanorkonik build-a-dashboard gist | queue-dir orchestration; SQLite pragmas/backup habits |
 | hoangsonww/Claude-Code-Agent-Monitor | ideas only: reading session JSONL for agent monitor |
 | LiveKit Agents / Pipecat | barge-in pattern (reference only) |
+| NousResearch/hermes-agent (MIT) | learning-loop review prompts, skill lifecycle/curator, memory guidance (Phase G) |
+| open-jarvis/OpenJarvis (Apache-2.0) | observability: TTFT/ITL stats, run_steps timeline, X-ray footer (Phase H) |
+| mem0 / graphiti / letta (Apache-2.0) | extraction prompts, bi-temporal KG schema, core-block + sleep-time memory (Phases F/J) |
+| khoj (**AGPL — patterns only, NEVER lift code**) | ingest chunking/hash-diff, NL automations, notify-or-not gate (Phases F/I) |
 
 If a pattern isn't covered, search GitHub for prior art first and report findings
 before writing from scratch.
@@ -145,6 +154,29 @@ before writing from scratch.
   (speech typed at cursor via ydotool). Both share `trigger_key`/models via
   config.yaml; don't run the assistant in `ptt`/`both` mode while
   mission-dictate is up or F9 will trigger both.
+
+## Operational notes (learned Phase F)
+
+- Memory API on the dispatcher: `GET /memory/search?q=…` (FTS5 BM25 over the
+  vault index + episode log; `file`/`after`/`before` filters),
+  `POST /memory/reindex`, `GET /memory/blocks`, `POST /memory/consolidate`.
+- Core blocks `vault/memory/{USER,MEMORY}.md` are injected into every quick
+  and agentic prompt (char budgets in config.yaml, enforced at prompt build).
+  Edit them by hand freely; the nightly agent and the memory area also edit
+  them. Per-project notes go in `vault/memory/projects/` (searchable, not
+  auto-injected yet).
+- Every settled task (except cancelled, excluded sources, and the
+  consolidator itself) appends a row to the SQLite `episodes` table — raw
+  capture is LLM-free. `mission-memory-consolidate.timer` (02:30, before the
+  backup) exports unconsolidated episodes to `data/consolidation/` (kept as
+  audit trail, gitignored) and queues the agent from
+  `areas/memory/agents/consolidate.md`. Episodes are marked at hand-off, so
+  a failed run needs a manual replay against the export file.
+- The vault FTS index re-syncs on dispatcher startup (`reindex_on_start`) —
+  mtime prefilter + per-chunk hash diff keeps that cheap.
+- Verifying memory recall: use a **fresh source name** — within
+  `quick_session_idle_minutes` the same source resumes its CLI session, which
+  can answer from conversation context and mask whether block injection works.
 
 ## Known quirks / open items
 
