@@ -26,7 +26,8 @@ Every working session MUST:
 | D | React dashboard | **implemented — served by dispatcher at :8765, headless-render verified** |
 | E | systemd wrap-up | **implemented — units live, auto-restart verified; reboot test = user** |
 | F | v2 memory foundation (episode capture, core blocks, vault FTS index, /memory API, nightly consolidation) | **implemented, acceptance passing** (user waived review) |
-| G | v2 learning loop (reflection fork on complex runs, skill telemetry, /learn + learn area, deterministic curator) | **implemented, acceptance passing — awaiting user review** |
+| G | v2 learning loop (reflection fork on complex runs, skill telemetry, /learn + learn area, deterministic curator) | **implemented, acceptance passing** (user waived review) |
+| H | v2 observability (run-step timeline + live SSE steps, TTFT/ITL latency, /stats, dashboard X-ray + stats widget) | **implemented, acceptance passing — awaiting user review** |
 
 v2 (phases F–J: memory, learning loop, observability, personal OS, graph) is
 planned in `context/v2-plan.md` (user approved the direction 2026-07-18);
@@ -200,6 +201,27 @@ before writing from scratch.
   resume). Voice: "learn this as a skill".
 - `claude -p --resume` works from the agentic runner too (same session store
   as the quick path) — that's what makes reflection nearly free.
+
+## Operational notes (learned Phase H)
+
+- Agentic runs now use `--output-format stream-json --verbose`: every message
+  becomes a `run_steps` row (init/text/tool_use/tool_result/result, clipped
+  summaries, elapsed_ms) and a live SSE `step` event — the dashboard shows
+  the current step under running rows and the full timeline on expand
+  (`GET /task/{id}/steps`). The result object carries the same fields the
+  old json format did.
+- Quick runs record `ttft_ms` / `itl_p95_ms` / `tokens_per_s` (additive
+  `runs` columns via the idempotent MIGRATIONS loop in db.py). First real
+  number: CLI backend TTFT ≈ 2.6s — the Messages API comparison is now
+  measurable, not anecdotal.
+- `GET /stats?days=N`: tasks by status, per-source cost, success rate,
+  quick-latency averages, recent reflection outcomes. Dashboard
+  "Observability" widget renders tiles + a "Jarvis learned" strip
+  (reflections that saved something).
+- **Observed during verification (pre-existing, Layer 13 follow-up)**: a run
+  with `allowedTools: [Read, Glob, Grep]` executed a read-only `Bash` find
+  without prompting — headless CLI seems to auto-permit some safe Bash.
+  Worth investigating when tightening the safety layer.
 
 ## Known quirks / open items
 

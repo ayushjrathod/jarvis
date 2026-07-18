@@ -4,10 +4,40 @@ _Last updated: 2026-07-18 (session 11, end)_
 
 ## Current phase
 
-**Phases F AND G (v2 memory foundation + learning loop) IMPLEMENTED, both
-acceptance-passing, live under systemd.** User waived the F review ("i am
-not checking go ahead"), so G was built in the same session. Next: Phase H
-(observability) per `context/v2-plan.md`, pending user go-ahead.
+**Phases F, G, AND H (memory + learning loop + observability) IMPLEMENTED,
+all acceptance-passing, live under systemd.** User waived phase reviews
+("i am not checking go ahead"). Remaining from the v2 plan: Phase I
+(personal-OS ingest + NL automations) and Phase J (embeddings + knowledge
+graph) — **both need dependency approvals the user hasn't given yet**
+(sqlite-vec, onnxruntime/fastembed, rapidocr, pymupdf), so building them
+unprompted would violate the ask-before-deps rule. STOPPED here on purpose.
+
+## Session 11 (cont. 3): Phase H — observability, live-verified
+
+- **Runner switched to stream-json** (`--output-format stream-json
+  --verbose`): each message → timeline step (init/text/tool_use/tool_result/
+  result, 200-char summaries, elapsed_ms) → `run_steps` table +
+  live SSE `step` events (delivers session-3's deferred "stream agentic runs
+  to dashboard" item). Result parsing unchanged in shape; `_FakeProc` test
+  double rewritten for the stream interface.
+- **Quick-path latency**: `dispatcher/telemetry.py` (openjarvis itl.py
+  metric shapes, Apache-2.0) — ttft_ms/itl_p95_ms/tokens_per_s per run via
+  the new additive-MIGRATIONS loop in db.py; surfaced in done SSE events.
+  First live number: CLI backend TTFT 2635ms, 16.75 tok/s.
+- **`GET /stats?days=N`** (db.stats_summary) + **`GET /task/{id}/steps`**.
+- **Dashboard**: new Observability widget (tiles: tasks/success/cost/TTFT +
+  "Jarvis learned" reflection strip); AgentMonitor shows live current-step
+  line under running rows, step timeline + ttft/tok-s in expanded detail;
+  SSE now subscribes `step` + `requeued`. ui/dist rebuilt and live-served
+  (bundle content verified; visual browser pass left to the user).
+- **127 tests green (+14 in test_observability.py, _FakeProc rework).**
+  Live: quick task carried ttft in its done event; agentic verify task
+  produced a 5-step timeline (init→Bash tool_use→tool_result→text→result)
+  with 5 SSE step events observed; /stats returned real aggregates
+  ($0.99 today across 6 sources, success 100%).
+- **Safety observation for later** (noted in CLAUDE.md): headless CLI ran a
+  read-only Bash despite allowedTools [Read, Glob, Grep] — pre-existing
+  behavior, flag for the Layer-13 pass.
 
 ## Session 11 (cont. 2): Phase G — learning loop, live-verified
 
