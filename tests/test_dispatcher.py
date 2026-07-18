@@ -4,6 +4,7 @@ Run: .venv/bin/python -m unittest discover tests
 """
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -210,19 +211,31 @@ class TestQueueIngestRetry(unittest.IsolatedAsyncioTestCase):
 
 
 class _FakeProc:
+    """Models the stream-json CLI (Phase H runner): stdout yields one result
+    line then EOF; stderr reads empty. The old communicate_* kwargs are kept
+    so the retry tests read the same."""
+
     def __init__(self, communicate_result=None, communicate_delay=0.0, returncode=0):
-        self._result = communicate_result or (b'{"result": "ok", "is_error": false}', b"")
+        body = (communicate_result or (b'{"result": "ok", "is_error": false}', b""))[0]
+        obj = {"type": "result", **json.loads(body)}
+        self._lines = [json.dumps(obj).encode() + b"\n"]
         self._delay = communicate_delay
         self.returncode = returncode
         self.killed = False
+        self.stdout = self
+        self.stderr = self
 
-    async def communicate(self):
+    async def readline(self):
         if self._delay:
             await asyncio.sleep(self._delay)
-        return self._result
+        return self._lines.pop(0) if self._lines else b""
+
+    async def read(self):
+        return b""
 
     def kill(self):
         self.killed = True
+        self._lines = []
 
     async def wait(self):
         return None

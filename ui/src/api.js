@@ -62,7 +62,8 @@ export async function postTask(text, { onDelta } = {}) {
   return result;
 }
 
-const EVENT_NAMES = ["queued", "started", "done", "failed", "refused", "cancelled"];
+const EVENT_NAMES = ["queued", "started", "done", "failed", "refused", "cancelled",
+                     "requeued", "step"];
 
 export function subscribeEvents(onEvent) {
   const es = new EventSource("/events");

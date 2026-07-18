@@ -122,3 +122,35 @@ ul.monitor .detail dd.err { color: var(--bad); }
 .chip-failed, .chip-cancelled { background: rgba(224, 93, 93, 0.15); color: var(--bad); }
 .chip-running, .chip-retrying { background: rgba(217, 161, 59, 0.15); color: var(--warn); }
 .chip-queued { background: rgba(110, 168, 254, 0.15); color: var(--accent); }
+
+/* Phase H: observability */
+.live-step {
+  margin: -0.1rem 0 0.35rem; padding-left: 0.2rem;
+  color: var(--dim); font-size: 0.8rem;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+ul.monitor .steps {
+  list-style: none; margin: 0.5rem 0 0; padding: 0.4rem 0 0;
+  border-top: 1px solid var(--border);
+  font-size: 0.8rem; max-height: 14rem; overflow-y: auto;
+}
+ul.monitor .steps li { display: flex; gap: 0.5rem; padding: 0.12rem 0; border: none; }
+ul.monitor .steps .t { color: var(--dim); min-width: 3em; text-align: right; flex-shrink: 0; }
+ul.monitor .steps .stype { color: var(--accent); min-width: 6.5em; flex-shrink: 0; }
+ul.monitor .steps .ssum { overflow-wrap: anywhere; }
+
+.stats .tiles {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(6.5rem, 1fr));
+  gap: 0.5rem; margin-bottom: 0.6rem;
+}
+.stats .tile {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  padding: 0.5rem 0.6rem; text-align: center;
+}
+.stats .tile .value { font-size: 1.25rem; font-weight: 700; }
+.stats .tile .label { color: var(--dim); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; }
+.stats .reflections h3 { margin: 0.4rem 0 0.2rem; font-size: 0.85rem; }
+.stats .reflections ul { list-style: none; margin: 0; padding: 0; font-size: 0.85rem; }
+.stats .reflections li { padding: 0.2rem 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+.stats .reflections li:last-child { border-bottom: none; }
+.stats .reflections .when { color: var(--dim); font-size: 0.78rem; margin-right: 0.3rem; }

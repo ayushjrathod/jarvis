@@ -10,7 +10,7 @@ import json
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SCHEMA = """
@@ -106,7 +106,27 @@ CREATE TABLE IF NOT EXISTS skill_usage (
   state           TEXT NOT NULL DEFAULT 'active',
   pinned          INTEGER NOT NULL DEFAULT 0
 );
+
+-- Per-run timeline (Phase H, shape after openjarvis traces/store.py
+-- trace_steps, Apache-2.0): one row per stream-json event of an agentic run.
+CREATE TABLE IF NOT EXISTS run_steps (
+  run_id     INTEGER NOT NULL,
+  step_index INTEGER NOT NULL,
+  step_type  TEXT NOT NULL,
+  elapsed_ms INTEGER,
+  summary    TEXT,
+  PRIMARY KEY (run_id, step_index)
+);
 """
+
+# Additive, idempotent column migrations (openjarvis _MIGRATE_COLUMNS habit):
+# each statement may fail with "duplicate column name" on an already-migrated
+# db — that's the expected steady state.
+MIGRATIONS = [
+    "ALTER TABLE runs ADD COLUMN ttft_ms REAL",
+    "ALTER TABLE runs ADD COLUMN itl_p95_ms REAL",
+    "ALTER TABLE runs ADD COLUMN tokens_per_s REAL",
+]
 
 
 def fts_query(q: str) -> str:
@@ -126,6 +146,12 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as c:
             c.executescript(SCHEMA)
+            for stmt in MIGRATIONS:
+                try:
+                    c.execute(stmt)
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e):
+                        raise
 
     @contextmanager
     def _conn(self):
@@ -225,6 +251,7 @@ class Database:
         allowed = {
             "stop_reason", "cost_usd", "input_tokens", "output_tokens",
             "num_turns", "output_path", "output_text", "error", "session_id",
+            "ttft_ms", "itl_p95_ms", "tokens_per_s",
         }
         sets, args = ["status=?", "finished_at=?"], [status, now()]
         for k, v in fields.items():
@@ -234,6 +261,65 @@ class Database:
         args.append(run_id)
         with self._conn() as c:
             c.execute(f"UPDATE runs SET {', '.join(sets)} WHERE id=?", args)
+
+    # -- run steps (Phase H timeline) --------------------------------------
+
+    def add_run_steps(self, run_id: int, steps: list[dict]):
+        if not steps:
+            return
+        with self._conn() as c:
+            c.executemany(
+                "INSERT OR REPLACE INTO run_steps"
+                " (run_id, step_index, step_type, elapsed_ms, summary)"
+                " VALUES (?,?,?,?,?)",
+                [(run_id, i, s["type"], s.get("elapsed_ms"), s.get("summary"))
+                 for i, s in enumerate(steps)])
+
+    def get_run_steps(self, run_id: int) -> list[dict]:
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM run_steps WHERE run_id=? ORDER BY step_index",
+                (run_id,)).fetchall()]
+
+    def stats_summary(self, days: int = 7) -> dict:
+        """Aggregates for /stats — pure SQL, one dict out (openjarvis
+        analyzer/aggregator shape, hermes insights spirit)."""
+        since = (datetime.now(timezone.utc)
+                 .replace(hour=0, minute=0, second=0, microsecond=0))
+        since_iso = (since - timedelta(days=days - 1)).isoformat(timespec="seconds")
+        with self._conn() as c:
+            by_status = {r["status"]: r["n"] for r in c.execute(
+                "SELECT status, COUNT(*) n FROM tasks WHERE created_at>=?"
+                " GROUP BY status", (since_iso,))}
+            by_source = [dict(r) for r in c.execute(
+                "SELECT t.source, COUNT(*) n, ROUND(SUM(COALESCE(r.cost_usd,0)),4) cost_usd"
+                " FROM tasks t LEFT JOIN runs r ON r.task_id=t.id"
+                " WHERE t.created_at>=? GROUP BY t.source ORDER BY n DESC",
+                (since_iso,))]
+            latency = c.execute(
+                "SELECT ROUND(AVG(r.ttft_ms),1) avg_ttft_ms,"
+                " ROUND(AVG(r.tokens_per_s),2) avg_tokens_per_s, COUNT(*) n"
+                " FROM runs r JOIN tasks t ON t.id=r.task_id"
+                " WHERE t.kind='quick' AND r.ttft_ms IS NOT NULL"
+                " AND r.started_at>=?", (since_iso,)).fetchone()
+            reflections = [dict(r) for r in c.execute(
+                "SELECT r.finished_at, r.output_text FROM runs r"
+                " JOIN tasks t ON t.id=r.task_id WHERE t.source='reflection'"
+                " AND r.status='done' ORDER BY r.id DESC LIMIT 5")]
+            cost = c.execute(
+                "SELECT ROUND(SUM(COALESCE(cost_usd,0)),4) total FROM runs"
+                " WHERE started_at>=?", (since_iso,)).fetchone()
+        done = by_status.get("done", 0)
+        failed = by_status.get("failed", 0)
+        return {
+            "days": days,
+            "tasks_by_status": by_status,
+            "by_source": by_source,
+            "success_rate": round(done / (done + failed), 3) if done + failed else None,
+            "total_cost_usd": cost["total"] or 0,
+            "quick_latency": dict(latency) if latency and latency["n"] else None,
+            "recent_reflections": reflections,
+        }
 
     # -- episodes (memory capture) -----------------------------------------
 

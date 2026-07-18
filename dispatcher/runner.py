@@ -5,6 +5,10 @@ Guardrails per unattended run: --allowedTools (per task type, read-only
 baseline), --max-budget-usd, and a wall-clock timeout. This CLI version has no
 --max-turns flag; the budget cap bounds runaway loops instead. Never uses
 permission-skipping flags.
+
+Phase H: output format is stream-json so every message becomes a timeline
+step (run_steps table + live SSE) instead of being discarded — the run's
+result object carries the same fields the old json format did.
 """
 
 from __future__ import annotations
@@ -14,10 +18,15 @@ import json
 import logging
 import os
 import re
+import time
 
 from .config import Config
 
 log = logging.getLogger("dispatcher.runner")
+
+# one tool result arrives as one JSON line; asyncio's 64KiB default is too small
+STREAM_LIMIT = 4 * 1024 * 1024
+SUMMARY_LEN = 200
 
 AGENT_SYSTEM = (
     "You are an unattended background agent of the mission-control system. "
@@ -57,15 +66,18 @@ SPAWN_ERRORS = (OSError,)
 async def run_once(text: str, cfg: Config, model: str | None, tools: list[str],
                    procs: dict, task_id: str, system_extra: str = "",
                    resume_session_id: str | None = None,
-                   max_cost_usd: float | None = None) -> dict:
+                   max_cost_usd: float | None = None,
+                   on_step=None) -> dict:
     """One `claude -p` attempt (with one internal retry on a transient
-    spawn/timeout error). Returns normalized result fields.
+    spawn/timeout error). Returns normalized result fields incl. `steps`.
     resume_session_id continues an earlier CLI session (reflection forks ride
-    the warm prompt cache); max_cost_usd overrides the default budget cap."""
+    the warm prompt cache); max_cost_usd overrides the default budget cap;
+    on_step is an async callback fired per timeline step as it happens."""
     for attempt in (1, 2):
         try:
             return await _attempt(text, cfg, model, tools, procs, task_id,
-                                  system_extra, resume_session_id, max_cost_usd)
+                                  system_extra, resume_session_id, max_cost_usd,
+                                  on_step)
         except _Timeout as exc:
             if attempt == 2:
                 return {"status": "timeout", "error": str(exc)}
@@ -90,7 +102,8 @@ def build_cmd(text: str, cfg: Config, model: str | None, tools: list[str],
     budget = max_cost_usd or cfg.budgets.get("max_cost_per_task_usd", 0.50)
     cmd = [
         cfg.claude_bin, "-p", text,
-        "--output-format", "json",
+        "--output-format", "stream-json",
+        "--verbose",
         "--max-budget-usd", str(budget),
         "--append-system-prompt", system,
     ]
@@ -106,10 +119,51 @@ def build_cmd(text: str, cfg: Config, model: str | None, tools: list[str],
     return cmd
 
 
+def _clip(s: str) -> str:
+    s = " ".join(str(s).split())
+    return s[:SUMMARY_LEN]
+
+
+def _tool_result_text(content) -> str:
+    if isinstance(content, list):
+        content = " ".join(b.get("text", "") for b in content
+                           if isinstance(b, dict) and b.get("type") == "text")
+    return str(content or "")
+
+
+def _steps_from_event(obj: dict) -> list[dict]:
+    """Timeline steps for one stream-json line. Summaries are clipped — the
+    timeline is for orientation, full output stays in the run row."""
+    t = obj.get("type")
+    if t == "system" and obj.get("subtype") == "init":
+        return [{"type": "init", "summary": _clip(obj.get("model") or "session start")}]
+    if t == "assistant":
+        steps = []
+        for block in (obj.get("message") or {}).get("content") or []:
+            if block.get("type") == "text" and block.get("text", "").strip():
+                steps.append({"type": "text", "summary": _clip(block["text"])})
+            elif block.get("type") == "tool_use":
+                steps.append({"type": "tool_use", "summary": _clip(
+                    f"{block.get('name')} {json.dumps(block.get('input') or {})}")})
+        return steps
+    if t == "user":
+        steps = []
+        for block in (obj.get("message") or {}).get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                prefix = "ERROR: " if block.get("is_error") else ""
+                steps.append({"type": "tool_result", "summary": _clip(
+                    prefix + _tool_result_text(block.get("content")))})
+        return steps
+    if t == "result":
+        return [{"type": "result", "summary": _clip(obj.get("subtype") or "result")}]
+    return []
+
+
 async def _attempt(text: str, cfg: Config, model: str | None, tools: list[str],
                     procs: dict, task_id: str, system_extra: str = "",
                     resume_session_id: str | None = None,
-                    max_cost_usd: float | None = None) -> dict:
+                    max_cost_usd: float | None = None,
+                    on_step=None) -> dict:
     cmd = build_cmd(text, cfg, model, tools, system_extra,
                     resume_session_id, max_cost_usd)
     env = dict(os.environ)
@@ -119,24 +173,53 @@ async def _attempt(text: str, cfg: Config, model: str | None, tools: list[str],
     proc = await asyncio.create_subprocess_exec(
         *cmd, cwd=cfg.root, env=env,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        limit=STREAM_LIMIT,
     )
     procs[task_id] = proc
+    # drain stderr concurrently or a chatty CLI fills the pipe and deadlocks
+    stderr_task = asyncio.create_task(proc.stderr.read())
     timeout = cfg.budgets.get("timeout_s", 600)
+    t0 = time.monotonic()
+    steps: list[dict] = []
+    data = None
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout)
-    except asyncio.TimeoutError:
+        async with asyncio.timeout(timeout):
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                for step in _steps_from_event(obj):
+                    step["elapsed_ms"] = int((time.monotonic() - t0) * 1000)
+                    steps.append(step)
+                    if on_step:
+                        try:
+                            await on_step(step)
+                        except Exception:
+                            log.exception("on_step hook failed")
+                if obj.get("type") == "result":
+                    data = obj
+            await proc.wait()
+    except TimeoutError:
         proc.kill()
         await proc.wait()
         raise _Timeout(timeout)
     finally:
         procs.pop(task_id, None)
+        if proc.returncode is None:
+            proc.kill()
 
-    data = _parse_json(stdout)
     if data is None:
+        try:
+            stderr = (await asyncio.wait_for(stderr_task, 5)).decode(errors="replace")
+        except TimeoutError:
+            stderr = ""
         return {
-            "status": "failed",
-            "error": f"unparseable output (exit {proc.returncode}): "
-                     f"{stderr[:400].decode(errors='replace')}",
+            "status": "failed", "steps": steps,
+            "error": f"no result event (exit {proc.returncode}): {stderr[:400]}",
         }
     out = {
         "stop_reason": data.get("stop_reason") or data.get("subtype"),
@@ -146,6 +229,7 @@ async def _attempt(text: str, cfg: Config, model: str | None, tools: list[str],
         "num_turns": data.get("num_turns"),
         "session_id": data.get("session_id"),
         "output_text": data.get("result"),
+        "steps": steps,
     }
     if is_refusal(data):
         out["status"] = "refused"
@@ -155,14 +239,3 @@ async def _attempt(text: str, cfg: Config, model: str | None, tools: list[str],
     else:
         out["status"] = "done"
     return out
-
-
-def _parse_json(stdout: bytes) -> dict | None:
-    for candidate in (stdout, stdout.strip().splitlines()[-1] if stdout.strip() else b""):
-        try:
-            obj = json.loads(candidate)
-            if isinstance(obj, dict):
-                return obj
-        except (json.JSONDecodeError, ValueError):
-            continue
-    return None

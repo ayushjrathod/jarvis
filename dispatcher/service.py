@@ -10,7 +10,7 @@ import logging
 import time
 from datetime import datetime, timezone
 
-from . import limits, memory, quick, reflection, runner
+from . import limits, memory, quick, reflection, runner, telemetry
 from .areas import AreaRegistry
 from .classifier import classify
 from .config import Config
@@ -176,6 +176,7 @@ class Service:
                 run_id = self.db.create_run(task["id"], attempt, label)
                 open_run = run_id
                 meta, collected = {}, []
+                t0, delta_times = time.monotonic(), []
                 try:
                     async for kind, payload in quick.stream(
                         task["text"], self.cfg, model_override,
@@ -183,6 +184,7 @@ class Service:
                         resume_session_id=resume_id,
                     ):
                         if kind == "delta":
+                            delta_times.append(time.monotonic())
                             collected.append(payload)
                             yield ("delta", {"text": payload})
                         else:
@@ -192,12 +194,13 @@ class Service:
                     meta = {"status": "failed", "error": f"{type(e).__name__}: {e}"}
 
                 status = meta.get("status", "failed")
+                lat = telemetry.stream_stats(t0, delta_times, meta.get("output_tokens"))
                 self.db.finish_run(
                     run_id, status,
                     stop_reason=meta.get("stop_reason"), cost_usd=meta.get("cost_usd"),
                     input_tokens=meta.get("input_tokens"), output_tokens=meta.get("output_tokens"),
                     session_id=meta.get("session_id"), error=meta.get("error"),
-                    output_text="".join(collected) or None,
+                    output_text="".join(collected) or None, **lat,
                 )
                 open_run = None
                 limit = (limits.classify_limit(meta.get("error"))
@@ -236,11 +239,15 @@ class Service:
                 self._capture_episode(task, final, "".join(collected) or None)
                 finished = True
                 await self.fire(final, task, cost_usd=meta.get("cost_usd"),
-                                model=label, error=meta.get("error"), speech=speech)
+                                model=label, error=meta.get("error"), speech=speech,
+                                ttft_ms=lat.get("ttft_ms"),
+                                tokens_per_s=lat.get("tokens_per_s"))
                 yield ("done", {
                     "task_id": task["id"], "status": final,
                     "cost_usd": meta.get("cost_usd"), "model": meta.get("model", label),
                     "error": meta.get("error"), "speech": speech,
+                    "ttft_ms": lat.get("ttft_ms"),
+                    "tokens_per_s": lat.get("tokens_per_s"),
                 })
                 return
         finally:
@@ -294,6 +301,11 @@ class Service:
         ]
         simulate = bool(meta.get("simulate_refusal"))
 
+        async def on_step(step: dict):
+            await self.fire("step", task, step_type=step["type"],
+                            summary=step.get("summary"),
+                            elapsed_ms=step.get("elapsed_ms"))
+
         for attempt, model in attempts:
             label = model or "cli-default"
             run_id = self.db.create_run(task["id"], attempt, label)
@@ -306,6 +318,7 @@ class Service:
                     system_extra=system_extra,
                     resume_session_id=meta.get("resume_session_id"),
                     max_cost_usd=meta.get("max_cost_usd"),
+                    on_step=on_step,
                 )
             # cancel() may have killed the subprocess and closed the books while
             # run_once was returning; don't overwrite 'cancelled' with 'failed'
@@ -321,6 +334,10 @@ class Service:
                 output_text=result.get("output_text"), error=result.get("error"),
                 output_path=output_path,
             )
+            try:
+                self.db.add_run_steps(run_id, result.get("steps") or [])
+            except Exception:
+                log.exception("run_steps persist failed for run %s", run_id)
             limit = (limits.classify_limit(result.get("error"))
                      if result["status"] == "failed" else None)
             if result["status"] == "refused" and attempt == 1:

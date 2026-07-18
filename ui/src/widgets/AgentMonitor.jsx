@@ -5,6 +5,7 @@ import { getJSON } from "../api.js";
 export default function AgentMonitor({ lastEvent }) {
   const [rows, setRows] = useState([]);
   const [expanded, setExpanded] = useState(() => new Set());
+  const [steps, setSteps] = useState({}); // task_id -> flat step list
 
   useEffect(() => {
     getJSON("/tasks?limit=15")
@@ -29,18 +30,32 @@ export default function AgentMonitor({ lastEvent }) {
     setRows((rows) => {
       const next = rows.filter((r) => r.task_id !== lastEvent.task_id);
       const prev = rows.find((r) => r.task_id === lastEvent.task_id) ?? {};
+      if (lastEvent.event === "step") {
+        // live timeline tick: keep the row's status, remember the last step
+        next.unshift({
+          ...prev, ...lastEvent,
+          status: prev.status ?? "running",
+          last_step: { step_type: lastEvent.step_type, summary: lastEvent.summary },
+        });
+        return next.slice(0, 15);
+      }
       const status = { queued: "queued", started: "running", refused: "retrying" }[lastEvent.event] ?? lastEvent.event;
-      next.unshift({ ...prev, ...lastEvent, status });
+      next.unshift({ ...prev, ...lastEvent, status, last_step: null });
       return next.slice(0, 15);
     });
   }, [lastEvent]);
 
-  function toggle(id) {
+  function toggle(id, kind) {
     setExpanded((open) => {
       const next = new Set(open);
       next.has(id) ? next.delete(id) : next.add(id);
       return next;
     });
+    if (kind === "agentic" && !steps[id]) {
+      getJSON(`/task/${id}/steps`)
+        .then((byRun) => setSteps((m) => ({ ...m, [id]: Object.values(byRun).flat() })))
+        .catch(() => {});
+    }
   }
 
   if (!rows.length) return <p className="empty">Nothing yet.</p>;
@@ -50,13 +65,18 @@ export default function AgentMonitor({ lastEvent }) {
         const open = expanded.has(r.task_id);
         return (
           <li key={r.task_id} className={open ? "open" : ""}>
-            <button className="row" onClick={() => toggle(r.task_id)} aria-expanded={open}>
+            <button className="row" onClick={() => toggle(r.task_id, r.kind)} aria-expanded={open}>
               <span className={`chip chip-${r.status}`}>{r.status}</span>
               <span className={`chip chip-kind`}>{r.kind}</span>
               <span className="text">{r.text}</span>
               {r.cost_usd != null && <span className="cost">${r.cost_usd.toFixed(2)}</span>}
               <span className="caret">{open ? "▾" : "▸"}</span>
             </button>
+            {!open && r.status === "running" && r.last_step && (
+              <div className="live-step">
+                {r.last_step.step_type}: {r.last_step.summary}
+              </div>
+            )}
             {open && (
               <div className="detail">
                 <p className="full-text">{r.text}</p>
@@ -89,6 +109,18 @@ export default function AgentMonitor({ lastEvent }) {
                       <dd>${r.cost_usd.toFixed(4)}</dd>
                     </>
                   )}
+                  {r.ttft_ms != null && (
+                    <>
+                      <dt>ttft</dt>
+                      <dd>{(r.ttft_ms / 1000).toFixed(1)}s</dd>
+                    </>
+                  )}
+                  {r.tokens_per_s != null && (
+                    <>
+                      <dt>tok/s</dt>
+                      <dd>{r.tokens_per_s}</dd>
+                    </>
+                  )}
                   {r.error && (
                     <>
                       <dt>error</dt>
@@ -96,6 +128,17 @@ export default function AgentMonitor({ lastEvent }) {
                     </>
                   )}
                 </dl>
+                {(steps[r.task_id] ?? []).length > 0 && (
+                  <ol className="steps">
+                    {steps[r.task_id].map((s, i) => (
+                      <li key={i}>
+                        <span className="t">{((s.elapsed_ms ?? 0) / 1000).toFixed(1)}s</span>
+                        <span className="stype">{s.step_type}</span>
+                        <span className="ssum">{s.summary}</span>
+                      </li>
+                    ))}
+                  </ol>
+                )}
               </div>
             )}
           </li>

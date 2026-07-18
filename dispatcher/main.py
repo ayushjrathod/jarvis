@@ -124,6 +124,19 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
+    @app.get("/stats")
+    async def stats(days: int = 7):
+        """Observability aggregates (Phase H): task counts, success rate,
+        cost, quick-path latency, recent reflections."""
+        return svc.db.stats_summary(days)
+
+    @app.get("/task/{task_id}/steps")
+    async def task_steps(task_id: str):
+        task = svc.db.get_task(task_id)
+        if not task:
+            raise HTTPException(404, "no such task")
+        return {r["id"]: svc.db.get_run_steps(r["id"]) for r in task["runs"]}
+
     @app.get("/health")
     async def health():
         return {
