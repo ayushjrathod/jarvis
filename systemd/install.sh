@@ -17,6 +17,7 @@ systemctl --user enable --now mission-daily-brief.timer
 systemctl --user enable --now mission-weekly-review.timer
 systemctl --user enable --now mission-backup.timer
 systemctl --user enable --now mission-memory-consolidate.timer
+systemctl --user enable --now mission-memory-reconcile.timer
 systemctl --user enable --now mission-skill-curator.timer
 
 echo

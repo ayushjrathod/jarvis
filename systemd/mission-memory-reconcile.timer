@@ -1,0 +1,9 @@
+[Unit]
+Description=Mission Control: reconcile the knowledge graph weekly
+
+[Timer]
+OnCalendar=Sun *-*-* 04:30
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -33,6 +33,7 @@ class Config:
     automations: dict = field(default_factory=dict)
     screenshots_dir: Path = None
     stt: dict = field(default_factory=dict)
+    embeddings: dict = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "Config":
@@ -67,6 +68,7 @@ class Config:
         cfg.automations = d.get("automations", {})
         cfg.screenshots_dir = rel(d.get("screenshots_dir", "data/screenshots"))
         cfg.stt = d.get("stt", {})
+        cfg.embeddings = d.get("embeddings", {})
         return cfg
 
     def tools_for(self, task_type: str | None) -> list[str]:

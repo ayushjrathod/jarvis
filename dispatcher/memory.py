@@ -81,7 +81,8 @@ def should_capture(cfg: Config, task: dict, status: str) -> bool:
     # would become next night's input, reflections are private review passes,
     # and the Phase I gate/parse runs are plumbing around real interactions
     return meta.get("task_type") not in (
-        "memory-consolidate", "reflection", "notify-gate", "automation-parse")
+        "memory-consolidate", "reflection", "notify-gate", "automation-parse",
+        "graph-extract", "graph-reconcile")
 
 
 def build_consolidation(cfg: Config, db: Database) -> dict | None:

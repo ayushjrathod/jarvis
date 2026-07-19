@@ -1,0 +1,9 @@
+[Unit]
+Description=Mission Control: weekly knowledge-graph reconciliation via the dispatcher
+After=mission-dispatcher.service
+Wants=mission-dispatcher.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Documents/code/jarvis
+ExecStart=%h/Documents/code/jarvis/.venv/bin/python scripts/run_memory_reconcile.py

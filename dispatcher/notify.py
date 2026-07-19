@@ -23,7 +23,8 @@ log = logging.getLogger("dispatcher.notify")
 # Phase I, Jarvis announced "Done: You just completed a task…" for reflections
 # whenever the voice service was up.)
 NEVER_SURFACE_TASK_TYPES = {"reflection", "memory-consolidate",
-                            "notify-gate", "automation-parse"}
+                            "notify-gate", "automation-parse",
+                            "graph-extract", "graph-reconcile"}
 
 RESULT_CLIP = 1500
 

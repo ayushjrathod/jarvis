@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import automations, curator, ingest, memory, queue_watcher, stt, vault
+from . import automations, curator, embeddings, ingest, memory, queue_watcher, stt, vault
 from .quick import resolve_backend
 from .config import Config
 from .service import Service, make_ack, resolve_screenshot
@@ -54,6 +54,14 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
     log = logging.getLogger("dispatcher.main")
 
+    async def _embed_missing():
+        if not embeddings.enabled(cfg):
+            return
+        try:
+            await asyncio.to_thread(embeddings.embed_missing, cfg, svc.db)
+        except Exception:
+            log.exception("embedding backfill failed")
+
     async def _startup_reindex():
         try:
             stats = await asyncio.to_thread(
@@ -62,6 +70,13 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             log.info("vault reindex: %s", stats)
         except Exception:
             log.exception("startup vault reindex failed")
+        await _embed_missing()
+
+    async def _embed_refresh_loop():
+        interval = max(1, (cfg.embeddings or {}).get("refresh_minutes", 15)) * 60
+        while True:
+            await asyncio.sleep(interval)
+            await _embed_missing()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -70,12 +85,12 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                    if cfg.memory.get("reindex_on_start", True) else None)
         scheduler = (asyncio.create_task(automations.loop(svc))
                      if (cfg.automations or {}).get("enabled") else None)
+        embedder = (asyncio.create_task(_embed_refresh_loop())
+                    if embeddings.enabled(cfg) else None)
         yield
-        watcher.cancel()
-        if reindex:
-            reindex.cancel()
-        if scheduler:
-            scheduler.cancel()
+        for t in (watcher, reindex, scheduler, embedder):
+            if t:
+                t.cancel()
         await svc.shutdown()
 
     app = FastAPI(title="mission-control dispatcher", lifespan=lifespan)
@@ -204,23 +219,43 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                             file: str | None = None,
                             after: str | None = None,
                             before: str | None = None):
-        """FTS5 (BM25) over the vault index and the episode log. `file` is a
-        glob-ish path filter (* allowed); after/before hit indexed entry dates
-        resp. episode times (ISO)."""
+        """Hybrid FTS5+vector search (RRF-fused) over the vault index and the
+        episode log; deterministic filters (file glob, after/before dates)
+        force the FTS-only path, khoj-style filters-before-vector. Degrades
+        to FTS-only without embeddings/sqlite-vec."""
+        qvec = None
+        if embeddings.enabled(cfg) and svc.db.vec_ok:
+            try:
+                qvec = await asyncio.to_thread(embeddings.embed_query, cfg, q)
+            except Exception:
+                log.exception("query embedding failed; falling back to FTS")
         out: dict = {}
         if scope in ("all", "vault"):
-            out["entries"] = svc.db.search_entries(q, limit, file, after, before)
+            out["entries"] = (
+                svc.db.search_entries(q, limit, file, after, before)
+                if (file or after or before)
+                else svc.db.search_entries_hybrid(q, qvec, limit))
         if scope in ("all", "episodes"):
-            out["episodes"] = svc.db.search_episodes(q, limit, after, before)
+            out["episodes"] = (
+                svc.db.search_episodes(q, limit, after, before)
+                if (after or before)
+                else svc.db.search_episodes_hybrid(q, qvec, limit))
+        if scope in ("all", "graph"):
+            facts = svc.db.search_facts(q, limit)
+            out["facts"] = facts
+            out["fact_neighbors"] = svc.db.fact_neighbors(
+                [f["id"] for f in facts], limit)
         if not out:
-            raise HTTPException(400, "scope must be all|vault|episodes")
+            raise HTTPException(400, "scope must be all|vault|episodes|graph")
         return out
 
     @app.post("/memory/reindex")
     async def memory_reindex():
-        return await asyncio.to_thread(
+        stats = await asyncio.to_thread(
             ingest.ingest_vault, svc.db, cfg.root,
             cfg.memory.get("index_dirs", ["vault"]))
+        await _embed_missing()
+        return stats
 
     @app.get("/memory/blocks")
     async def memory_blocks():
@@ -237,10 +272,25 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         svc.db.mark_episodes_consolidated(job["episode_ids"])
         task = await svc.submit(job["text"], source="timer", mode="agentic",
                                 area="memory", metadata=job["metadata"])
+        # graph extraction (Phase J2) reads the same export, in parallel with
+        # the block-consolidation agent
+        try:
+            export_text = (cfg.root / job["export_path"]).read_text()
+            svc.spawn_graph_extract(export_text, job["episode_ids"])
+        except Exception:
+            log.exception("graph extract spawn failed")
         return JSONResponse(status_code=202, content={
             "task_id": task["id"], "status": "queued",
             "episodes": len(job["episode_ids"]), "export": job["export_path"],
         })
+
+    @app.post("/memory/reconcile")
+    async def memory_reconcile():
+        """Weekly knowledge-graph reconciliation (mem0 ADD/UPDATE/DELETE
+        spirit): duplicates and contradicted facts get invalidated."""
+        if not svc.graph_enabled():
+            return {"status": "graph_disabled"}
+        return await svc.graph_reconcile()
 
     # -- ask-about-my-screen ------------------------------------------------
 

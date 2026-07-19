@@ -7,11 +7,21 @@ model — that split is what makes locked decision #3 auditable.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+log = logging.getLogger("dispatcher.db")
+
+try:
+    import sqlite_vec
+    _VEC_AVAILABLE = True
+except ImportError:
+    sqlite_vec = None
+    _VEC_AVAILABLE = False
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -140,6 +150,31 @@ CREATE TABLE IF NOT EXISTS automations (
   notify           INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_automations_due ON automations(enabled, next_run_at);
+
+-- Knowledge graph (Phase J2, graphiti bi-temporal pattern, Apache-2.0):
+-- facts are standalone sentences linked n-ary to entities. valid_at = true
+-- in the world since; invalid_at = contradicted as of; expired_at = when we
+-- learned it. Invalidation never deletes — history stays queryable.
+CREATE TABLE IF NOT EXISTS kg_entities (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS kg_facts (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  fact        TEXT NOT NULL,
+  valid_at    TEXT,
+  invalid_at  TEXT,
+  expired_at  TEXT,
+  episode_ids TEXT,
+  created_at  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS kg_fact_entities (
+  fact_id   INTEGER NOT NULL,
+  entity_id INTEGER NOT NULL,
+  PRIMARY KEY (fact_id, entity_id)
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS kg_facts_fts USING fts5(fact, fact_id UNINDEXED);
 """
 
 # Additive, idempotent column migrations (openjarvis _MIGRATE_COLUMNS habit):
@@ -151,12 +186,40 @@ MIGRATIONS = [
     "ALTER TABLE runs ADD COLUMN tokens_per_s REAL",
 ]
 
+# Vector mirrors (Phase J1, sqlite-vec): rowid == the entries/episodes id, so
+# deletion is a rowid DELETE and KNN results join straight back. 384 dims =
+# bge-small-en-v1.5 (dispatcher/embeddings.py must agree). Created only when
+# the sqlite-vec extension loads; everything degrades to FTS-only without it.
+SCHEMA_VEC = """
+CREATE VIRTUAL TABLE IF NOT EXISTS entries_vec USING vec0(embedding float[384]);
+CREATE VIRTUAL TABLE IF NOT EXISTS episodes_vec USING vec0(embedding float[384]);
+"""
+
+
+def _rrf(ranklists: list[list], k: int = 60) -> tuple[list, dict]:
+    """Reciprocal-rank fusion (graphiti's ~15-line pattern, Apache-2.0):
+    items ranked high in ANY list bubble up; k=60 is the standard damping."""
+    scores: dict = {}
+    for ranks in ranklists:
+        for i, item in enumerate(ranks):
+            scores[item] = scores.get(item, 0.0) + 1.0 / (k + i + 1)
+    return sorted(scores, key=scores.get, reverse=True), scores
+
 
 def fts_query(q: str) -> str:
     """Every term double-quoted so user text can't hit FTS5 operator syntax
     (NEAR, AND, column filters, unbalanced quotes)."""
     terms = [t.replace('"', "") for t in q.split()]
     return " ".join(f'"{t}"' for t in terms if t)
+
+
+def fts_query_any(q: str) -> str:
+    """OR-joined variant for short documents (kg facts): a question like
+    "where does mira live" must hit "Mira lives in Pune." even though most
+    query words are absent — AND semantics returns nothing there. BM25 still
+    ranks fuller matches first."""
+    terms = [t.replace('"', "") for t in q.split()]
+    return " OR ".join(f'"{t}"' for t in terms if t)
 
 
 def now() -> str:
@@ -167,6 +230,7 @@ class Database:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.vec_ok = _VEC_AVAILABLE
         with self._conn() as c:
             c.executescript(SCHEMA)
             for stmt in MIGRATIONS:
@@ -175,11 +239,25 @@ class Database:
                 except sqlite3.OperationalError as e:
                     if "duplicate column" not in str(e):
                         raise
+        if self.vec_ok:
+            try:
+                with self._conn() as c:
+                    c.executescript(SCHEMA_VEC)
+            except sqlite3.OperationalError as e:
+                log.warning("sqlite-vec unusable (%s); hybrid search disabled", e)
+                self.vec_ok = False
 
     @contextmanager
     def _conn(self):
         conn = sqlite3.connect(self.path, timeout=5)
         conn.row_factory = sqlite3.Row
+        if getattr(self, "vec_ok", False):
+            try:
+                conn.enable_load_extension(True)
+                sqlite_vec.load(conn)
+                conn.enable_load_extension(False)
+            except Exception:
+                self.vec_ok = False
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
@@ -503,6 +581,109 @@ class Database:
             cur = c.execute("DELETE FROM automations WHERE id=?", (automation_id,))
             return cur.rowcount > 0
 
+    # -- knowledge graph (Phase J2) ----------------------------------------
+
+    def upsert_entity(self, name: str) -> int:
+        with self._conn() as c:
+            c.execute("INSERT OR IGNORE INTO kg_entities (name, created_at)"
+                      " VALUES (?,?)", (name, now()))
+            return c.execute("SELECT id FROM kg_entities WHERE name=?",
+                             (name,)).fetchone()["id"]
+
+    def entity_names(self, limit: int = 200) -> list[str]:
+        with self._conn() as c:
+            return [r["name"] for r in c.execute(
+                "SELECT name FROM kg_entities ORDER BY id LIMIT ?",
+                (limit,)).fetchall()]
+
+    def add_fact(self, fact: str, entity_names: list[str],
+                 valid_at: str | None = None,
+                 episode_ids: list[int] | None = None) -> int:
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO kg_facts (fact, valid_at, episode_ids, created_at)"
+                " VALUES (?,?,?,?)",
+                (fact, valid_at,
+                 json.dumps(episode_ids) if episode_ids else None, now()))
+            fid = cur.lastrowid
+            c.execute("INSERT INTO kg_facts_fts (fact, fact_id) VALUES (?,?)",
+                      (fact, fid))
+        for name in entity_names:
+            eid = self.upsert_entity(name)
+            with self._conn() as c:
+                c.execute("INSERT OR IGNORE INTO kg_fact_entities VALUES (?,?)",
+                          (fid, eid))
+        return fid
+
+    def invalidate_facts(self, ids: list[int]) -> int:
+        if not ids:
+            return 0
+        with self._conn() as c:
+            cur = c.execute(
+                f"UPDATE kg_facts SET invalid_at=?, expired_at=?"
+                f" WHERE invalid_at IS NULL AND id IN"
+                f" ({','.join('?' * len(ids))})",
+                [now(), now(), *ids])
+            return cur.rowcount
+
+    def active_facts(self, limit: int = 80) -> list[dict]:
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT id, fact, valid_at FROM kg_facts"
+                " WHERE invalid_at IS NULL ORDER BY id DESC LIMIT ?",
+                (limit,)).fetchall()]
+
+    def search_facts(self, q: str, limit: int = 10,
+                     include_invalid: bool = False) -> list[dict]:
+        match = fts_query_any(q)  # facts are one sentence: OR semantics
+        if not match:
+            return []
+        sql = (
+            "SELECT k.id, k.fact, k.valid_at, k.invalid_at,"
+            " bm25(kg_facts_fts) AS score,"
+            " (SELECT GROUP_CONCAT(e.name, ', ') FROM kg_fact_entities fe"
+            "  JOIN kg_entities e ON e.id=fe.entity_id"
+            "  WHERE fe.fact_id=k.id) AS entities"
+            " FROM kg_facts_fts f JOIN kg_facts k ON k.id = f.fact_id"
+            " WHERE kg_facts_fts MATCH ?"
+        )
+        args: list = [match]
+        if not include_invalid:
+            sql += " AND k.invalid_at IS NULL"
+        sql += " ORDER BY score LIMIT ?"
+        args.append(limit)
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(sql, args).fetchall()]
+
+    def fact_neighbors(self, fact_ids: list[int], limit: int = 10) -> list[dict]:
+        """1-hop expansion: active facts sharing an entity with any of the
+        given facts (graphiti BFS collapsed to one join for depth 1)."""
+        if not fact_ids:
+            return []
+        ph = ",".join("?" * len(fact_ids))
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                f"SELECT DISTINCT k.id, k.fact, k.valid_at FROM kg_facts k"
+                f" JOIN kg_fact_entities fe ON fe.fact_id=k.id"
+                f" WHERE fe.entity_id IN (SELECT entity_id FROM"
+                f"  kg_fact_entities WHERE fact_id IN ({ph}))"
+                f" AND k.id NOT IN ({ph}) AND k.invalid_at IS NULL"
+                f" ORDER BY k.id DESC LIMIT ?",
+                [*fact_ids, *fact_ids, limit]).fetchall()]
+
+    def graph_counts(self) -> dict:
+        with self._conn() as c:
+            return {
+                "entities": c.execute(
+                    "SELECT COUNT(*) n FROM kg_entities").fetchone()["n"],
+                "facts_active": c.execute(
+                    "SELECT COUNT(*) n FROM kg_facts WHERE invalid_at IS NULL"
+                ).fetchone()["n"],
+                "facts_invalidated": c.execute(
+                    "SELECT COUNT(*) n FROM kg_facts WHERE invalid_at IS NOT NULL"
+                ).fetchone()["n"],
+            }
+
     # -- vault entries (search index) --------------------------------------
 
     def vault_file_mtimes(self) -> dict[str, float]:
@@ -530,6 +711,8 @@ class Database:
                     c.execute("DELETE FROM entries WHERE id=?", (row["id"],))
                     c.execute("DELETE FROM entries_fts WHERE entry_id=?", (row["id"],))
                     c.execute("DELETE FROM entry_dates WHERE entry_id=?", (row["id"],))
+                    if self.vec_ok:
+                        c.execute("DELETE FROM entries_vec WHERE rowid=?", (row["id"],))
                     deleted += 1
             for ch in chunks:
                 if ch["hash"] in seen:
@@ -563,9 +746,91 @@ class Database:
             for eid in ids:
                 c.execute("DELETE FROM entries_fts WHERE entry_id=?", (eid,))
                 c.execute("DELETE FROM entry_dates WHERE entry_id=?", (eid,))
+                if self.vec_ok:
+                    c.execute("DELETE FROM entries_vec WHERE rowid=?", (eid,))
             c.execute("DELETE FROM entries WHERE file_path=?", (path,))
             c.execute("DELETE FROM vault_files WHERE path=?", (path,))
             return len(ids)
+
+    # -- vectors + hybrid search (Phase J1) --------------------------------
+
+    def entries_missing_embeddings(self, limit: int = 128) -> list[dict]:
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT id, compiled FROM entries"
+                " WHERE id NOT IN (SELECT rowid FROM entries_vec)"
+                " ORDER BY id LIMIT ?", (limit,)).fetchall()]
+
+    def episodes_missing_embeddings(self, limit: int = 128) -> list[dict]:
+        with self._conn() as c:
+            return [{"id": r["id"],
+                     "text": f"{r['user_text']}\n{r['assistant_text'] or ''}"}
+                    for r in c.execute(
+                        "SELECT id, user_text, assistant_text FROM episodes"
+                        " WHERE id NOT IN (SELECT rowid FROM episodes_vec)"
+                        " ORDER BY id LIMIT ?", (limit,)).fetchall()]
+
+    def add_entry_embeddings(self, pairs: list[tuple[int, bytes]]):
+        if not pairs:
+            return
+        with self._conn() as c:
+            c.executemany(
+                "INSERT OR REPLACE INTO entries_vec (rowid, embedding) VALUES (?,?)",
+                pairs)
+
+    def add_episode_embeddings(self, pairs: list[tuple[int, bytes]]):
+        if not pairs:
+            return
+        with self._conn() as c:
+            c.executemany(
+                "INSERT OR REPLACE INTO episodes_vec (rowid, embedding) VALUES (?,?)",
+                pairs)
+
+    def _knn(self, c, table: str, qvec: bytes, k: int) -> list[int]:
+        return [r["rowid"] for r in c.execute(
+            f"SELECT rowid FROM {table} WHERE embedding MATCH ? AND k = ?"
+            " ORDER BY distance", (qvec, k)).fetchall()]
+
+    def search_entries_hybrid(self, q: str, qvec: bytes | None,
+                              limit: int = 10) -> list[dict]:
+        """FTS BM25 + vector KNN fused with RRF; degrades to FTS-only when
+        vectors are unavailable. Same row shape as search_entries + 'rrf'."""
+        fts = self.search_entries(q, limit=40)
+        if not (self.vec_ok and qvec is not None):
+            return fts[:limit]
+        with self._conn() as c:
+            knn_ids = self._knn(c, "entries_vec", qvec, 40)
+            order, scores = _rrf([[r["id"] for r in fts], knn_ids])
+            by_id = {r["id"]: dict(r) for r in fts}
+            for eid in order[:limit]:
+                if eid not in by_id:
+                    row = c.execute(
+                        "SELECT id, file_path, heading, line_no, raw"
+                        " FROM entries WHERE id=?", (eid,)).fetchone()
+                    if row:
+                        by_id[eid] = dict(row)
+        return [{**by_id[i], "rrf": round(scores[i], 5)}
+                for i in order[:limit] if i in by_id]
+
+    def search_episodes_hybrid(self, q: str, qvec: bytes | None,
+                               limit: int = 10) -> list[dict]:
+        fts = self.search_episodes(q, limit=40)
+        if not (self.vec_ok and qvec is not None):
+            return fts[:limit]
+        with self._conn() as c:
+            knn_ids = self._knn(c, "episodes_vec", qvec, 40)
+            order, scores = _rrf([[r["id"] for r in fts], knn_ids])
+            by_id = {r["id"]: dict(r) for r in fts}
+            for eid in order[:limit]:
+                if eid not in by_id:
+                    row = c.execute(
+                        "SELECT id, task_id, source, kind, area, status,"
+                        " user_text, assistant_text, valid_at FROM episodes"
+                        " WHERE id=?", (eid,)).fetchone()
+                    if row:
+                        by_id[eid] = dict(row)
+        return [{**by_id[i], "rrf": round(scores[i], 5)}
+                for i in order[:limit] if i in by_id]
 
     def search_entries(self, q: str, limit: int = 10,
                        file_like: str | None = None,

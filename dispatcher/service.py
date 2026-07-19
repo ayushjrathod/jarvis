@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import automations, limits, memory, notify, quick, reflection, runner, telemetry
+from . import automations, graph, limits, memory, notify, quick, reflection, runner, telemetry
 from .areas import AreaRegistry
 from .classifier import classify
 from .config import Config
@@ -26,7 +26,8 @@ TERMINAL = {"done", "failed", "cancelled"}
 # Unrelated machine-submitted quick tasks must not chain each other's CLI
 # sessions the way a human source's follow-ups do (Phase G lesson: meta-work
 # leaking into conversational machinery causes weird cross-contamination).
-NO_CONTINUITY_SOURCES = {"automation", "automation-parse", "notify-gate"}
+NO_CONTINUITY_SOURCES = {"automation", "automation-parse", "notify-gate",
+                         "graph-extract", "graph-reconcile"}
 
 # Ask-about-my-screen: extra system context for screenshot-question tasks.
 SCREEN_CONTEXT = (
@@ -571,6 +572,71 @@ class Service:
         log.info("automation %s created: %s (%s)", row["id"],
                  spec["task_text"][:80], automations.describe(spec))
         return row, f"Scheduled: {spec['task_text']} — {automations.describe(spec)}."
+
+    # -- knowledge graph (Phase J2/J3) --------------------------------------
+
+    def graph_enabled(self) -> bool:
+        return bool((self.cfg.memory.get("graph") or {}).get("enabled"))
+
+    def _today(self) -> str:
+        return datetime.now(timezone.utc).date().isoformat()
+
+    async def graph_extract(self, episodes_text: str,
+                            episode_ids: list[int]) -> dict | None:
+        """Nightly fact extraction over the consolidation export: one quick
+        JSON call, deterministic apply (graph.py). None = parse failure —
+        the export file is still on disk for a manual replay."""
+        task = await self.create_task(
+            graph.extraction_prompt(self.db, episodes_text, self._today()),
+            "graph-extract", "quick", None, {"task_type": "graph-extract"})
+        reply, status = await self._collect_quick(task)
+        try:
+            if status != "done":
+                raise ValueError(f"extract task status {status}")
+            counts = graph.apply_extraction(
+                self.db, graph.parse_reply(reply), episode_ids)
+        except ValueError as e:
+            log.warning("graph extraction failed: %s", e)
+            return None
+        await self.hooks.fire({"event": "graph", **counts})
+        log.info("graph extraction: %s", counts)
+        return counts
+
+    def spawn_graph_extract(self, episodes_text: str, episode_ids: list[int]):
+        """Fire-and-forget alongside the consolidation agent (both read the
+        same export; neither blocks the other)."""
+        if not self.graph_enabled():
+            return
+        key = f"graph:{time.monotonic()}"
+
+        async def run():
+            try:
+                await self.graph_extract(episodes_text, episode_ids)
+            except Exception:
+                log.exception("graph extract crashed")
+            finally:
+                self.bg.pop(key, None)
+
+        self.bg[key] = asyncio.create_task(run())
+
+    async def graph_reconcile(self) -> dict:
+        """Weekly mem0-style pass: duplicates/contradictions/stale facts get
+        invalidated (never deleted). Cheap no-op while the graph is small."""
+        if len(self.db.active_facts(limit=2)) < 2:
+            return {"status": "nothing_to_reconcile", **self.db.graph_counts()}
+        task = await self.create_task(
+            graph.reconcile_prompt(self.db, self._today()),
+            "graph-reconcile", "quick", None, {"task_type": "graph-reconcile"})
+        reply, status = await self._collect_quick(task)
+        try:
+            if status != "done":
+                raise ValueError(f"reconcile task status {status}")
+            counts = graph.apply_reconciliation(self.db, graph.parse_reply(reply))
+        except ValueError as e:
+            log.warning("graph reconciliation failed: %s", e)
+            return {"status": "failed", "error": str(e)}
+        log.info("graph reconciliation: %s", counts)
+        return {"status": "done", **counts, **self.db.graph_counts()}
 
     def _limit_requeue_delay(self, limit: limits.LimitInfo) -> float:
         """Seconds until a limit-failed timer task is worth retrying: shortly

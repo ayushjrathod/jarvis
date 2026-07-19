@@ -69,6 +69,21 @@ dispatcher:
       MEMORY.md: 3200
     index_dirs: [vault]            # ingest walks these for /memory/search
     reindex_on_start: true
+    # Knowledge graph (Phase J2/J3): nightly fact extraction rides the
+    # consolidation export; weekly reconcile timer invalidates duplicates/
+    # contradictions (never deletes). Facts surface in /memory/search.
+    graph:
+      enabled: true
+
+  # Local embeddings (Phase J1): fastembed bge-small int8 ONNX (~34MB, first
+  # use downloads into data/models/fastembed) + sqlite-vec in mission.db.
+  # /memory/search becomes hybrid FTS+vector fused by RRF; new entries and
+  # episodes are embedded at startup, after reindex, and every
+  # refresh_minutes. enabled: false (or a missing sqlite-vec) = FTS-only.
+  embeddings:
+    enabled: true
+    model: BAAI/bge-small-en-v1.5   # 384-dim; db vec tables must agree
+    refresh_minutes: 15
 
   # Learning loop (Phase G): a complex agentic run (>= min turns) triggers a
   # reflection fork that resumes the run's own CLI session with areas/**-scoped
