@@ -95,6 +95,10 @@ class _Timeout(Exception):
         self.seconds = seconds
 
 
+def grants_bash(tools: list[str] | None) -> bool:
+    return any(t == "Bash" or t.startswith("Bash(") for t in tools or [])
+
+
 def build_cmd(text: str, cfg: Config, model: str | None, tools: list[str],
               system_extra: str = "", resume_session_id: str | None = None,
               max_cost_usd: float | None = None) -> list[str]:
@@ -111,6 +115,11 @@ def build_cmd(text: str, cfg: Config, model: str | None, tools: list[str],
         cmd += ["--resume", resume_session_id]
     if tools:
         cmd += ["--allowedTools", ",".join(tools)]
+    if not grants_bash(tools):
+        # the headless CLI auto-permits sandboxed read-only Bash (cwd-scoped,
+        # no writes) even when Bash is absent from --allowedTools — probed
+        # 2026-07-19. Granting exactly these tools should mean exactly these.
+        cmd += ["--disallowedTools", "Bash"]
     if model:
         cmd += ["--model", model]
     effort = cfg.models.get("effort")

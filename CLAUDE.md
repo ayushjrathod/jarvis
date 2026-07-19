@@ -221,10 +221,13 @@ before writing from scratch.
   quick-latency averages, recent reflection outcomes. Dashboard
   "Observability" widget renders tiles + a "Jarvis learned" strip
   (reflections that saved something).
-- **Observed during verification (pre-existing, Layer 13 follow-up)**: a run
-  with `allowedTools: [Read, Glob, Grep]` executed a read-only `Bash` find
-  without prompting — headless CLI seems to auto-permit some safe Bash.
-  Worth investigating when tightening the safety layer.
+- **RESOLVED 2026-07-19 (Layer-13 probe)**: the headless CLI auto-permits a
+  **sandboxed read-only Bash** even when Bash is absent from
+  `--allowedTools` — cwd-scoped (reads outside the repo blocked, e.g.
+  /etc/passwd), writes blocked everywhere (in-repo and out). Since granted
+  tools should mean exactly those, both runners now pass
+  `--disallowedTools Bash` whenever Bash wasn't granted
+  (runner.grants_bash); verified blocked through the live dispatcher.
 
 ## Operational notes (learned Phase I)
 

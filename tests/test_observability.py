@@ -76,6 +76,19 @@ class TestStepParsing(unittest.TestCase):
         self.assertIn("stream-json", cmd)
         self.assertIn("--verbose", cmd)
 
+    def test_build_cmd_disallows_ungranted_bash(self):
+        """Layer-13 probe (2026-07-19): headless CLI auto-permits sandboxed
+        read-only Bash unless explicitly disallowed."""
+        cfg = Config(root=Path("."))
+        cfg.claude_bin = "claude"
+        cfg.budgets = {}
+        cmd = build_cmd("t", cfg, None, ["Read", "Glob", "Grep"])
+        self.assertIn("--disallowedTools", cmd)
+        self.assertEqual(cmd[cmd.index("--disallowedTools") + 1], "Bash")
+        for granted in (["Bash"], ["Read", "Bash(git status)"]):
+            self.assertNotIn("--disallowedTools",
+                             build_cmd("t", cfg, None, granted))
+
 
 class TestRunStepsAndStats(unittest.TestCase):
     def setUp(self):

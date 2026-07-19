@@ -17,6 +17,7 @@ import asyncio
 import json
 import os
 
+from . import runner
 from .config import Config
 
 # stdout line budget for stream-json: asyncio's 64KiB readline default is too
@@ -115,6 +116,10 @@ async def _stream_cli(text: str, cfg: Config, model_override: str | None,
         cmd += ["--resume", resume_session_id]
     if tools:
         cmd += ["--allowedTools", ",".join(tools)]
+    if not runner.grants_bash(tools):
+        # mirror the agentic runner: the CLI's sandboxed read-only Bash
+        # auto-permit is disabled unless Bash was explicitly granted
+        cmd += ["--disallowedTools", "Bash"]
     model = model_override or cfg.models.get("quick")
     if model:
         cmd += ["--model", model]
