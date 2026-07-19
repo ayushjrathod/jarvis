@@ -4,15 +4,35 @@ _Last updated: 2026-07-19 (session 12, end)_
 
 ## Current phase
 
-**Phases F–I implemented, all acceptance-passing, live under systemd.**
-User waived phase reviews ("i am not checking go ahead"; session 12
-"continue" = keep building). Phase I was built in its **dependency-free
-scope**: txt/html ingest + vault/inbox, NL→standing automations,
-notify-or-not gate. Remaining from the v2 plan, **all blocked on dependency
-approvals the user hasn't given**: Phase I's OCR/PDF ingest (pymupdf,
-rapidocr-onnxruntime) and all of Phase J (sqlite-vec, onnxruntime/fastembed,
-optional spacy). Building those unprompted would violate the ask-before-deps
-rule — STOPPED here on purpose.
+**The entire v2 plan (Phases F–J) is implemented, acceptance-passing, live
+under systemd** — user approved + installed the deps 2026-07-19 (sqlite-vec,
+fastembed, pymupdf, rapidocr, jeepney) and waived phase reviews. Also
+shipped: ask-about-my-screen (ssplan.md) and the Layer-13 Bash hardening.
+**Only user-side items remain** (ask-screen manual E2E after
+setup_ask_screen.sh, Gmail OAuth, reboot test, dashboard visual pass).
+Deliberately unbuilt: H4 complexity tiers, media area, Kokoro swap,
+multi-agent fan-out (all "do not build unprompted").
+
+## Session 12 (cont. 3): deps landed → Phase I completed + Phase J shipped
+
+- **PDF/image ingest** (finishes Phase I): chunkers take (label, path);
+  pdf/epub per-page text w/ OCR fallback (10-page budget); images via lazy
+  rapidocr (~1.5s each); DepMissing degrades to dep_gated counting. Live:
+  generated PDF + rendered-text PNG both indexed and searchable.
+- **Phase J1 hybrid memory**: dispatcher/embeddings.py (fastembed bge-small
+  int8, lazy singleton, passage/query split); vec0 tables rowid==id;
+  RRF fusion in db.search_*_hybrid; /memory/search hybrid unless filtered;
+  backfill at startup/reindex + 15-min refresh loop. Live: 49 entries + 10
+  episodes embedded; paraphrase query with ZERO FTS hits surfaced the right
+  block via vectors ("preferred coding tool" → USER.md Neovim).
+- **Phase J2/J3 knowledge graph**: kg_entities/kg_facts/kg_fact_entities
+  (+FTS), bi-temporal invalidate-never-delete; graph-extract quick task
+  rides the consolidation export (spawned by /memory/consolidate);
+  scope=graph search with 1-hop neighbor join; POST /memory/reconcile +
+  weekly timer Sun 04:30 (installed + enabled). Deterministic applies in
+  dispatcher/graph.py, unit-tested without LLM.
+- **191 tests green** (+17 semantic/graph, +3 PDF/OCR, tests use synthetic
+  384-dim vectors — no model download in the suite).
 
 ## Session 12 (cont. 2): ask-about-my-screen shipped (context/ssplan.md)
 

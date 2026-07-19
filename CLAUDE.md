@@ -28,13 +28,15 @@ Every working session MUST:
 | F | v2 memory foundation (episode capture, core blocks, vault FTS index, /memory API, nightly consolidation) | **implemented, acceptance passing** (user waived review) |
 | G | v2 learning loop (reflection fork on complex runs, skill telemetry, /learn + learn area, deterministic curator) | **implemented, acceptance passing** (user waived review) |
 | H | v2 observability (run-step timeline + live SSE steps, TTFT/ITL latency, /stats, dashboard X-ray + stats widget) | **implemented, acceptance passing — awaiting user review** |
-| I | v2 personal OS (txt/html ingest + vault/inbox, NL→standing automations, notify-or-not gate) | **implemented, acceptance passing** (review waived) — **PDF/image ingest still dep-gated** (pymupdf, rapidocr) |
+| I | v2 personal OS (txt/html/pdf/image ingest + vault/inbox, NL→standing automations, notify-or-not gate) | **implemented incl. PDF/OCR, acceptance passing** (review waived) |
+| J | v2 semantic + graph memory (sqlite-vec hybrid search, bge-small local embeddings, bi-temporal fact graph, weekly reconcile) | **implemented, acceptance passing** (review waived) |
+| — | Ask-about-my-screen (`<Super><Alt>a` → portal shot → popup → streamed answer) | **implemented, smoke passing — user E2E pending** (run scripts/setup_ask_screen.sh) |
 
 v2 (phases F–J: memory, learning loop, observability, personal OS, graph) is
 planned in `context/v2-plan.md` (user approved the direction 2026-07-18);
-research audits behind it live in `context/research/`. Phase J (embeddings +
-knowledge graph) is **blocked on dependency approval** (sqlite-vec,
-onnxruntime/fastembed), as is Phase I's OCR/PDF sub-item.
+research audits behind it live in `context/research/`. **All five phases are
+now implemented** — deps sqlite-vec/fastembed/pymupdf/rapidocr/jeepney were
+user-approved and installed 2026-07-19.
 
 **STOP for user review at the end of each phase.** Before Phase A code: API schema,
 SQLite schema, and the four voice ABC signatures must be approved by the user.
@@ -231,6 +233,12 @@ before writing from scratch.
 
 ## Operational notes (learned Phase I)
 
+- **Ingest formats (updated after dep approval)**: `.pdf`/`.epub` extract
+  text per page (pymupdf), textless pages OCR within a 10-page/file budget;
+  images (`.png/.jpg/.jpeg/.webp/.tiff`) OCR via a lazy rapidocr singleton
+  (~1.5s each — a big image dump slows one reindex). Only docx/doc/gif stay
+  `dep_gated`. An uninstalled dep degrades back to counting, never breaks
+  the walk.
 - **Automations**: `POST /automations {request}` or any schedule-phrased text
   ("every morning, …") through `POST /task` mode=auto (nl_detect divert;
   questions never divert) → one LLM parse (task_type `automation-parse`,
@@ -262,6 +270,32 @@ before writing from scratch.
   PDF/images are counted as `dep_gated` in reindex stats, not indexed.
 - First scheduled 02:30 memory consolidation ran clean on 2026-07-19 (the
   Phase F timer's first unattended fire).
+
+## Operational notes (learned Phase J)
+
+- **Hybrid search**: `/memory/search` fuses FTS5 BM25 + sqlite-vec KNN with
+  RRF (k=60) for entries AND episodes; deterministic filters (`file`,
+  `after`, `before`) force the FTS-only path (khoj filters-before-vector).
+  Missing sqlite-vec or `embeddings.enabled: false` degrades everything to
+  FTS-only silently. Verified live: "preferred coding tool" (zero FTS hits)
+  surfaced the USER.md Neovim block via vectors alone.
+- **Embeddings**: fastembed bge-small-en-v1.5 int8 (384-dim; ~20s first
+  model load incl. download into `data/models/fastembed/`, warm after).
+  vec0 tables key on rowid == entry/episode id (deletes stay one statement).
+  Backfill runs at startup (after reindex), after `POST /memory/reindex`,
+  and every `refresh_minutes` (15) — first live pass embedded 49 entries +
+  10 episodes in ~0.4s once warm.
+- **Knowledge graph**: nightly fact extraction (`graph-extract` quick task,
+  mem0/graphiti-derived JSON prompt) rides the same episode export as the
+  consolidation agent — spawned by `/memory/consolidate`, deterministic
+  apply in `dispatcher/graph.py`. Facts are sentences linked n-ary to
+  entities; invalidation sets `invalid_at`/`expired_at`, never deletes.
+  `scope=graph` in `/memory/search` returns matching facts + 1-hop
+  neighbors. Weekly `mission-memory-reconcile` timer (Sun 04:30) invalidates
+  duplicates/contradictions; "nothing_to_reconcile" while < 2 active facts.
+- Meta task types `graph-extract`/`graph-reconcile` are excluded from
+  episode capture, notice surfacing, and quick-session continuity — same
+  hygiene as the Phase I gate/parse tasks.
 
 ## Operational notes (ask-about-my-screen)
 
