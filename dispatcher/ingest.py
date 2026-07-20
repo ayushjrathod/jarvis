@@ -11,8 +11,10 @@ Phase I: per-format processors normalizing everything to the same entry shape
 (khoj's per-format pattern). Markdown chunks by heading; plaintext by
 paragraph windows; HTML (browser bookmark exports, saved pages) is converted
 to markdown-ish text by a stdlib parser and rides the markdown chunker.
-PDF/image formats are counted as dep_gated, not indexed — they need
-pymupdf/rapidocr, which the user hasn't approved yet.
+PDFs/epubs extract text per page via pymupdf, with a budget-capped OCR
+fallback for textless (scanned) pages; images OCR via rapidocr — both deps
+user-approved 2026-07-19 and lazily imported, so an uninstalled dep degrades
+back to dep_gated counting instead of breaking the walk.
 """
 
 from __future__ import annotations
@@ -209,19 +211,95 @@ def chunk_html(file_label: str, text: str) -> list[dict]:
     return chunk_markdown(file_label, html_to_markdown(text))
 
 
+class DepMissing(Exception):
+    """A format's parser dependency isn't installed — count as dep_gated."""
+
+
+_ocr_engine = None
+
+
+def _ocr(src) -> str | None:
+    """OCR a path or PNG bytes via rapidocr (lazy warm singleton, ~1.5s/image
+    on this CPU). None = dependency missing; "" = no text found."""
+    global _ocr_engine
+    if _ocr_engine is None:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+        except ImportError:
+            return None
+        log.info("loading OCR engine (rapidocr)…")
+        _ocr_engine = RapidOCR()
+    result, _elapse = _ocr_engine(src)
+    if not result:
+        return ""
+    return "\n".join(t for _box, t, score in result if float(score) >= 0.5)
+
+
+OCR_MAX_PAGES_PER_FILE = 10  # scanned-PDF OCR budget; log what's skipped
+
+
+def chunk_pdf_file(file_label: str, path: Path) -> list[dict]:
+    """Per-page text extraction; a textless page (scan) falls back to OCR
+    within the per-file budget. Pages become '## page N' sections so hits are
+    self-describing. Also handles epub/xps — pymupdf opens those too."""
+    try:
+        import pymupdf
+    except ImportError as e:
+        raise DepMissing(str(e))
+    parts, ocr_budget = [], OCR_MAX_PAGES_PER_FILE
+    with pymupdf.open(path) as doc:
+        for page in doc:
+            text = page.get_text().strip()
+            if not text:
+                if ocr_budget <= 0:
+                    continue
+                ocr = _ocr(page.get_pixmap(dpi=150).tobytes("png"))
+                if ocr is None:  # no OCR dep: index the text pages we do have
+                    log.info("%s: textless page %d skipped (no OCR dep)",
+                             file_label, page.number + 1)
+                    continue
+                ocr_budget -= 1
+                text = ocr.strip()
+            if text:
+                parts.append(f"## page {page.number + 1}\n\n{text}")
+    return chunk_markdown(file_label, "\n\n".join(parts))
+
+
+def chunk_image_file(file_label: str, path: Path) -> list[dict]:
+    text = _ocr(str(path))
+    if text is None:
+        raise DepMissing("rapidocr-onnxruntime not installed")
+    if not text.strip():
+        return []
+    return chunk_plaintext(file_label, text)
+
+
+def _text_chunker(fn):
+    def chunk(file_label: str, path: Path) -> list[dict]:
+        return fn(file_label, path.read_text(errors="replace"))
+    return chunk
+
+
+# Contract: chunker(rel_label, Path) -> chunks. Text formats read+delegate;
+# binary formats parse the file themselves.
 CHUNKERS = {
-    ".md": chunk_markdown,
-    ".txt": chunk_plaintext,
-    ".text": chunk_plaintext,
-    ".html": chunk_html,
-    ".htm": chunk_html,
+    ".md": _text_chunker(chunk_markdown),
+    ".txt": _text_chunker(chunk_plaintext),
+    ".text": _text_chunker(chunk_plaintext),
+    ".html": _text_chunker(chunk_html),
+    ".htm": _text_chunker(chunk_html),
+    ".pdf": chunk_pdf_file,
+    ".epub": chunk_pdf_file,
+    ".png": chunk_image_file,
+    ".jpg": chunk_image_file,
+    ".jpeg": chunk_image_file,
+    ".webp": chunk_image_file,
+    ".tiff": chunk_image_file,
 }
 
-# Formats we recognize but can't parse without unapproved dependencies
-# (pymupdf for PDF, rapidocr-onnxruntime for images). Counted in the reindex
-# stats so the cost of not approving them stays visible.
-DEP_GATED_EXTS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".tiff",
-                  ".docx", ".doc", ".epub"}
+# Formats we recognize but still can't parse. Counted in the reindex stats so
+# the cost stays visible (a runtime DepMissing lands in the same counter).
+DEP_GATED_EXTS = {".docx", ".doc", ".gif"}
 
 
 def ingest_vault(db: Database, root: Path, dirs: list[str]) -> dict:
@@ -255,10 +333,19 @@ def ingest_vault(db: Database, root: Path, dirs: list[str]) -> dict:
                 mtime = p.stat().st_mtime
                 if indexed.get(rel) == mtime:
                     continue
-                chunks = chunker(rel, p.read_text(errors="replace"))
+                chunks = chunker(rel, p)
                 added, deleted = db.replace_file_entries(rel, mtime, chunks)
+            except DepMissing:
+                seen.discard(rel)
+                stats["files_scanned"] -= 1
+                stats["dep_gated"] += 1
+                gated_names.append(rel)
+                continue
             except OSError as e:
                 log.warning("ingest: skipping %s: %s", rel, e)
+                continue
+            except Exception as e:  # one corrupt pdf/image must not end the walk
+                log.warning("ingest: failed to parse %s: %s", rel, e)
                 continue
             stats["files_changed"] += 1
             stats["added"] += added

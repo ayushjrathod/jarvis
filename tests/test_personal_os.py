@@ -65,7 +65,7 @@ class TestIngestWalk(unittest.TestCase):
         inbox.mkdir(parents=True)
         (inbox / "note.txt").write_text("quarterly insurance premium is due")
         (inbox / "bm.html").write_text(TestHtml.HTML)
-        (inbox / "scan.pdf").write_bytes(b"%PDF-fake")
+        (inbox / "old.docx").write_bytes(b"PK\x03\x04fake")
         (self.root / "vault" / "plain.md").write_text("# Plan\ntoday's plan text")
 
     def tearDown(self):
@@ -84,6 +84,47 @@ class TestIngestWalk(unittest.TestCase):
         stats = ingest_vault(self.db, self.root, ["vault"])
         self.assertGreater(stats["deleted"], 0)
         self.assertFalse(self.db.search_entries("insurance premium"))
+
+
+class TestIngestDocs(unittest.TestCase):
+    """PDF + image OCR processors (deps approved + installed 2026-07-19)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.db = Database(self.root / "t.db")
+        (self.root / "vault" / "inbox").mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_pdf_text_extraction(self):
+        import pymupdf
+        doc = pymupdf.open()
+        page = doc.new_page()
+        page.insert_text((72, 72), "quarterly cashflow report for the vineyard")
+        doc.save(self.root / "vault" / "inbox" / "report.pdf")
+        doc.close()
+        stats = ingest_vault(self.db, self.root, ["vault"])
+        self.assertEqual(stats["dep_gated"], 0)
+        hits = self.db.search_entries("cashflow vineyard")
+        self.assertTrue(hits)
+        self.assertIn("page 1", hits[0]["heading"])
+
+    def test_image_ocr(self):
+        import cv2
+        import numpy as np
+        img = np.full((90, 700, 3), 255, np.uint8)
+        cv2.putText(img, "WARRANTY EXPIRES DECEMBER", (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 0, 0), 3)
+        cv2.imwrite(str(self.root / "vault" / "inbox" / "scan.png"), img)
+        ingest_vault(self.db, self.root, ["vault"])
+        self.assertTrue(self.db.search_entries("WARRANTY"))
+
+    def test_docx_still_gated(self):
+        (self.root / "vault" / "inbox" / "x.docx").write_bytes(b"PK\x03\x04junk")
+        stats = ingest_vault(self.db, self.root, ["vault"])
+        self.assertEqual(stats["dep_gated"], 1)
 
 
 class TestDetect(unittest.TestCase):
