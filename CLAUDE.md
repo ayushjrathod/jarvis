@@ -263,6 +263,26 @@ before writing from scratch.
 - First scheduled 02:30 memory consolidation ran clean on 2026-07-19 (the
   Phase F timer's first unattended fire).
 
+## Operational notes (ask-about-my-screen)
+
+- Flow: GNOME shortcut `<Super><Alt>a` → `python -m jarvis.ask_screen` →
+  xdg-portal **area-select** screenshot (jeepney D-Bus; grim doesn't work on
+  this GNOME Wayland) → PNG moved to `data/screenshots/` (keep_last=20) →
+  chromium `--app` popup at `/ask?shot=<id>` — typed or mic question,
+  streamed answer, follow-ups resume the CLI session (source
+  `screen:<shot_id>`, image stays in context, resumed turns ~6× cheaper).
+- Server seams: `POST /stt` (raw-body webm/wav → lazy server-side Whisper,
+  ~200-300MB, first call ~3s), `GET /screenshots/{name}`
+  (traversal-guarded), `GET /ask`. The quick path wraps the prompt with a
+  Read-the-image instruction **only on fresh sessions** (first turn or
+  vanished-session retry); DB `text` keeps the raw question.
+- Setup: `scripts/setup_ask_screen.sh` (installs jeepney — approved dep —
+  and the gsettings binding; idempotent). Acceptance:
+  `scripts/smoke_ask_screen.sh` (incl. Piper-synthesized real-audio /stt
+  check and one real image-reading quick task).
+- Hold-F9 dictation types into the popup textarea for free (it's a focused
+  text field); the mic button is the built-in alternative.
+
 ## Known quirks / open items
 
 - **Arch /dev/uinput quirk** (document in setup docs): the udev rule sometimes

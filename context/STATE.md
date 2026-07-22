@@ -14,7 +14,20 @@ rapidocr-onnxruntime) and all of Phase J (sqlite-vec, onnxruntime/fastembed,
 optional spacy). Building those unprompted would violate the ask-before-deps
 rule — STOPPED here on purpose.
 
-## Session 12 (2026-07-19): Phase I — personal OS, dep-free scope, live-verified
+## Session 12 (cont. 2): ask-about-my-screen shipped (context/ssplan.md)
+
+`<Super><Alt>a` → portal area screenshot → chromium --app popup at
+`/ask?shot=<id>` → typed/mic question → streamed answer; follow-ups resume
+the CLI session (source `screen:<shot>`). New: dispatcher/stt.py + POST /stt
+(raw-body Whisper), GET /screenshots (traversal-guarded), GET /ask,
+screenshot-aware stream_quick (Read tool + wrap-on-fresh-session),
+ui/src/AskScreen.jsx, jarvis/ask_screen.py (jeepney portal),
+scripts/{setup,smoke}_ask_screen.sh. 174 tests green (+10); smoke 5/5 incl.
+real-audio /stt and a real image-reading quick task. **User: run
+scripts/setup_ask_screen.sh** (installs jeepney — pip is blocked for the
+assistant) then manual E2E per ssplan step 8.
+
+## Session 12 (cont. 1, 2026-07-19): Phase I — personal OS, dep-free scope, live-verified
 
 - **Ingest expansion** (`dispatcher/ingest.py`): per-format processors —
   `.txt/.text` paragraph chunks, `.html/.htm` via stdlib HTMLParser →
