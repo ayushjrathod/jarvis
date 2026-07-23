@@ -9,6 +9,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from . import automations, limits, memory, notify, quick, reflection, runner, telemetry
 from .areas import AreaRegistry
@@ -26,6 +27,24 @@ TERMINAL = {"done", "failed", "cancelled"}
 # sessions the way a human source's follow-ups do (Phase G lesson: meta-work
 # leaking into conversational machinery causes weird cross-contamination).
 NO_CONTINUITY_SOURCES = {"automation", "automation-parse", "notify-gate"}
+
+# Ask-about-my-screen: extra system context for screenshot-question tasks.
+SCREEN_CONTEXT = (
+    "The user is asking about a screenshot they just captured. Answer from "
+    "what the image actually shows, in concise plain prose."
+)
+
+
+def resolve_screenshot(cfg: Config, name: str) -> Path | None:
+    """Traversal-guarded lookup: a bare <name>.png directly inside
+    screenshots_dir, existing — anything else is None."""
+    if not name or not name.endswith(".png"):
+        return None
+    base = Path(cfg.screenshots_dir).resolve()
+    p = (base / name).resolve()
+    if p.parent != base or not p.is_file():
+        return None
+    return p
 
 
 def make_ack(text: str) -> str:
@@ -175,6 +194,19 @@ class Service:
             except (TypeError, ValueError):
                 task_meta = {}
 
+            # ask-screen: a screenshot-question task gets the Read tool and
+            # image context; a missing/pruned file degrades to a plain answer
+            shot = None
+            if task_meta.get("screenshot"):
+                shot = resolve_screenshot(self.cfg, task_meta["screenshot"])
+                if shot:
+                    if not q_tools or "Read" not in q_tools:
+                        q_tools = list(q_tools or []) + ["Read"]
+                    q_context = "\n\n".join(x for x in (q_context, SCREEN_CONTEXT) if x)
+                else:
+                    log.warning("task %s: screenshot %r not found; answering without it",
+                                task["id"], task_meta["screenshot"])
+
             models = [None, self.cfg.models.get("fallback", "claude-opus-4-8")]
             # metadata override first: the notify gate resumes the settled
             # run's own session rather than this source's conversation
@@ -189,9 +221,18 @@ class Service:
                 open_run = run_id
                 meta, collected = {}, []
                 t0, delta_times = time.monotonic(), []
+                # first turn — or a fresh retry after a vanished session —
+                # must tell the model to Read the image; resumed follow-ups
+                # already have it in context. The DB `text` stays the raw
+                # question either way.
+                send_text = task["text"]
+                if shot and resume_id is None:
+                    send_text = (
+                        f"Use the Read tool to view the screenshot at {shot}, "
+                        f"then answer this question about it: {task['text']}")
                 try:
                     async for kind, payload in quick.stream(
-                        task["text"], self.cfg, model_override,
+                        send_text, self.cfg, model_override,
                         tools=q_tools, context=q_context,
                         resume_session_id=resume_id,
                     ):

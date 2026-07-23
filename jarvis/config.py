@@ -36,6 +36,10 @@ class JarvisConfig:
     max_utterance_s: int = 30
     # barge-in: consecutive speech frames (32ms each) before cutting TTS
     barge_in_frames: int = 6
+    # ask-about-my-screen popup (jarvis.ask_screen)
+    ask_screen: dict = field(default_factory=lambda: {
+        "shortcut": "<Super><Alt>a", "window_size": [520, 720],
+        "keep_last": 20, "chromium_bin": "chromium"})
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "JarvisConfig":
@@ -58,6 +62,7 @@ class JarvisConfig:
         cfg.endpoint_silence_ms = j.get("endpoint_silence_ms", cfg.endpoint_silence_ms)
         cfg.max_utterance_s = j.get("max_utterance_s", cfg.max_utterance_s)
         cfg.barge_in_frames = j.get("barge_in_frames", cfg.barge_in_frames)
+        cfg.ask_screen = {**cfg.ask_screen, **(j.get("ask_screen") or {})}
         cfg.dispatcher_url = j.get(
             "dispatcher_url", f"http://{d.get('host', '127.0.0.1')}:{d.get('port', 8765)}"
         )

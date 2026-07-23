@@ -8,8 +8,10 @@ const dispatcher = "http://127.0.0.1:8765";
 export default defineConfig({
   plugins: [react()],
   server: {
+    // NOT /ask: Vite's SPA fallback must serve the dev index.html there
     proxy: Object.fromEntries(
-      ["/task", "/tasks", "/events", "/vault", "/health"].map((p) => [p, dispatcher])
+      ["/task", "/tasks", "/events", "/vault", "/health", "/stt", "/screenshots"]
+        .map((p) => [p, dispatcher])
     ),
   },
 });

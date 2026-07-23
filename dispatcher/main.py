@@ -13,15 +13,15 @@ import logging
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import automations, curator, ingest, memory, queue_watcher, vault
+from . import automations, curator, ingest, memory, queue_watcher, stt, vault
 from .quick import resolve_backend
 from .config import Config
-from .service import Service, make_ack
+from .service import Service, make_ack, resolve_screenshot
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
@@ -241,6 +241,35 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             "task_id": task["id"], "status": "queued",
             "episodes": len(job["episode_ids"]), "export": job["export_path"],
         })
+
+    # -- ask-about-my-screen ------------------------------------------------
+
+    @app.post("/stt")
+    async def transcribe(request: Request):
+        """Raw-body audio upload (webm/opus from MediaRecorder, or wav) →
+        transcript. Raw body on purpose: python-multipart isn't a dep."""
+        data = await request.body()
+        if len(data) < 100:
+            raise HTTPException(400, "no audio")
+        try:
+            text = await asyncio.to_thread(stt.get_stt(cfg).transcribe_bytes, data)
+        except Exception as e:
+            raise HTTPException(422, f"could not decode audio: {e}")
+        return {"text": text}
+
+    @app.get("/screenshots/{name}")
+    async def screenshot(name: str):
+        p = resolve_screenshot(cfg, name)
+        if not p:
+            raise HTTPException(404, "no such screenshot")
+        return FileResponse(p, media_type="image/png")
+
+    @app.get("/ask")
+    async def ask_page():
+        index = cfg.root / "ui" / "dist" / "index.html"
+        if not index.is_file():
+            raise HTTPException(404, "ui not built")
+        return FileResponse(index, media_type="text/html")
 
     # -- automation endpoints (Phase I) -------------------------------------
 

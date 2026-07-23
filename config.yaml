@@ -14,6 +14,12 @@ dispatcher:
   claude_bin: /home/ayra/.local/bin/claude
   claude_config_dir: /home/ayra/.claude-per
 
+  # Ask-about-my-screen: portal screenshots stored + served from here
+  # (GET /screenshots/<name>, pruned by jarvis.ask_screen keep_last), and a
+  # server-side Whisper instance for browser mic uploads (POST /stt).
+  screenshots_dir: data/screenshots
+  stt: { model: small.en, compute: int8, language: en }
+
   models:
     # quick path: Messages API when credentials exist, else claude -p stream-json
     quick: claude-sonnet-5
@@ -125,3 +131,11 @@ jarvis:
   endpoint_silence_ms: 900     # stop capture after this much trailing silence
   max_utterance_s: 30
   barge_in_frames: 6           # 6 x 32ms ≈ 192ms of speech cuts TTS + aborts call
+  # Ask-about-my-screen: GNOME shortcut -> python -m jarvis.ask_screen
+  # (portal area-select screenshot -> chromium --app popup on the dispatcher).
+  # Re-run scripts/setup_ask_screen.sh after changing the shortcut.
+  ask_screen:
+    shortcut: "<Super><Alt>a"
+    window_size: [520, 720]
+    keep_last: 20              # screenshots kept in data/screenshots
+    chromium_bin: chromium

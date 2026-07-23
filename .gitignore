@@ -21,3 +21,4 @@ ui/dist/
 # local model files
 models/
 *.onnx
+data/screenshots/

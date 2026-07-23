@@ -175,3 +175,34 @@ ul.automations li.paused .auto-main { opacity: 0.55; }
 }
 .auto-actions button:hover { border-color: var(--accent); }
 .auto-actions button.danger:hover { border-color: var(--bad); color: var(--bad); }
+
+/* Ask-about-my-screen popup */
+.ask-page {
+  display: flex; flex-direction: column; gap: 0.6rem;
+  height: 100vh; padding: 0.7rem; box-sizing: border-box;
+}
+.ask-shot {
+  max-height: 40vh; max-width: 100%; object-fit: contain;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg); align-self: center;
+}
+.ask-exchanges { flex: 1; overflow-y: auto; min-height: 0; }
+.ask-exchanges .exchange { margin-bottom: 0.6rem; }
+.ask-exchanges .q { margin: 0 0 0.2rem; color: var(--accent); font-weight: 600; overflow-wrap: anywhere; }
+.ask-exchanges .a { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ask-exchanges .err { margin: 0; color: var(--bad); }
+.ask-input { display: flex; gap: 0.4rem; align-items: flex-end; }
+.ask-input textarea {
+  flex: 1; resize: none; padding: 0.45rem 0.6rem;
+  background: var(--bg); color: var(--fg);
+  border: 1px solid var(--border); border-radius: 8px;
+  font: inherit;
+}
+.ask-input button {
+  padding: 0.45rem 0.8rem; font: inherit; cursor: pointer;
+  background: var(--bg); color: var(--fg);
+  border: 1px solid var(--border); border-radius: 8px;
+}
+.ask-input button:hover:not(:disabled) { border-color: var(--accent); }
+.ask-input button:disabled { opacity: 0.5; cursor: default; }
+.ask-input .mic.recording { border-color: var(--bad); color: var(--bad); }

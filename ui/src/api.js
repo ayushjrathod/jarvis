@@ -26,11 +26,14 @@ function parseSSEBlock(block) {
   }
 }
 
-export async function postTask(text, { onDelta } = {}) {
+export async function postTask(text, { onDelta, source = "ui", mode, metadata } = {}) {
+  const body = { text, source };
+  if (mode) body.mode = mode;
+  if (metadata) body.metadata = metadata;
   const resp = await fetch("/task", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ text, source: "ui" }),
+    body: JSON.stringify(body),
   });
   const ctype = resp.headers.get("content-type") || "";
   if (ctype.startsWith("application/json")) {
