@@ -18,9 +18,10 @@ use over the Tailscale HTTPS URL (mic needs a secure context — Serve is HTTPS)
 - **334 tests green** (UI-only; build is the bar). `ui/dist` rebuilt —
   **JS `index-DZvyj-0c.js`, CSS `index-BKjwyAup.css`** (CSS changed this time).
   Running dispatcher already serves it (StaticFiles, no restart).
-- **Uncommitted.** Commit-time: `git add -f` the two new dist assets, stage the
-  deletion of the committed baseline `index-CjFcS_Jm.js` + `index-qeg-kXaw.css`
-  (session 18's rebuild was never committed), `ui/dist/index.html` modified.
+- **Committed** with session 18 as one batch — `84e1290` feat: phone access via
+  Tailscale + installable PWA + dashboard voice button. Dist assets force-added
+  past the ignore; old baseline `index-CjFcS_Jm.js`/`index-qeg-kXaw.css` deleted.
+  **Working tree clean.**
 - **User-side**: grant mic permission; caveat — iOS Safari can throttle
   `speechSynthesis` from async code (best-effort, never blocks). Details:
   `context/sessions/2026-07-24-3.md`.
@@ -54,12 +55,9 @@ User picked **Tailscale** (over LAN-only/Cloudflare/ngrok) and **yes** to the PW
   cross-origin still 403s). Dispatcher restarted on the new code; live-checked
   `/manifest.webmanifest` → 200 `application/manifest+json`, `/sw.js`, all icons
   200, SPA index carries the manifest link.
-- **Uncommitted** (session 17 committed its own batch; this is new). Commit-time
-  notes: the rebuilt JS `ui/dist/assets/index-BsED9CnX.js` is **gitignored** →
-  `git add -f` it; stage the deletion of the old `index-CjFcS_Jm.js`; the CSS
-  hash is unchanged (`index-qeg-kXaw.css`, already tracked). `ui/public/` is
-  **not** ignored — the icons + manifest + sw commit normally. Serve unit and
-  setup script are new untracked files.
+- **Committed** as part of `84e1290` (batched with session 19 — see that block).
+  Note: session 18's interim `index-BsED9CnX.js` was superseded by session 19's
+  rebuild; the committed dist assets are `index-DZvyj-0c.js`/`index-BKjwyAup.css`.
 - **User-side**: `sudo pacman -S tailscale` → `scripts/setup_tailscale.sh` →
   paste the printed `public_hosts` line → restart dispatcher → Tailscale app on
   the phone → open the URL, add to home screen. Details:
