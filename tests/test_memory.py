@@ -207,6 +207,24 @@ class TestBlocks(unittest.TestCase):
         (d / "USER.md").write_text("\n")
         self.assertEqual(memory.blocks_context(make_cfg(self.root)), "")
 
+    def test_only_allowlisted_files_injected(self):
+        # M4: a note dropped into blocks_dir must not enter every prompt
+        d = self.root / "vault" / "memory"
+        d.mkdir(parents=True)
+        (d / "USER.md").write_text("- likes tea\n")
+        (d / "NOTES.md").write_text("arbitrary dropped note — do not inject\n")
+        ctx = memory.blocks_context(make_cfg(self.root))
+        self.assertIn("likes tea", ctx)
+        self.assertNotIn("do not inject", ctx)
+        self.assertNotIn("## NOTES.md", ctx)
+
+    def test_block_files_config_override(self):
+        d = self.root / "vault" / "memory"
+        d.mkdir(parents=True)
+        (d / "NOTES.md").write_text("now allowed\n")
+        ctx = memory.blocks_context(make_cfg(self.root, block_files=["NOTES.md"]))
+        self.assertIn("now allowed", ctx)
+
 
 class TestCapturePolicy(unittest.TestCase):
     def _task(self, source="voice", metadata=None):

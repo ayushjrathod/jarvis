@@ -16,13 +16,20 @@ fi
 ls -la "$VAD"
 
 echo "== Piper voice (en_US-lessac-medium) =="
-if [ ! -f "$MODELS/piper/en_US-lessac-medium.onnx" ]; then
+PIPER_ONNX="$MODELS/piper/en_US-lessac-medium.onnx"
+PIPER_JSON="$PIPER_ONNX.json"
+# Guard on BOTH files: a prior run that fetched the .onnx but died before the
+# .onnx.json would otherwise look "done" and leave Piper permanently broken.
+# Fallback curls download to .part then atomically move, so a failed download
+# never leaves a half file at the real path (set -e aborts before the mv).
+if [ ! -f "$PIPER_ONNX" ] || [ ! -f "$PIPER_JSON" ]; then
   $VENV -m piper.download_voices en_US-lessac-medium --data-dir "$MODELS/piper" 2>/dev/null \
     || { # older piper-tts releases use a different downloader
-      curl -fsSL -o "$MODELS/piper/en_US-lessac-medium.onnx" \
-        "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx"
-      curl -fsSL -o "$MODELS/piper/en_US-lessac-medium.onnx.json" \
-        "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json"
+      BASE="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium"
+      curl -fsSL -o "$PIPER_ONNX.part" "$BASE/en_US-lessac-medium.onnx"
+      mv "$PIPER_ONNX.part" "$PIPER_ONNX"
+      curl -fsSL -o "$PIPER_JSON.part" "$BASE/en_US-lessac-medium.onnx.json"
+      mv "$PIPER_JSON.part" "$PIPER_JSON"
     }
 fi
 ls -la "$MODELS/piper/"

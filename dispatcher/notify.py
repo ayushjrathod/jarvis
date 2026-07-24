@@ -23,8 +23,14 @@ log = logging.getLogger("dispatcher.notify")
 # Phase I, Jarvis announced "Done: You just completed a task…" for reflections
 # whenever the voice service was up.)
 NEVER_SURFACE_TASK_TYPES = {"reflection", "memory-consolidate",
-                            "notify-gate", "automation-parse",
+                            "notify-gate", "automation-parse", "media-parse",
                             "graph-extract", "graph-reconcile"}
+
+# ...but a scheduled background job that FAILS must not fail silently — a broken
+# 02:30 consolidation should be visible, not swallowed like a routine success
+# (M6). Kept narrow: the quick plumbing tasks (gate/parse) handle their own
+# errors and would only add noise.
+SURFACE_ON_FAILURE = {"memory-consolidate"}
 
 RESULT_CLIP = 1500
 
@@ -68,7 +74,10 @@ def surfacing(acfg: dict, task: dict, meta: dict, final: str) -> str:
     """Pure policy: what happens to this settled task's completion event.
     "surface" — announce as before; "silent" — suppress, no gate;
     "gate" — suppress the plain event, an LLM judgment will decide."""
-    if meta.get("task_type") in NEVER_SURFACE_TASK_TYPES:
+    tt = meta.get("task_type")
+    if tt in NEVER_SURFACE_TASK_TYPES:
+        if final != "done" and tt in SURFACE_ON_FAILURE:
+            return "surface"   # a broken nightly job must be visible
         return "silent"
     if not acfg.get("enabled"):
         return "surface"

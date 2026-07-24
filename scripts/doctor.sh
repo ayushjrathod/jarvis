@@ -86,8 +86,29 @@ else
   warn "mission-dispatcher.service not active (may be run manually instead)"
 fi
 
+hdr "─── media (spotify) ───"
+if [ -f data/spotify.json ]; then
+  ok "spotify credentials present (data/spotify.json)"
+else
+  warn "no data/spotify.json — 'play <song>' can't search; run scripts/setup_spotify.sh"
+fi
+if busctl --user list 2>/dev/null | grep -q org.mpris.MediaPlayer2.spotify; then
+  ok "spotify client running (MPRIS reachable)"
+else
+  warn "spotify client not running (it's launched on demand by a play command)"
+fi
+
 hdr "─── systemd timers ───"
-for t in mission-daily-brief mission-weekly-review mission-backup; do
+# derive the list from the shipped unit files so a new timer can't be silently
+# missed by a stale hardcoded list
+shopt -s nullglob
+timers=(systemd/mission-*.timer)
+shopt -u nullglob
+if [ ${#timers[@]} -eq 0 ]; then
+  warn "no systemd/mission-*.timer files found"
+fi
+for f in "${timers[@]}"; do
+  t=$(basename "$f" .timer)
   if systemctl --user is-enabled --quiet "$t.timer" 2>/dev/null; then
     ok "$t.timer enabled"
   else

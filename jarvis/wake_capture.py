@@ -20,6 +20,44 @@ import numpy as np
 from jarvis.vad import FRAME_SAMPLES
 
 
+class MicLostError(RuntimeError):
+    """The capture device stopped delivering audio *after* the stream opened
+    (BT dropout, unplug, PipeWire node death). Raised out of
+    capture_after_wake so wake_loop's open-time retry re-opens the MicStream
+    — without this the read loop just spins on None forever and the wake word
+    goes silently dead until the process restarts (finding H6).
+    """
+
+
+class MicWatchdog:
+    """Detects a capture device that died mid-stream by counting consecutive
+    None reads.
+
+    A live mic delivers a frame every ~32ms, so read() returns immediately and
+    never times out — even during silence, which is still audio frames, not
+    None. Once the device is gone the PortAudio callback stops firing and
+    read() returns None on every read timeout (~1s). A single None is a normal
+    transient; many *consecutive* Nones mean the device is gone. Any good frame
+    resets the streak, so ordinary silence never trips it.
+    """
+
+    def __init__(self, none_limit: int):
+        self.none_limit = max(1, none_limit)
+        self.none_streak = 0
+
+    def observe(self, frame) -> None:
+        """Feed each read() result. Raises MicLostError once none_limit
+        consecutive Nones have been seen; any non-None frame resets the streak."""
+        if frame is not None:
+            self.none_streak = 0
+            return
+        self.none_streak += 1
+        if self.none_streak >= self.none_limit:
+            raise MicLostError(
+                f"no audio for {self.none_streak} consecutive reads; device lost?"
+            )
+
+
 def capture_after_wake(
     read_frame: Callable[[], np.ndarray | None],
     wake,
@@ -29,6 +67,7 @@ def capture_after_wake(
     is_busy: Callable[[], bool] = lambda: False,
     on_busy: Callable[[], None] = lambda: None,
     on_wake: Callable[[], None] = lambda: None,
+    none_limit: int = 5,
 ) -> np.ndarray | None:
     """Block on `read_frame()` until the wake word fires, then VAD-endpoint
     an utterance. Returns the captured audio (prebuffer + utterance), or
@@ -36,6 +75,7 @@ def capture_after_wake(
     """
     sr = cfg.sample_rate
     ring: deque = deque(maxlen=prebuffer_frames) if prebuffer_frames > 0 else deque(maxlen=0)
+    watch = MicWatchdog(none_limit)
 
     # phase 1: wait for the wake word
     while True:
@@ -43,6 +83,7 @@ def capture_after_wake(
             on_busy()
             continue
         frame = read_frame()
+        watch.observe(frame)  # raises MicLostError if the device died mid-stream
         if frame is None or len(frame) != FRAME_SAMPLES:
             continue
         ring.append(frame)
@@ -80,6 +121,7 @@ def capture_after_wake(
         if not heard_speech and waited > 5 * sr // FRAME_SAMPLES:
             return None
         frame = read_frame()
+        watch.observe(frame)  # raises MicLostError if the device died mid-stream
         if frame is None:
             continue
         consume(frame)

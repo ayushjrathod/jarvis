@@ -23,6 +23,12 @@ log = logging.getLogger("dispatcher.memory")
 
 DEFAULT_BUDGETS = {"USER.md": 2000, "MEMORY.md": 3200}
 DEFAULT_BUDGET = 2000
+# Only these files are injected into every prompt. A note dropped into
+# blocks_dir (or an OCR/ingest artifact that lands there) must NOT silently
+# enter every system prompt — that's an injection + context-bloat vector (M4).
+# Override with memory.block_files in config; per-project notes live in
+# blocks_dir/projects/ and are searchable, not auto-injected.
+DEFAULT_BLOCK_FILES = ("USER.md", "MEMORY.md")
 
 BLOCKS_PREAMBLE = (
     "Persistent memory blocks — personal context distilled from past "
@@ -49,8 +55,11 @@ def blocks_context(cfg: Config) -> str:
     if not d.is_dir():
         return ""
     budgets = {**DEFAULT_BUDGETS, **(_cfg_memory(cfg).get("block_budgets") or {})}
+    allow = set(_cfg_memory(cfg).get("block_files") or DEFAULT_BLOCK_FILES)
     parts = []
     for f in sorted(d.glob("*.md")):
+        if f.name not in allow:  # arbitrary top-level .md never gets injected
+            continue
         try:
             text = f.read_text(errors="replace").strip()
         except OSError as e:

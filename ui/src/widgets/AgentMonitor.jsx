@@ -1,6 +1,8 @@
 import React, { useEffect, useState } from "react";
 import { getJSON } from "../api.js";
 
+const TERMINAL = new Set(["done", "failed", "cancelled"]);
+
 // Live task/agent activity: seeded from /tasks, updated by /events SSE.
 export default function AgentMonitor({ lastEvent }) {
   const [rows, setRows] = useState([]);
@@ -29,6 +31,18 @@ export default function AgentMonitor({ lastEvent }) {
     if (!lastEvent?.task_id) return;
     // automation/notify events reference a task but aren't status changes
     if (["notify", "notify_skipped", "automation", "automation_created"].includes(lastEvent.event)) return;
+    // keep an expanded row's timeline live: append the step instead of waiting
+    // for a re-expand to refetch
+    if (lastEvent.event === "step" && expanded.has(lastEvent.task_id)) {
+      setSteps((m) => ({
+        ...m,
+        [lastEvent.task_id]: [
+          ...(m[lastEvent.task_id] ?? []),
+          { step_type: lastEvent.step_type, summary: lastEvent.summary,
+            elapsed_ms: lastEvent.elapsed_ms },
+        ],
+      }));
+    }
     setRows((rows) => {
       const next = rows.filter((r) => r.task_id !== lastEvent.task_id);
       const prev = rows.find((r) => r.task_id === lastEvent.task_id) ?? {};
@@ -47,13 +61,16 @@ export default function AgentMonitor({ lastEvent }) {
     });
   }, [lastEvent]);
 
-  function toggle(id, kind) {
+  function toggle(id, kind, status) {
+    const willOpen = !expanded.has(id);
     setExpanded((open) => {
       const next = new Set(open);
-      next.has(id) ? next.delete(id) : next.add(id);
+      willOpen ? next.add(id) : next.delete(id);
       return next;
     });
-    if (kind === "agentic" && !steps[id]) {
+    // fetch on expand; also refetch a non-terminal row whose cached steps may
+    // be incomplete (it was expanded mid-run)
+    if (willOpen && kind === "agentic" && (!steps[id] || !TERMINAL.has(status))) {
       getJSON(`/task/${id}/steps`)
         .then((byRun) => setSteps((m) => ({ ...m, [id]: Object.values(byRun).flat() })))
         .catch(() => {});
@@ -67,7 +84,7 @@ export default function AgentMonitor({ lastEvent }) {
         const open = expanded.has(r.task_id);
         return (
           <li key={r.task_id} className={open ? "open" : ""}>
-            <button className="row" onClick={() => toggle(r.task_id, r.kind)} aria-expanded={open}>
+            <button className="row" onClick={() => toggle(r.task_id, r.kind, r.status)} aria-expanded={open}>
               <span className={`chip chip-${r.status}`}>{r.status}</span>
               <span className={`chip chip-kind`}>{r.kind}</span>
               <span className="text">{r.text}</span>

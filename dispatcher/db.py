@@ -16,6 +16,10 @@ from pathlib import Path
 
 log = logging.getLogger("dispatcher.db")
 
+# WAL single-writer contention waits this long before raising OperationalError.
+# Doubles as the sqlite3.connect() busy timeout (seconds) and PRAGMA (ms).
+BUSY_TIMEOUT_S = 15
+
 try:
     import sqlite_vec
     _VEC_AVAILABLE = True
@@ -249,7 +253,7 @@ class Database:
 
     @contextmanager
     def _conn(self):
-        conn = sqlite3.connect(self.path, timeout=5)
+        conn = sqlite3.connect(self.path, timeout=BUSY_TIMEOUT_S)
         conn.row_factory = sqlite3.Row
         if getattr(self, "vec_ok", False):
             try:
@@ -261,6 +265,11 @@ class Database:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
+        # WAL still serializes writers; a longer busy_timeout makes a contended
+        # write wait at SQLite instead of raising OperationalError at the driver
+        # default — so a settle-path write (finish_run/set_task_status) can't
+        # strand a task 'running' just because two writers overlapped briefly.
+        conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_S * 1000}")
         try:
             yield conn
             conn.commit()
@@ -457,6 +466,19 @@ class Database:
                 [(now(), i) for i in ids],
             )
 
+    def mark_episodes_unconsolidated(self, ids: list[int]) -> int:
+        """Undo a hand-off mark (M6): when the consolidation run then FAILS, its
+        episodes go back into the pool so the next nightly pass retries them —
+        rather than being lost because they were marked before the agent ran."""
+        if not ids:
+            return 0
+        with self._conn() as c:
+            cur = c.executemany(
+                "UPDATE episodes SET consolidated_at=NULL WHERE id=?",
+                [(i,) for i in ids],
+            )
+            return cur.rowcount
+
     def search_episodes(self, q: str, limit: int = 10,
                         after: str | None = None,
                         before: str | None = None) -> list[dict]:
@@ -583,12 +605,19 @@ class Database:
 
     # -- knowledge graph (Phase J2) ----------------------------------------
 
+    @staticmethod
+    def _upsert_entity(c, name: str) -> int:
+        """Entity upsert on an existing connection/cursor — lets add_fact do the
+        whole fact write (fact + FTS + entities + links) in one transaction so a
+        mid-way failure leaves no partial fact."""
+        c.execute("INSERT OR IGNORE INTO kg_entities (name, created_at)"
+                  " VALUES (?,?)", (name, now()))
+        return c.execute("SELECT id FROM kg_entities WHERE name=?",
+                         (name,)).fetchone()["id"]
+
     def upsert_entity(self, name: str) -> int:
         with self._conn() as c:
-            c.execute("INSERT OR IGNORE INTO kg_entities (name, created_at)"
-                      " VALUES (?,?)", (name, now()))
-            return c.execute("SELECT id FROM kg_entities WHERE name=?",
-                             (name,)).fetchone()["id"]
+            return self._upsert_entity(c, name)
 
     def entity_names(self, limit: int = 200) -> list[str]:
         with self._conn() as c:
@@ -599,6 +628,9 @@ class Database:
     def add_fact(self, fact: str, entity_names: list[str],
                  valid_at: str | None = None,
                  episode_ids: list[int] | None = None) -> int:
+        # one transaction: fact + FTS row + entity upserts + links commit or roll
+        # back together, so an error partway can't leave a fact with no FTS index
+        # or dangling half its entity links (L1).
         with self._conn() as c:
             cur = c.execute(
                 "INSERT INTO kg_facts (fact, valid_at, episode_ids, created_at)"
@@ -608,9 +640,8 @@ class Database:
             fid = cur.lastrowid
             c.execute("INSERT INTO kg_facts_fts (fact, fact_id) VALUES (?,?)",
                       (fact, fid))
-        for name in entity_names:
-            eid = self.upsert_entity(name)
-            with self._conn() as c:
+            for name in entity_names:
+                eid = self._upsert_entity(c, name)
                 c.execute("INSERT OR IGNORE INTO kg_fact_entities VALUES (?,?)",
                           (fid, eid))
         return fid
@@ -770,21 +801,54 @@ class Database:
                         " WHERE id NOT IN (SELECT rowid FROM episodes_vec)"
                         " ORDER BY id LIMIT ?", (limit,)).fetchall()]
 
+    @staticmethod
+    def _live_ids(c, table: str, ids: list[int]) -> set[int]:
+        ph = ",".join("?" * len(ids))
+        return {r["id"] for r in c.execute(
+            f"SELECT id FROM {table} WHERE id IN ({ph})", ids)}
+
     def add_entry_embeddings(self, pairs: list[tuple[int, bytes]]):
         if not pairs:
             return
         with self._conn() as c:
-            c.executemany(
-                "INSERT OR REPLACE INTO entries_vec (rowid, embedding) VALUES (?,?)",
-                pairs)
+            # only embed ids whose entry still exists in THIS transaction: a
+            # reindex may have deleted the entry (and its vec row) between the
+            # missing-list query and now — an unconditional insert would leave
+            # an orphan vector matching nothing (L3).
+            live = self._live_ids(c, "entries", [p[0] for p in pairs])
+            rows = [p for p in pairs if p[0] in live]
+            if rows:
+                c.executemany(
+                    "INSERT OR REPLACE INTO entries_vec (rowid, embedding) VALUES (?,?)",
+                    rows)
 
     def add_episode_embeddings(self, pairs: list[tuple[int, bytes]]):
         if not pairs:
             return
         with self._conn() as c:
-            c.executemany(
-                "INSERT OR REPLACE INTO episodes_vec (rowid, embedding) VALUES (?,?)",
-                pairs)
+            live = self._live_ids(c, "episodes", [p[0] for p in pairs])
+            rows = [p for p in pairs if p[0] in live]
+            if rows:
+                c.executemany(
+                    "INSERT OR REPLACE INTO episodes_vec (rowid, embedding) VALUES (?,?)",
+                    rows)
+
+    def sweep_orphan_vectors(self) -> int:
+        """Delete vec rows whose backing entry/episode is gone (L3). vec0 tables
+        don't take subquery DELETEs, so scan rowids and delete the strays by id.
+        Cheap: the vectors number in the hundreds and this runs on the backfill."""
+        if not self.vec_ok:
+            return 0
+        removed = 0
+        with self._conn() as c:
+            for vtable, src in (("entries_vec", "entries"),
+                                ("episodes_vec", "episodes")):
+                live = {r["id"] for r in c.execute(f"SELECT id FROM {src}")}
+                for r in c.execute(f"SELECT rowid FROM {vtable}").fetchall():
+                    if r["rowid"] not in live:
+                        c.execute(f"DELETE FROM {vtable} WHERE rowid=?", (r["rowid"],))
+                        removed += 1
+        return removed
 
     def _knn(self, c, table: str, qvec: bytes, k: int) -> list[int]:
         return [r["rowid"] for r in c.execute(

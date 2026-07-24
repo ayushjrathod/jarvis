@@ -11,6 +11,7 @@ adapted from openclaw/openclaw src/shared/text/strip-markdown.ts (MIT,
 from __future__ import annotations
 
 import re
+import unicodedata
 
 _CODE_BLOCK = re.compile(r"```.*?```", re.S)
 _INLINE_CODE = re.compile(r"`([^`]*)`")
@@ -51,6 +52,33 @@ def sanitize(text: str) -> str:
     text = text.replace("|", " ")
     text = _WS.sub(" ", text)
     return text.strip()
+
+
+# whitespace controls that must not reach ydotool as literal keypresses; they
+# collapse to a plain space so words stay separated (a bare newline would be an
+# Enter keypress — executing whatever sits in the focused terminal)
+_INJECT_WS = {"\n", "\r", "\t", "\f", "\v"}
+
+
+def sanitize_for_injection(text: str) -> str:
+    """Make a transcript safe to type at the cursor via `ydotool type`.
+
+    Whisper occasionally hallucinates a newline; injected verbatim that is an
+    Enter keypress in the focused window (a terminal would run the line). Other
+    control / non-printing characters can fire unintended key events too. So:
+    newlines/tabs become a single space, every other control char (Unicode
+    C* category) is dropped, and ordinary printable text — spaces, punctuation,
+    unicode letters and symbols — passes through unchanged. Pure function."""
+    out = []
+    for ch in text:
+        if ch in _INJECT_WS:
+            out.append(" ")
+        elif unicodedata.category(ch).startswith("C"):
+            continue  # Cc/Cf/Cs/Co/Cn — control or non-printing
+        else:
+            out.append(ch)
+    # split()/join collapses the runs the substitutions created and trims ends
+    return " ".join("".join(out).split())
 
 
 class SentenceChunker:

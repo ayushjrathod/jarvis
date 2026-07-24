@@ -35,6 +35,16 @@ export async function postTask(text, { onDelta, source = "ui", mode, metadata } 
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
+  if (!resp.ok) {
+    // surface a real error instead of parsing an error page as JSON/SSE
+    let detail = "";
+    try {
+      detail = (await resp.json())?.detail ?? "";
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new Error(`POST /task ${resp.status}${detail ? `: ${detail}` : ""}`);
+  }
   const ctype = resp.headers.get("content-type") || "";
   if (ctype.startsWith("application/json")) {
     return { kind: "agentic", ...(await resp.json()) };

@@ -36,7 +36,7 @@ class RecordingStream:
         self.calls = []
 
     async def __call__(self, text, cfg, model_override=None, tools=None,
-                       context="", resume_session_id=None):
+                       context="", resume_session_id=None, **kwargs):
         self.calls.append({"model": model_override, "resume": resume_session_id})
         meta = self.metas.pop(0)
         if meta.get("status") == "done":
@@ -181,6 +181,43 @@ class TestAgenticLimitHandling(unittest.IsolatedAsyncioTestCase):
         got = self.svc.db.get_task(task["id"])
         self.assertEqual(got["status"], "done")
         self.assertEqual([r["status"] for r in got["runs"]], ["failed", "done"])
+
+    async def _consolidate_task(self, eid):
+        return await self.svc.create_task(
+            "consolidate now", "timer", "agentic", area="memory",
+            metadata={"task_type": "memory-consolidate", "episode_ids": [eid]},
+            trusted=True)
+
+    async def test_failed_consolidation_requeues_episodes(self):
+        # M6: episodes marked consolidated at hand-off go back to the pool when
+        # the run fails, so a broken nightly pass doesn't lose them.
+        eid = self.svc.db.add_episode("t1", "voice", "quick", None, "done",
+                                      "hello", "hi")
+        self.svc.db.mark_episodes_consolidated([eid])
+        self.assertEqual(self.svc.db.unconsolidated_episodes(), [])
+
+        async def fake_run(*a, **kw):
+            return {"status": "failed", "error": "agent crashed"}
+
+        with patch("dispatcher.service.runner.run_once", fake_run):
+            task = await self._consolidate_task(eid)
+            await self.svc._run_agentic_inner(task)
+        self.assertEqual(self.svc.db.get_task(task["id"])["status"], "failed")
+        self.assertIn(eid, [e["id"] for e in self.svc.db.unconsolidated_episodes()])
+
+    async def test_done_consolidation_keeps_episodes_marked(self):
+        eid = self.svc.db.add_episode("t2", "voice", "quick", None, "done",
+                                      "hello", "hi")
+        self.svc.db.mark_episodes_consolidated([eid])
+
+        async def fake_run(*a, **kw):
+            return {"status": "done", "session_id": "s", "num_turns": 1}
+
+        with patch("dispatcher.service.runner.run_once", fake_run):
+            task = await self._consolidate_task(eid)
+            await self.svc._run_agentic_inner(task)
+        self.assertEqual(self.svc.db.get_task(task["id"])["status"], "done")
+        self.assertEqual(self.svc.db.unconsolidated_episodes(), [])
 
     async def test_session_limit_fails_with_speech_event(self):
         seen = []

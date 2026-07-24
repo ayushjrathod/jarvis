@@ -81,6 +81,25 @@ class TestVecStore(unittest.TestCase):
         out = self.db.search_episodes_hybrid("zzz nothing", vec(2), limit=5)
         self.assertTrue(any(r["id"] == eid for r in out))
 
+    def test_add_entry_embeddings_skips_vanished_entry(self):
+        # L3: an id with no backing entry must not be inserted as an orphan vec
+        self.db.add_entry_embeddings([(9999, vec(3))])
+        with self.db._conn() as c:
+            n = c.execute("SELECT count(*) n FROM entries_vec"
+                          " WHERE rowid=9999").fetchone()["n"]
+        self.assertEqual(n, 0)
+
+    def test_sweep_removes_orphan_vectors(self):
+        # L3: an entry deleted out from under its vector is swept
+        eid = self.ids["a"]
+        with self.db._conn() as c:
+            c.execute("DELETE FROM entries WHERE id=?", (eid,))  # orphans the vec
+        self.assertEqual(self.db.sweep_orphan_vectors(), 1)
+        with self.db._conn() as c:
+            left = c.execute("SELECT count(*) n FROM entries_vec"
+                             " WHERE rowid=?", (eid,)).fetchone()["n"]
+        self.assertEqual(left, 0)
+
 
 class TestGraphStore(unittest.TestCase):
     def setUp(self):
@@ -125,6 +144,25 @@ class TestGraphStore(unittest.TestCase):
         self.assertNotIn(f3, near)
         self.assertNotIn(f1, near)
 
+    def test_add_fact_is_atomic_on_failure(self):
+        # L1: a failure partway through must leave no partial fact — no orphan
+        # kg_facts row, no dangling FTS row.
+        from unittest.mock import patch
+        with patch.object(Database, "_upsert_entity", side_effect=ValueError("boom")):
+            with self.assertRaises(ValueError):
+                self.db.add_fact("Half-written fact.", ["X"])
+        counts = self.db.graph_counts()
+        self.assertEqual(counts["facts_active"], 0)
+        self.assertFalse(self.db.search_facts("Half-written"))
+
+    def test_busy_timeout_pragma_applied(self):
+        # M3: every connection gets a generous busy_timeout so WAL contention
+        # waits at SQLite instead of raising OperationalError at the driver default.
+        from dispatcher.db import BUSY_TIMEOUT_S
+        with self.db._conn() as c:
+            got = c.execute("PRAGMA busy_timeout").fetchone()[0]
+        self.assertEqual(got, BUSY_TIMEOUT_S * 1000)
+
 
 class TestApplyExtraction(unittest.TestCase):
     def setUp(self):
@@ -154,6 +192,60 @@ class TestApplyExtraction(unittest.TestCase):
         self.db.add_fact("Dup B.", ["X"])
         out = graph.apply_reconciliation(self.db, {"invalidate": [f1]})
         self.assertEqual(out, {"invalidated": 1})
+
+    def test_invalidation_restricted_to_candidates(self):
+        """A reply may only invalidate ids it was shown as candidates; an active
+        fact absent from the candidate set (or a bogus id) is left untouched."""
+        a = self.db.add_fact("Candidate fact.", ["X"])
+        b = self.db.add_fact("Active but not a candidate.", ["Y"])
+        counts = graph.apply_extraction(
+            self.db, {"invalidated_ids": [a, b, 4242]},
+            episode_ids=[1], allowed_ids={a})
+        self.assertEqual(counts["invalidated"], 1)      # only a
+        self.assertTrue(self.db.search_facts("candidate", include_invalid=True))
+        self.assertTrue(self.db.search_facts("active"))  # b still active
+        self.assertEqual(self.db.graph_counts()["facts_active"], 1)
+
+    def test_extraction_cannot_soft_wipe_the_graph(self):
+        """H3 repro: a reply enumerating a huge id range invalidates only the
+        real active candidates, not every id it names."""
+        a = self.db.add_fact("Keep me.", ["X"])
+        b = self.db.add_fact("Keep me too.", ["Y"])
+        counts = graph.apply_extraction(
+            self.db, {"invalidated_ids": list(range(1, 10000))},
+            episode_ids=[1], allowed_ids={a})  # b not offered as a candidate
+        self.assertEqual(counts["invalidated"], 1)
+        self.assertEqual(self.db.graph_counts()["facts_active"], 1)
+        self.assertTrue(self.db.search_facts("keep me too"))  # b survives
+        _ = b
+
+    def test_bools_are_not_fact_ids(self):
+        """isinstance(True, int) is True; a bare [true]/[false] must invalidate
+        nothing even though True == 1 could collide with fact id 1."""
+        a = self.db.add_fact("Fact number one.", ["X"])  # id 1 on a fresh db
+        counts = graph.apply_extraction(
+            self.db, {"invalidated_ids": [True, False]},
+            episode_ids=[1], allowed_ids={a})
+        self.assertEqual(counts["invalidated"], 0)
+        self.assertEqual(self.db.graph_counts()["facts_active"], 1)
+
+    def test_reconciliation_restricted_to_candidates(self):
+        a = self.db.add_fact("Reconcile me.", ["X"])
+        b = self.db.add_fact("Off the list.", ["Y"])
+        out = graph.apply_reconciliation(
+            self.db, {"invalidate": [a, b]}, allowed_ids={a})
+        self.assertEqual(out, {"invalidated": 1})
+        self.assertEqual(self.db.graph_counts()["facts_active"], 1)
+        _ = b
+
+    def test_facts_batch_is_capped(self):
+        many = [{"fact": f"Durable fact number {i}.", "entities": ["X"]}
+                for i in range(graph.MAX_FACTS_PER_BATCH + 20)]
+        counts = graph.apply_extraction(self.db, {"facts": many},
+                                        episode_ids=[1])
+        self.assertEqual(counts["facts_added"], graph.MAX_FACTS_PER_BATCH)
+        self.assertEqual(self.db.graph_counts()["facts_active"],
+                         graph.MAX_FACTS_PER_BATCH)
 
     def test_parse_reply_garbage_raises(self):
         with self.assertRaises(ValueError):

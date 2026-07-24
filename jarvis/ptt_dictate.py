@@ -23,6 +23,8 @@ import numpy as np
 import sounddevice as sd
 from evdev import InputDevice, ecodes, list_devices
 
+from jarvis.sanitize import sanitize_for_injection
+
 # ---------------- Config you'll likely want to tweak ----------------
 TRIGGER_KEY = ecodes.KEY_F9        # the held-down hotkey
 SAMPLE_RATE = 16000
@@ -80,6 +82,11 @@ def stop_recording_and_transcribe():
 
 
 def type_text(text):
+    # Strip control chars before injection so a hallucinated newline can't
+    # become an Enter keypress in the focused window (L9; shared helper).
+    text = sanitize_for_injection(text)
+    if not text:
+        return
     subprocess.run(["ydotool", "type", "--", text])
 
 

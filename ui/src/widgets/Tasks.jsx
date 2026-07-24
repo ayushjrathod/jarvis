@@ -5,6 +5,7 @@ const today = () => new Date().toISOString().slice(0, 10);
 
 export default function Tasks({ lastEvent }) {
   const [tasks, setTasks] = useState([]);
+  const [note, setNote] = useState(null);
 
   const refresh = useCallback(() => {
     getJSON("/vault/tasks").then(setTasks).catch(() => setTasks([]));
@@ -17,13 +18,28 @@ export default function Tasks({ lastEvent }) {
   }, [lastEvent, refresh]);
 
   async function toggle(file) {
-    await postJSON(`/vault/tasks/${encodeURIComponent(file)}/toggle`);
-    refresh();
+    try {
+      await postJSON(`/vault/tasks/${encodeURIComponent(file)}/toggle`);
+      setNote(null);
+    } catch (e) {
+      setNote(`Couldn't update task: ${e.message}`);
+    } finally {
+      refresh();
+    }
   }
 
-  if (!tasks.length) return <p className="empty">No tasks — say "add a task: …"</p>;
+  const noteEl = note && <p className="note err">{note}</p>;
+  if (!tasks.length)
+    return (
+      <>
+        {noteEl}
+        <p className="empty">No tasks — say "add a task: …"</p>
+      </>
+    );
   return (
-    <ul className="tasks">
+    <>
+      {noteEl}
+      <ul className="tasks">
       {tasks.map((t) => (
         <li key={t.file} className={t.status === "done" ? "done" : ""}>
           <label>
@@ -41,6 +57,7 @@ export default function Tasks({ lastEvent }) {
           </label>
         </li>
       ))}
-    </ul>
+      </ul>
+    </>
   );
 }

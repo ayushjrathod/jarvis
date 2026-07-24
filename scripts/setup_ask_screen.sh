@@ -24,10 +24,14 @@ if [[ "$current" != *"$KEYPATH"* ]]; then
   fi
 fi
 
-# GNOME spawns shortcut commands with no cwd in the repo — self-contained cmd
+# GNOME spawns shortcut commands with no cwd in the repo — self-contained cmd.
+# Shell-quote the repo path so a directory with spaces/specials still cd's
+# correctly. NOTE: the path is baked in here — re-run this script after moving
+# the repo, or the shortcut will cd into the old location.
+REPO_Q=$(printf '%q' "$PWD")
 gsettings set "$BINDING_SCHEMA:$KEYPATH" name "Mission ask screen"
 gsettings set "$BINDING_SCHEMA:$KEYPATH" binding "$BINDING"
 gsettings set "$BINDING_SCHEMA:$KEYPATH" command \
-  "sh -c 'cd $PWD && exec .venv/bin/python -m jarvis.ask_screen'"
+  "sh -c 'cd $REPO_Q && exec .venv/bin/python -m jarvis.ask_screen'"
 
 echo "ask-screen ready: press $BINDING (dispatcher must be running)"

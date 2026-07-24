@@ -60,9 +60,12 @@ def embed_missing(cfg: Config, db: Database, batch: int = 128) -> dict:
     """Backfill vectors for entries/episodes that don't have one yet. Runs in
     a thread (CPU-bound); called at startup, after reindex, and on the
     refresh loop — cheap when nothing is new."""
-    stats = {"entries": 0, "episodes": 0}
+    stats = {"entries": 0, "episodes": 0, "orphans_swept": 0}
     if not (enabled(cfg) and db.vec_ok):
         return stats
+    # clear vectors whose entry/episode was deleted since the last pass, so a
+    # reindexed-away chunk can't keep matching KNN queries (L3)
+    stats["orphans_swept"] = db.sweep_orphan_vectors()
     while True:
         rows = db.entries_missing_embeddings(batch)
         if not rows:

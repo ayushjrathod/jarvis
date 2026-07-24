@@ -2,6 +2,7 @@
 scheduler firing, notify-or-not gate policy. stdlib unittest, no network."""
 
 import asyncio
+import shutil
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -9,10 +10,17 @@ from pathlib import Path
 
 from dispatcher import automations, notify
 from dispatcher.db import Database
-from dispatcher.ingest import (chunk_html, chunk_plaintext, html_to_markdown,
-                               ingest_vault)
+from dispatcher.ingest import (chunk_html, chunk_markdown, chunk_plaintext,
+                               html_to_markdown, ingest_vault)
 
 IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _installed(*mods) -> bool:
+    """True only if every optional dependency is importable — lets the PDF/OCR
+    tests skip cleanly on a machine that never approved those deps (L14)."""
+    import importlib.util
+    return all(importlib.util.find_spec(m) is not None for m in mods)
 
 
 class TestChunkPlaintext(unittest.TestCase):
@@ -30,6 +38,39 @@ class TestChunkPlaintext(unittest.TestCase):
         text = "\n\n".join("word " * 100 for _ in range(5))  # ~500 words
         chunks = chunk_plaintext("big.txt", text)
         self.assertGreater(len(chunks), 1)
+
+
+class TestJunkWordFilter(unittest.TestCase):
+    """M5: the >500-char junk filter must tokenize on all whitespace, not just
+    single spaces — else newline-separated content (a bookmark-per-line .txt)
+    is one giant pseudo-word, gets dropped wholesale, and the file indexes as a
+    single empty entry."""
+
+    def test_url_per_line_txt_is_searchable(self):
+        urls = "\n".join(f"https://example.com/bookmark-{i}" for i in range(30))
+        chunks = chunk_plaintext("vault/inbox/bookmarks.txt", urls)
+        self.assertTrue(chunks)
+        self.assertTrue(any("http" in c["raw"] for c in chunks))
+        # regression for the empty-entry bug: no chunk with empty raw
+        self.assertFalse(any(c["raw"].strip() == "" for c in chunks))
+
+    def test_url_per_line_markdown_section_is_searchable(self):
+        body = "# Links\n" + "\n".join(
+            f"https://example.com/bookmark-{i}" for i in range(30))
+        chunks = chunk_markdown("vault/inbox/links.md", body)
+        self.assertTrue(chunks)
+        self.assertTrue(any("http" in c["raw"] for c in chunks))
+        self.assertFalse(any(c["raw"].strip() == "" for c in chunks))
+
+    def test_single_long_junk_token_still_dropped(self):
+        # a genuine 5000-char blob with no whitespace stays dropped/empty
+        self.assertEqual(chunk_plaintext("x.txt", "A" * 5000), [])
+        self.assertEqual(chunk_markdown("x.md", "# H\n" + "B" * 5000), [])
+
+    def test_normal_prose_keeps_paragraphs(self):
+        chunks = chunk_plaintext("p.txt", "first para\n\nsecond para")
+        self.assertEqual(len(chunks), 1)
+        self.assertIn("\n\n", chunks[0]["raw"])
 
 
 class TestHtml(unittest.TestCase):
@@ -86,6 +127,44 @@ class TestIngestWalk(unittest.TestCase):
         self.assertFalse(self.db.search_entries("insurance premium"))
 
 
+class TestIngestStaleDir(unittest.TestCase):
+    """L6: a briefly-absent index_dir must not purge its whole index; a
+    present dir must still prune files that were genuinely deleted."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.db = Database(self.root / "t.db")
+        (self.root / "vault").mkdir()
+        (self.root / "vault" / "note.txt").write_text(
+            "quarterly insurance premium is due")
+        (self.root / "notes").mkdir()
+        (self.root / "notes" / "memo.txt").write_text(
+            "standalone journal memo content")
+        self.dirs = ["vault", "notes"]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_absent_dir_keeps_its_entries(self):
+        ingest_vault(self.db, self.root, self.dirs)
+        self.assertTrue(self.db.search_entries("journal memo"))
+        # 'notes' vanishes (unmounted / mid-sync); reindex must not purge it
+        shutil.rmtree(self.root / "notes")
+        stats = ingest_vault(self.db, self.root, self.dirs)
+        self.assertEqual(stats["deleted"], 0)
+        self.assertTrue(self.db.search_entries("journal memo"))
+        self.assertTrue(self.db.search_entries("insurance premium"))
+
+    def test_present_dir_still_prunes_deleted_file(self):
+        ingest_vault(self.db, self.root, self.dirs)
+        (self.root / "notes" / "memo.txt").unlink()  # dir present, file gone
+        stats = ingest_vault(self.db, self.root, self.dirs)
+        self.assertGreater(stats["deleted"], 0)
+        self.assertFalse(self.db.search_entries("journal memo"))
+        self.assertTrue(self.db.search_entries("insurance premium"))
+
+
 class TestIngestDocs(unittest.TestCase):
     """PDF + image OCR processors (deps approved + installed 2026-07-19)."""
 
@@ -98,6 +177,7 @@ class TestIngestDocs(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    @unittest.skipUnless(_installed("pymupdf"), "pymupdf not installed")
     def test_pdf_text_extraction(self):
         import pymupdf
         doc = pymupdf.open()
@@ -111,6 +191,8 @@ class TestIngestDocs(unittest.TestCase):
         self.assertTrue(hits)
         self.assertIn("page 1", hits[0]["heading"])
 
+    @unittest.skipUnless(_installed("cv2", "rapidocr_onnxruntime"),
+                         "cv2/rapidocr not installed")
     def test_image_ocr(self):
         import cv2
         import numpy as np
@@ -141,6 +223,14 @@ class TestDetect(unittest.TestCase):
                      "should I water the plants every day",
                      "add a task: buy milk",
                      "tell me my schedule"):
+            self.assertFalse(automations.detect(text), text)
+
+    def test_memory_statements_do_not_divert(self):
+        # L5: "remember/note/save …" is a memory write, not a schedule, even
+        # with schedule-ish phrasing
+        for text in ("remember that I run every morning",
+                     "note that I take meds every day",
+                     "save this: standup is every weekday"):
             self.assertFalse(automations.detect(text), text)
 
 
@@ -217,6 +307,20 @@ class TestNextRun(unittest.TestCase):
         after = datetime(2026, 7, 19, 11, 0, tzinfo=IST)
         self.assertIsNone(automations.next_run_iso(spec, after))
         self.assertIsNone(automations.next_run_iso({"kind": "once", "once_at": None}))
+
+    def test_daily_default_after_is_dst_correct(self):
+        # L4: the default 'now' rides the real IANA zone, so a daily 09:30 keeps
+        # its wall-clock hour across a DST transition (a frozen fixed offset
+        # would drift an hour). Simulate a DST zone the day before spring-forward.
+        from unittest.mock import patch
+        from zoneinfo import ZoneInfo
+        ny = ZoneInfo("America/New_York")
+        now = datetime(2026, 3, 7, 10, 0, tzinfo=ny)  # EST, before spring-forward
+        with patch("dispatcher.automations._local_zone", return_value=ny), \
+             patch("dispatcher.automations._now_local", return_value=now):
+            iso = automations.next_run_iso({"kind": "daily", "time": "09:30"})
+        got = datetime.fromisoformat(iso).astimezone(ny)
+        self.assertEqual((got.month, got.day, got.hour, got.minute), (3, 8, 9, 30))
 
 
 class TestParseResponse(unittest.TestCase):
@@ -368,12 +472,23 @@ class TestSurfacingPolicy(unittest.TestCase):
         return notify.surfacing(self.ACFG if acfg is None else acfg,
                                 {"source": source}, meta or {}, final)
 
-    def test_meta_types_always_silent(self):
+    def test_meta_types_silent_on_success(self):
         for tt in ("reflection", "memory-consolidate", "notify-gate",
                    "automation-parse"):
             self.assertEqual(self.surf(meta={"task_type": tt}), "silent")
+
+    def test_plumbing_meta_types_silent_even_on_failure(self):
+        # gate/parse/reflection failures are internal noise — stay silent
+        for tt in ("reflection", "notify-gate", "automation-parse"):
             self.assertEqual(self.surf(acfg={}, meta={"task_type": tt},
                                        final="failed"), "silent")
+
+    def test_failed_consolidation_surfaces(self):
+        # M6: a broken nightly consolidation must be visible, not swallowed
+        self.assertEqual(self.surf(acfg={}, meta={"task_type": "memory-consolidate"},
+                                   final="failed"), "surface")
+        self.assertEqual(self.surf(meta={"task_type": "memory-consolidate"},
+                                   final="done"), "silent")
 
     def test_feature_off_or_wrong_source_surfaces(self):
         self.assertEqual(self.surf(acfg={}), "surface")

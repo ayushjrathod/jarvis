@@ -46,7 +46,11 @@ def resolve_backend(cfg: Config) -> str:
 
 async def stream(text: str, cfg: Config, model_override: str | None = None,
                  tools: list[str] | None = None, context: str = "",
-                 resume_session_id: str | None = None):
+                 resume_session_id: str | None = None,
+                 procs: dict | None = None, task_id: str | None = None):
+    """procs/task_id let the caller register the CLI subprocess for cancel/
+    barge-in (mirrors runner.run_once): while a turn is streaming, procs[task_id]
+    holds the live process so POST /task/{id}/cancel can kill it."""
     backend = resolve_backend(cfg)
     if tools and backend == "messages_api":
         backend = "claude_cli"  # file-reading quick queries need CLI tool access
@@ -56,7 +60,7 @@ async def stream(text: str, cfg: Config, model_override: str | None = None,
         agen = _stream_api(text, cfg, model_override)
     else:
         agen = _stream_cli(text, cfg, model_override, tools, context,
-                           resume_session_id)
+                           resume_session_id, procs, task_id)
     async for item in agen:
         yield item
 
@@ -102,7 +106,8 @@ async def _stream_api(text: str, cfg: Config, model_override: str | None):
 
 async def _stream_cli(text: str, cfg: Config, model_override: str | None,
                       tools: list[str] | None = None, context: str = "",
-                      resume_session_id: str | None = None):
+                      resume_session_id: str | None = None,
+                      procs: dict | None = None, task_id: str | None = None):
     system = QUICK_SYSTEM + ("\n\n" + context if context else "")
     cmd = [
         cfg.claude_bin, "-p", text,
@@ -135,6 +140,8 @@ async def _stream_cli(text: str, cfg: Config, model_override: str | None,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         limit=STREAM_LIMIT,
     )
+    if procs is not None and task_id is not None:
+        procs[task_id] = proc  # let cancel()/barge-in kill this live turn (M2)
     # drain stderr concurrently: with only stdout being read, a chatty CLI can
     # fill the 64KiB stderr pipe and deadlock until the timeout kills it
     stderr_task = asyncio.create_task(proc.stderr.read())
@@ -182,15 +189,18 @@ async def _stream_cli(text: str, cfg: Config, model_override: str | None,
             await proc.wait()
     except TimeoutError:
         proc.kill()
+        await proc.wait()
         meta.update({"status": "failed", "error": f"quick timeout after {timeout}s"})
     finally:
+        if procs is not None and task_id is not None:
+            procs.pop(task_id, None)
         if proc.returncode is None:
             proc.kill()
+            await proc.wait()
+        # always reap the concurrent stderr drainer (L2)
+        stderr_bytes = await runner.reap_reader(stderr_task)
     if proc.returncode not in (0, None) and meta["status"] == "failed" and not meta.get("error"):
-        try:
-            stderr = (await asyncio.wait_for(stderr_task, 5))[:500].decode(errors="replace")
-        except TimeoutError:
-            stderr = ""
+        stderr = stderr_bytes[:500].decode(errors="replace")
         meta["error"] = f"claude exited {proc.returncode}: {stderr}"
     yield ("meta", meta)
 

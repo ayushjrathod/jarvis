@@ -5,6 +5,7 @@ import { getJSON, postJSON } from "../api.js";
 // through the command box ("every morning, tell me …") or POST /automations.
 export default function Automations({ lastEvent }) {
   const [rows, setRows] = useState([]);
+  const [note, setNote] = useState(null);
 
   const refresh = useCallback(() => {
     getJSON("/automations").then(setRows).catch(() => setRows([]));
@@ -16,18 +17,40 @@ export default function Automations({ lastEvent }) {
   }, [lastEvent, refresh]);
 
   async function toggle(id) {
-    await postJSON(`/automations/${id}/toggle`);
-    refresh();
+    try {
+      await postJSON(`/automations/${id}/toggle`);
+      setNote(null);
+    } catch (e) {
+      setNote(`Couldn't toggle: ${e.message}`);
+    } finally {
+      refresh();
+    }
   }
 
   async function remove(id) {
-    await fetch(`/automations/${id}`, { method: "DELETE" });
-    refresh();
+    try {
+      const r = await fetch(`/automations/${id}`, { method: "DELETE" });
+      if (!r.ok) throw new Error(`${r.status}`);
+      setNote(null);
+    } catch (e) {
+      setNote(`Couldn't delete: ${e.message}`);
+    } finally {
+      refresh();
+    }
   }
 
-  if (!rows.length) return <p className="empty">None yet — say "every morning, tell me …"</p>;
+  const noteEl = note && <p className="note err">{note}</p>;
+  if (!rows.length)
+    return (
+      <>
+        {noteEl}
+        <p className="empty">None yet — say "every morning, tell me …"</p>
+      </>
+    );
   return (
-    <ul className="automations">
+    <>
+      {noteEl}
+      <ul className="automations">
       {rows.map((a) => (
         <li key={a.id} className={a.enabled ? "" : "paused"}>
           <div className="auto-main">
@@ -44,6 +67,7 @@ export default function Automations({ lastEvent }) {
           </div>
         </li>
       ))}
-    </ul>
+      </ul>
+    </>
   );
 }

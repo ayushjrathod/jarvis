@@ -23,6 +23,13 @@ log = logging.getLogger("dispatcher.graph")
 MAX_FACT_LEN = 300
 MAX_ENTITIES_PER_FACT = 6
 MAX_EPISODES_CHARS = 12000
+# Active facts offered to the model as invalidation candidates (extraction /
+# weekly reconcile). An apply may ONLY invalidate ids drawn from this set — a
+# reply can never reach past the candidates it was shown (H3: no graph wipe).
+CANDIDATE_LIMIT = 80
+RECONCILE_LIMIT = 200
+# Facts one extraction reply may add — bounds a flood of the graph in one batch.
+MAX_FACTS_PER_BATCH = 50
 
 EXTRACT_PROMPT = """\
 You extract durable facts from a day's interaction log into a personal \
@@ -63,9 +70,16 @@ contradicted by newer facts, and one-off states that clearly stopped being
 true. When unsure, keep it. An empty list is the normal outcome."""
 
 
+def candidate_ids(db: Database, limit: int = CANDIDATE_LIMIT) -> set[int]:
+    """The exact set of active-fact ids offered as invalidation candidates —
+    the only ids an apply is allowed to invalidate. Re-derivable from the same
+    query the prompt builders use, so callers may thread it through or omit it."""
+    return {f["id"] for f in db.active_facts(limit=limit)}
+
+
 def extraction_prompt(db: Database, episodes_text: str, date: str) -> str:
     entities = db.entity_names(limit=200)
-    candidates = db.active_facts(limit=80)
+    candidates = db.active_facts(limit=CANDIDATE_LIMIT)
     return EXTRACT_PROMPT.format(
         date=date,
         episodes=episodes_text[:MAX_EPISODES_CHARS],
@@ -75,7 +89,7 @@ def extraction_prompt(db: Database, episodes_text: str, date: str) -> str:
     )
 
 
-def reconcile_prompt(db: Database, date: str, limit: int = 200) -> str:
+def reconcile_prompt(db: Database, date: str, limit: int = RECONCILE_LIMIT) -> str:
     facts = db.active_facts(limit=limit)
     return RECONCILE_PROMPT.format(
         date=date,
@@ -83,11 +97,33 @@ def reconcile_prompt(db: Database, date: str, limit: int = 200) -> str:
                         for f in facts))
 
 
-def apply_extraction(db: Database, obj: dict, episode_ids: list[int]) -> dict:
+def _allowed_invalidations(raw, allowed: set[int]) -> list[int]:
+    """Clean a model-supplied id list: drop non-ints and bools
+    (isinstance(True, int) is True — a bare [true] would otherwise mean id 1),
+    de-dup, and keep only ids that were actually shown as candidates. Intersecting
+    with `allowed` also caps the count at len(candidates)."""
+    out, seen = [], set()
+    for i in raw or []:
+        if isinstance(i, bool) or not isinstance(i, int):
+            continue
+        if i in allowed and i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
+
+
+def apply_extraction(db: Database, obj: dict, episode_ids: list[int],
+                     allowed_ids: set[int] | None = None) -> dict:
     """Deterministic apply of the extraction JSON; malformed items are
-    skipped individually so one bad fact never voids the batch."""
+    skipped individually so one bad fact never voids the batch. Invalidation is
+    restricted to `allowed_ids` (the candidates the prompt offered — re-derived
+    at the current cap when not threaded through) and additions are capped."""
+    if allowed_ids is None:
+        allowed_ids = candidate_ids(db, CANDIDATE_LIMIT)
     added, invalidated = 0, 0
     for item in obj.get("facts") or []:
+        if added >= MAX_FACTS_PER_BATCH:
+            break
         if not isinstance(item, dict):
             continue
         fact = str(item.get("fact") or "").strip()
@@ -100,14 +136,17 @@ def apply_extraction(db: Database, obj: dict, episode_ids: list[int]) -> dict:
         db.add_fact(fact, names[:MAX_ENTITIES_PER_FACT], valid_at=valid_at,
                     episode_ids=episode_ids)
         added += 1
-    ids = [i for i in (obj.get("invalidated_ids") or []) if isinstance(i, int)]
+    ids = _allowed_invalidations(obj.get("invalidated_ids"), allowed_ids)
     if ids:
         invalidated = db.invalidate_facts(ids)
     return {"facts_added": added, "invalidated": invalidated}
 
 
-def apply_reconciliation(db: Database, obj: dict) -> dict:
-    ids = [i for i in (obj.get("invalidate") or []) if isinstance(i, int)]
+def apply_reconciliation(db: Database, obj: dict,
+                         allowed_ids: set[int] | None = None) -> dict:
+    if allowed_ids is None:
+        allowed_ids = candidate_ids(db, RECONCILE_LIMIT)
+    ids = _allowed_invalidations(obj.get("invalidate"), allowed_ids)
     return {"invalidated": db.invalidate_facts(ids) if ids else 0}
 
 

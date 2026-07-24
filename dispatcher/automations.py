@@ -16,10 +16,47 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 log = logging.getLogger("dispatcher.automations")
+
+_ZONE = None
+
+
+def _local_zone():
+    """The machine's IANA zone, so wall-clock math is DST-correct (L4): adding
+    a day to '07:30' keeps 07:30 across a DST change, and only .astimezone(UTC)
+    at the end applies the per-date offset. A fixed-offset tzinfo (what
+    .astimezone() yields) would freeze one offset and drift an hour twice a
+    year. Falls back to the fixed local offset when the zone can't be resolved
+    (harmless in a no-DST zone like IST). No new dependency: TZ env or the
+    /etc/localtime symlink."""
+    global _ZONE
+    if _ZONE is not None:
+        return _ZONE
+    name = os.environ.get("TZ") or ""
+    if not name:
+        try:
+            link = os.readlink("/etc/localtime")
+            if "zoneinfo/" in link:
+                name = link.split("zoneinfo/", 1)[1]
+        except OSError:
+            pass
+    if name:
+        try:
+            _ZONE = ZoneInfo(name)
+            return _ZONE
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+    _ZONE = datetime.now().astimezone().tzinfo  # fixed-offset fallback
+    return _ZONE
+
+
+def _now_local() -> datetime:
+    return datetime.now(_local_zone())
 
 KINDS = ("daily", "weekly", "interval", "once")
 WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
@@ -38,6 +75,13 @@ DETECT_RE = re.compile(
 QUESTION_RE = re.compile(
     r"^\s*(what|when|why|how|who|where|which|did|do|does|is|are|was|were|"
     r"have|has|can|could|should|would|show|list)\b",
+    re.IGNORECASE)
+# A leading memory/statement verb means "write this down", never "schedule it"
+# — "remember that I run every morning" must stay a memory write, not become an
+# automation, even though it carries schedule-ish phrasing (L5).
+STATEMENT_RE = re.compile(
+    r"^\s*(remember|note|save|record|store|log|memoriz|"
+    r"don'?t forget|keep in mind|fyi)\b",
     re.IGNORECASE)
 
 PARSE_PROMPT = """\
@@ -63,11 +107,13 @@ quiet about the results."""
 
 def detect(text: str) -> bool:
     """Should this task text be diverted to automation creation?"""
-    return bool(DETECT_RE.search(text)) and not QUESTION_RE.match(text)
+    return (bool(DETECT_RE.search(text))
+            and not QUESTION_RE.match(text)
+            and not STATEMENT_RE.match(text))
 
 
 def parse_prompt(request: str) -> str:
-    now_local = datetime.now().astimezone()
+    now_local = _now_local()
     return PARSE_PROMPT.format(
         now=now_local.strftime("%Y-%m-%d %H:%M"),
         tz=now_local.tzname() or "local",
@@ -127,8 +173,8 @@ def validate_spec(spec: dict) -> dict:
         except ValueError:
             raise ValueError("once needs once_at as ISO local datetime")
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
-        if dt <= datetime.now().astimezone():
+            dt = dt.replace(tzinfo=_local_zone())
+        if dt <= _now_local():
             raise ValueError("once_at is in the past")
         out["once_at"] = dt.isoformat(timespec="minutes")
     return out
@@ -139,9 +185,9 @@ def next_run_iso(spec: dict, after: datetime | None = None) -> str | None:
     when the automation is spent (kind=once after firing). Schedules are
     local-time; catch-up policy is compute-from-now, so a machine that slept
     through three due times fires once, not three times."""
-    after = after or datetime.now().astimezone()
+    after = after or _now_local()
     if after.tzinfo is None:
-        after = after.astimezone()
+        after = after.replace(tzinfo=_local_zone())
     kind = spec["kind"]
     if kind == "once":
         if spec.get("once_at") is None:
@@ -195,7 +241,7 @@ async def fire(svc, row: dict):
     nxt = next_run_iso(spec_from_row(row))
     svc.db.automation_fired(row["id"], nxt)
     task = await svc.submit(
-        row["task_text"], source="automation", mode="auto",
+        row["task_text"], source="automation", mode="auto", trusted=True,
         metadata={"automation_id": row["id"], "notify": bool(row["notify"])})
     svc.db.automation_task_started(row["id"], task["id"])
     await svc.hooks.fire({

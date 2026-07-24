@@ -37,6 +37,22 @@ HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 
 
+def _drop_junk_words(body: str) -> str:
+    """Drop tokens longer than MAX_WORD_LEN (URL/base64/log junk).
+
+    Tokenize on *all* whitespace so newline-delimited junk is filtered per
+    real token, not as one giant pseudo-word: a bookmarks .txt of one URL per
+    line, a wrapped base64 blob, or multi-line CJK used to collapse into a
+    single >500-char "word" and the whole section was dropped (indexed as an
+    empty entry). Line breaks are preserved — the original filter split on
+    single spaces precisely to keep them, and _split_oversize's paragraph
+    logic (and the stored `raw`) still rely on them for normal prose."""
+    kept = []
+    for line in body.split("\n"):
+        kept.append(" ".join(w for w in line.split() if len(w) <= MAX_WORD_LEN))
+    return "\n".join(kept)
+
+
 def extract_dates(text: str) -> list[str]:
     out = []
     for m in DATE_RE.findall(text):
@@ -89,7 +105,9 @@ def chunk_markdown(file_label: str, text: str) -> list[dict]:
         body = "\n".join(buf).strip()
         if not body:
             return
-        body = " ".join(w for w in body.split(" ") if len(w) <= MAX_WORD_LEN)
+        body = _drop_junk_words(body).strip()
+        if not body:  # all-junk section: skip, don't index an empty entry
+            return
         ancestry = " / ".join(t for _, t in stack)
         heading = ancestry or None
         label = f"{file_label} / {ancestry}" if ancestry else file_label
@@ -125,7 +143,9 @@ def chunk_plaintext(file_label: str, text: str) -> list[dict]:
     body = text.strip()
     if not body:
         return []
-    body = " ".join(w for w in body.split(" ") if len(w) <= MAX_WORD_LEN)
+    body = _drop_junk_words(body).strip()
+    if not body:  # all-junk file: skip, don't index an empty entry
+        return []
     chunks = []
     for part in _split_oversize(body):
         compiled = f"{file_label}\n\n{part}"
@@ -311,10 +331,12 @@ def ingest_vault(db: Database, root: Path, dirs: list[str]) -> dict:
     stats = {"files_scanned": 0, "files_changed": 0, "added": 0, "deleted": 0,
              "dep_gated": 0}
     gated_names: list[str] = []
+    walked_prefixes: list[str] = []
     for d in dirs:
         base = root / d
         if not base.is_dir():
             continue
+        walked_prefixes.append(d.rstrip("/") + "/")
         for p in sorted(base.rglob("*")):
             if not p.is_file():
                 continue
@@ -350,10 +372,16 @@ def ingest_vault(db: Database, root: Path, dirs: list[str]) -> dict:
             stats["files_changed"] += 1
             stats["added"] += added
             stats["deleted"] += deleted
-    prefixes = tuple(d.rstrip("/") + "/" for d in dirs)
-    for path in indexed:
-        if path not in seen and path.startswith(prefixes):
-            stats["deleted"] += db.delete_file_entries(path)
+    # Prune stale entries only under dirs we actually walked this pass: a
+    # briefly-absent index_dir (unmounted, mid-sync) must not purge its whole
+    # index — nothing under it was `seen`, so a naive prefix match over all
+    # configured dirs would delete every entry and force a full re-chunk +
+    # re-embed when it returns (L6).
+    prefixes = tuple(walked_prefixes)
+    if prefixes:
+        for path in indexed:
+            if path not in seen and path.startswith(prefixes):
+                stats["deleted"] += db.delete_file_entries(path)
     if gated_names:
         log.info("ingest: %d file(s) need PDF/OCR deps, not indexed: %s%s",
                  len(gated_names), ", ".join(gated_names[:5]),

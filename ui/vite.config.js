@@ -10,7 +10,8 @@ export default defineConfig({
   server: {
     // NOT /ask: Vite's SPA fallback must serve the dev index.html there
     proxy: Object.fromEntries(
-      ["/task", "/tasks", "/events", "/vault", "/health", "/stt", "/screenshots"]
+      ["/task", "/tasks", "/events", "/vault", "/health", "/stt",
+       "/screenshots", "/automations", "/stats"]
         .map((p) => [p, dispatcher])
     ),
   },

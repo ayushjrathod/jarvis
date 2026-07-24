@@ -8,6 +8,7 @@ Run: .venv/bin/python -m jarvis.dictate
 from __future__ import annotations
 
 import logging
+import queue
 import subprocess
 import sys
 import threading
@@ -16,11 +17,17 @@ from jarvis import engines
 from jarvis.audio import Recorder
 from jarvis.config import JarvisConfig
 from jarvis.hotkey import HotkeyWatcher
+from jarvis.sanitize import sanitize_for_injection
 
 log = logging.getLogger("jarvis.dictate")
 
 
 def type_text(text: str):
+    # Strip control chars at the injection boundary so a hallucinated newline
+    # can't become an Enter keypress in the focused window (L9).
+    text = sanitize_for_injection(text)
+    if not text:
+        return
     try:
         res = subprocess.run(["ydotool", "type", "--", text])
     except FileNotFoundError:
@@ -40,22 +47,35 @@ def main():
     )
     log.info("loading STT model…")
     stt.load()
-    recorder = Recorder(cfg.sample_rate)
+    recorder = Recorder(cfg.sample_rate, max_seconds=cfg.max_recording_s)
+
+    # Serialize transcribe+type through one worker so two rapid dictations
+    # can't interleave or land out of order — the old one-thread-per-release
+    # spawned concurrent whisper runs + ydotool writes (L9).
+    jobs: queue.Queue = queue.Queue()
+
+    def worker():
+        while True:
+            audio = jobs.get()
+            try:
+                text = stt.transcribe(audio)
+                if text:
+                    log.info("typing: %s", text)
+                    type_text(text)  # sanitizes control chars before injection
+                else:
+                    log.info("empty transcription")
+            except Exception:
+                log.exception("dictation transcription failed; dropping")
+            finally:
+                jobs.task_done()
+
+    threading.Thread(target=worker, daemon=True).start()
 
     def on_release():
         audio = recorder.stop()
         if len(audio) < cfg.sample_rate // 4:
             return
-
-        def work():
-            text = stt.transcribe(audio)
-            if text:
-                log.info("typing: %s", text)
-                type_text(text)
-            else:
-                log.info("empty transcription")
-
-        threading.Thread(target=work, daemon=True).start()
+        jobs.put(audio)
 
     watcher = HotkeyWatcher(cfg.trigger_key, recorder.start, on_release)
     watcher.start()

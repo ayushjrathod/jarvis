@@ -13,10 +13,12 @@ export default function AskScreen() {
 
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
-  const [exchanges, setExchanges] = useState([]); // [{q, a, err}]
+  const [exchanges, setExchanges] = useState([]); // [{id, q, a, err}]
   const [recState, setRecState] = useState("idle"); // idle | recording | transcribing
   const inputRef = useRef(null);
   const recRef = useRef(null);
+  const nextId = useRef(0); // stable exchange ids so streamed deltas patch the
+                            // right row even if another exchange is appended
 
   useEffect(() => inputRef.current?.focus(), []);
 
@@ -25,21 +27,22 @@ export default function AskScreen() {
     if (!q || busy || !shot) return;
     setBusy(true);
     setText("");
-    setExchanges((xs) => [...xs, { q, a: "", err: null }]);
-    const patchLast = (fn) =>
-      setExchanges((xs) => xs.map((x, i) => (i === xs.length - 1 ? fn(x) : x)));
+    const id = nextId.current++;
+    setExchanges((xs) => [...xs, { id, q, a: "", err: null }]);
+    const patch = (fn) =>
+      setExchanges((xs) => xs.map((x) => (x.id === id ? fn(x) : x)));
     try {
       const res = await postTask(q, {
         source: `screen:${shot}`,
         mode: "quick",
         metadata: { screenshot: `${shot}.png` },
-        onDelta: (d) => patchLast((x) => ({ ...x, a: x.a + d })),
+        onDelta: (d) => patch((x) => ({ ...x, a: x.a + d })),
       });
       if (res.status && res.status !== "done") {
-        patchLast((x) => ({ ...x, err: res.error ?? "failed" }));
+        patch((x) => ({ ...x, err: res.error ?? "failed" }));
       }
     } catch (err) {
-      patchLast((x) => ({ ...x, err: err.message }));
+      patch((x) => ({ ...x, err: err.message }));
     } finally {
       setBusy(false);
       inputRef.current?.focus();
@@ -78,7 +81,7 @@ export default function AskScreen() {
           const { text: heard } = await resp.json();
           if (heard) setText((t) => (t ? `${t} ${heard}` : heard));
         } catch (err) {
-          setExchanges((xs) => [...xs, { q: "(mic)", a: "", err: err.message }]);
+          setExchanges((xs) => [...xs, { id: nextId.current++, q: "(mic)", a: "", err: err.message }]);
         } finally {
           setRecState("idle");
           inputRef.current?.focus();
@@ -88,7 +91,7 @@ export default function AskScreen() {
       recRef.current = rec;
       setRecState("recording");
     } catch (err) {
-      setExchanges((xs) => [...xs, { q: "(mic)", a: "", err: err.message }]);
+      setExchanges((xs) => [...xs, { id: nextId.current++, q: "(mic)", a: "", err: err.message }]);
     }
   }
 
@@ -97,8 +100,8 @@ export default function AskScreen() {
     <div className="ask-page">
       <img className="ask-shot" src={`/screenshots/${shot}.png`} alt="screenshot" />
       <div className="ask-exchanges">
-        {exchanges.map((x, i) => (
-          <div key={i} className="exchange">
+        {exchanges.map((x) => (
+          <div key={x.id} className="exchange">
             <p className="q">{x.q}</p>
             {x.a && <p className="a">{x.a}</p>}
             {x.err && <p className="err">{x.err}</p>}
