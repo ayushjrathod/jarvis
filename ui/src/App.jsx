@@ -21,6 +21,9 @@ export default function App() {
       <header>
         <h1>Mission Control</h1>
         <span className="sub">local · dispatcher :8765</span>
+        <a className="docs-back" href="/system-docs">
+          docs →
+        </a>
       </header>
       <main className="grid">
         {widgets.map(({ id, title, Component }) => (

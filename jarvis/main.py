@@ -1,4 +1,5 @@
-"""Jarvis main loop: PTT (hold F9) and/or wake word ("hey jarvis") → VAD
+"""Jarvis main loop: PTT (hold `ptt_key`, default Right Ctrl) and/or wake word
+("hey jarvis") → VAD
 endpointing → STT → dispatcher Brain → sentence-streamed TTS with barge-in.
 
 State per interaction: capture → transcribe → submit → speak-as-it-streams.
@@ -53,7 +54,13 @@ class Jarvis:
                 model=cfg.wake_word, threshold=cfg.wake_threshold,
             )
         self.vad = SileroVAD(cfg.models_dir / "silero_vad.onnx", cfg.vad_threshold)
-        self.recorder = Recorder(cfg.sample_rate)
+        # The barge monitor needs its own VAD: capture_after_wake (wake thread)
+        # and _barge_monitor (playback thread) both reset()/prob() their VAD,
+        # which read-modify-write internal state — a notice spoken during a
+        # phase-2 capture would otherwise corrupt endpointing (M8). State is
+        # ~65KB and construction is cheap, so a second instance is free.
+        self.barge_vad = SileroVAD(cfg.models_dir / "silero_vad.onnx", cfg.vad_threshold)
+        self.recorder = Recorder(cfg.sample_rate, max_seconds=cfg.max_recording_s)
         self.player: Player | None = None
         self.wake_acks: list[np.ndarray] = []
 
@@ -78,6 +85,7 @@ class Jarvis:
                 self.wake_acks.append(np.concatenate(chunks))
         log.info("loading VAD…")
         self.vad.load()
+        self.barge_vad.load()
         if self.wake:
             log.info("loading wake word (%s)…", self.cfg.wake_word)
             self.wake.load()
@@ -96,11 +104,26 @@ class Jarvis:
         interrupted = False
         try:
             while True:
-                sentence = await sentence_queue.get()
-                if sentence is None:
-                    break
-                if barge.is_set():
+                # Race the next sentence against a barge-in: if the brain stream
+                # stalls between sentences, a barge fired while parked on get()
+                # must still wake us (H5) — otherwise `busy` is held until the
+                # next sentence or the 300s read timeout.
+                get_task = asyncio.ensure_future(sentence_queue.get())
+                barge_task = asyncio.ensure_future(barge.wait())
+                _, pending = await asyncio.wait(
+                    {get_task, barge_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+                for t in pending:  # cancel the loser cleanly (no destroyed-pending warns)
+                    t.cancel()
+                    try:
+                        await t
+                    except asyncio.CancelledError:
+                        pass
+                if barge.is_set():  # barge wins even if a sentence arrived same tick
                     interrupted = True
+                    break
+                sentence = get_task.result()
+                if sentence is None:
                     break
                 try:
                     ok = await asyncio.to_thread(
@@ -133,13 +156,13 @@ class Jarvis:
         """
         def watch():
             consecutive = 0
-            self.vad.reset()
+            self.barge_vad.reset()
             with MicStream(self.cfg.sample_rate, FRAME_SAMPLES) as mic:
                 while not stop.is_set() and not self.player.interrupt.is_set():
                     frame = mic.read(timeout=0.2)
                     if frame is None:
                         continue
-                    if len(frame) == FRAME_SAMPLES and self.vad.is_speech(frame):
+                    if len(frame) == FRAME_SAMPLES and self.barge_vad.is_speech(frame):
                         consecutive += 1
                         if consecutive >= self.cfg.barge_in_frames:
                             return True
@@ -207,16 +230,36 @@ class Jarvis:
     # -- input sources ---------------------------------------------------------
 
     def start_ptt(self):
+        """Hold-to-talk on `ptt_key`: press = listen, release = ask.
+
+        Same downstream path as the wake word (STT → dispatcher → streamed TTS),
+        minus the VAD endpointing — the key edge IS the endpoint.
+        """
         def on_press():
+            # Pressing while Jarvis talks is an explicit barge-in: stop playback
+            # (speak_sentences then cancels the in-flight dispatcher call) so the
+            # new utterance isn't queued behind a long reply.
+            if self.busy.locked() and self.player is not None:
+                self.player.stop()
+            if self.cfg.ptt_beep_ms > 0:
+                play_beep_async(ms=self.cfg.ptt_beep_ms)
             self.recorder.start()
 
         def on_release():
             audio = self.recorder.stop()
+            if self.cfg.ptt_beep_ms > 0:  # lower tone = "got it, thinking"
+                play_beep_async(ms=self.cfg.ptt_beep_ms, freq=660.0)
             self.loop.call_soon_threadsafe(self.ptt_audio.put_nowait, audio)
 
-        watcher = HotkeyWatcher(self.cfg.trigger_key, on_press, on_release)
+        if self.cfg.ptt_key == self.cfg.trigger_key:
+            log.warning(
+                "ptt_key == trigger_key (%s): mission-dictate will type the same "
+                "speech it answers — set a different jarvis.ptt_key in config.yaml",
+                self.cfg.ptt_key,
+            )
+        watcher = HotkeyWatcher(self.cfg.ptt_key, on_press, on_release)
         watcher.start()
-        log.info("PTT ready: hold %s to talk", self.cfg.trigger_key)
+        log.info("PTT ready: hold %s to talk", self.cfg.ptt_key)
         return watcher
 
     async def _handle_safely(self, audio: np.ndarray):
@@ -266,6 +309,8 @@ class Jarvis:
                 prebuffer_frames=prebuffer_frames,
                 is_busy=self.busy.locked, on_busy=on_busy,
                 on_wake=on_wake,
+                # mic.read uses a ~1s timeout, so seconds-of-silence ≈ None count
+                none_limit=self.cfg.mic_lost_after_s,
             )
 
     async def notices_loop(self):

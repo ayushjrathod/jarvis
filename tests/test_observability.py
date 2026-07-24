@@ -57,6 +57,28 @@ class TestStepParsing(unittest.TestCase):
         self.assertEqual(steps[0]["type"], "tool_result")
         self.assertTrue(steps[0]["summary"].startswith("ERROR: no such file"))
 
+    def test_permission_denial_is_flagged(self):
+        """2026-07-21..23: the CLI reports a missing allowedTools grant as an
+        ordinary is_error tool_result, so three daily briefs ended
+        subtype=success having written nothing."""
+        denial = ("Claude requested permissions to write to "
+                  + "/home/ayra/Documents/code/jarvis/vault/briefs/x.md" * 4
+                  + ", but you haven't granted it yet.")
+        steps = _steps_from_event({"type": "user", "message": {"content": [
+            {"type": "tool_result", "is_error": True, "content": denial},
+        ]}})
+        # flagged off the full text, though the clip hides the tell-tale tail
+        self.assertTrue(steps[0]["denied"])
+        self.assertNotIn("haven't granted", steps[0]["summary"])
+
+    def test_ordinary_errors_are_not_denials(self):
+        steps = _steps_from_event({"type": "user", "message": {"content": [
+            {"type": "tool_result", "is_error": True, "content": "no such file"},
+            {"type": "tool_result", "content": "requested permissions"},
+        ]}})
+        self.assertNotIn("denied", steps[0])   # an error, but not a denial
+        self.assertNotIn("denied", steps[1])   # the phrase, but not an error
+
     def test_summaries_clipped(self):
         steps = _steps_from_event({"type": "assistant", "message": {"content": [
             {"type": "text", "text": "x" * 1000}]}})

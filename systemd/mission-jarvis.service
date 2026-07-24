@@ -1,7 +1,9 @@
 [Unit]
 Description=Mission Control Jarvis voice assistant
-# Needs the dispatcher and PipeWire audio. Wake-word only ("hey jarvis");
-# the F9 hotkey belongs to mission-dictate (dictation at cursor).
+# Needs the dispatcher and PipeWire audio. Two triggers, same assistant:
+# "hey jarvis" (wake word) and hold-to-talk on jarvis.ptt_key (Right Ctrl).
+# The F9 hotkey belongs to mission-dictate (dictation at cursor) — keep
+# ptt_key and trigger_key distinct or both services fire on one press.
 # Not enabled by default — enable once the mic is set up:
 #   systemctl --user enable --now mission-jarvis
 After=mission-dispatcher.service pipewire.service
@@ -10,7 +12,7 @@ Wants=mission-dispatcher.service
 [Service]
 Type=simple
 WorkingDirectory=%h/Documents/code/jarvis
-ExecStart=%h/Documents/code/jarvis/.venv/bin/python -m jarvis.main --mode wake
+ExecStart=%h/Documents/code/jarvis/.venv/bin/python -m jarvis.main --mode both
 Restart=on-failure
 RestartSec=5
 

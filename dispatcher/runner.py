@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import time
+from pathlib import Path
 
 from .config import Config
 
@@ -54,6 +55,22 @@ def guess_output_path(task_text: str, root) -> str | None:
     if m and (root / m.group(0)).exists():
         return m.group(0)
     return None
+
+
+def wrote_declared_output(task_text: str, root, since: float) -> bool | None:
+    """Did a prompt that names an output file ("write it to vault/briefs/x.md")
+    actually produce it during this run? None when the prompt names no file.
+
+    mtime, not mere existence: re-running a brief on a day whose file already
+    exists must not mask a denial that stopped it being refreshed."""
+    m = OUTPUT_PATH_RE.search(task_text)
+    if not m:
+        return None
+    p = Path(root) / m.group(0)
+    try:
+        return p.stat().st_mtime >= since
+    except OSError:
+        return False
 
 
 # Whitelist for the one-time transient retry below: a spawn error (CLI binary
@@ -99,6 +116,18 @@ def grants_bash(tools: list[str] | None) -> bool:
     return any(t == "Bash" or t.startswith("Bash(") for t in tools or [])
 
 
+async def reap_reader(task, timeout: float = 5) -> bytes:
+    """Await a `StreamReader.read()` task to completion (bounded), cancelling it
+    if it somehow hangs, so the concurrent stderr drainer is never left orphaned
+    when the main read loop exits (L2). Returns whatever bytes it read, or b''."""
+    try:
+        return await asyncio.wait_for(task, timeout)
+    except Exception:
+        if not task.done():
+            task.cancel()
+        return b""
+
+
 def build_cmd(text: str, cfg: Config, model: str | None, tools: list[str],
               system_extra: str = "", resume_session_id: str | None = None,
               max_cost_usd: float | None = None) -> list[str]:
@@ -133,6 +162,20 @@ def _clip(s: str) -> str:
     return s[:SUMMARY_LEN]
 
 
+# The headless CLI reports a missing --allowedTools grant as an ordinary
+# is_error tool_result and then lets the model carry on, so the run still ends
+# subtype=success. That's how three daily briefs "succeeded" while writing
+# nothing (2026-07-21..23). A denial here is always an operator-side grant
+# mismatch, never something the model can fix, so we surface it as a failure.
+_DENIAL_MARKERS = ("requested permissions", "haven't granted it yet",
+                   "permission to use", "permission denied")
+
+
+def is_permission_denial(text: str) -> bool:
+    low = (text or "").lower()
+    return any(m in low for m in _DENIAL_MARKERS)
+
+
 def _tool_result_text(content) -> str:
     if isinstance(content, list):
         content = " ".join(b.get("text", "") for b in content
@@ -159,9 +202,14 @@ def _steps_from_event(obj: dict) -> list[dict]:
         steps = []
         for block in (obj.get("message") or {}).get("content") or []:
             if isinstance(block, dict) and block.get("type") == "tool_result":
+                body = _tool_result_text(block.get("content"))
                 prefix = "ERROR: " if block.get("is_error") else ""
-                steps.append({"type": "tool_result", "summary": _clip(
-                    prefix + _tool_result_text(block.get("content")))})
+                step = {"type": "tool_result", "summary": _clip(prefix + body)}
+                # flagged on the full text: a long path can push the giveaway
+                # phrase past the summary clip
+                if block.get("is_error") and is_permission_denial(body):
+                    step["denied"] = True
+                steps.append(step)
         return steps
     if t == "result":
         return [{"type": "result", "summary": _clip(obj.get("subtype") or "result")}]
@@ -179,6 +227,9 @@ async def _attempt(text: str, cfg: Config, model: str | None, tools: list[str],
     if cfg.claude_config_dir:
         env["CLAUDE_CONFIG_DIR"] = cfg.claude_config_dir
 
+    # capture before spawn: any output the run writes must post-date this, or a
+    # stale prior file could vouch for a run that actually wrote nothing
+    wall_t0 = time.time()
     proc = await asyncio.create_subprocess_exec(
         *cmd, cwd=cfg.root, env=env,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -191,6 +242,7 @@ async def _attempt(text: str, cfg: Config, model: str | None, tools: list[str],
     t0 = time.monotonic()
     steps: list[dict] = []
     data = None
+    stderr_bytes = b""
     try:
         async with asyncio.timeout(timeout):
             while True:
@@ -220,12 +272,12 @@ async def _attempt(text: str, cfg: Config, model: str | None, tools: list[str],
         procs.pop(task_id, None)
         if proc.returncode is None:
             proc.kill()
+            await proc.wait()
+        # always reap the concurrent stderr drainer, whatever way we leave
+        stderr_bytes = await reap_reader(stderr_task)
 
     if data is None:
-        try:
-            stderr = (await asyncio.wait_for(stderr_task, 5)).decode(errors="replace")
-        except TimeoutError:
-            stderr = ""
+        stderr = stderr_bytes.decode(errors="replace")
         return {
             "status": "failed", "steps": steps,
             "error": f"no result event (exit {proc.returncode}): {stderr[:400]}",
@@ -247,4 +299,20 @@ async def _attempt(text: str, cfg: Config, model: str | None, tools: list[str],
         out["error"] = str(data.get("result") or data.get("subtype"))
     else:
         out["status"] = "done"
+    denied = [s for s in steps if s.get("denied")]
+    if denied and out["status"] == "done":
+        out["denied_tools"] = [s["summary"] for s in denied]
+        # Not every denial is fatal: the daily brief is written to skip its
+        # email section silently when Gmail MCP isn't granted, and does its job
+        # regardless. What's fatal is a denial that stopped the run producing
+        # the file its prompt names — the 2026-07-21..23 briefs, which reported
+        # success having written nothing.
+        if wrote_declared_output(text, cfg.root, wall_t0) is False:
+            out["status"] = "failed"
+            out["error"] = (
+                "blocked by tool permissions — declared output file never "
+                "written; allowedTools is missing a grant: {}".format(denied[0]["summary"]))
+        else:
+            log.warning("task %s: %d tool denial(s) but output was produced; "
+                        "first: %s", task_id, len(denied), denied[0]["summary"])
     return out

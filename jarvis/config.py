@@ -14,7 +14,14 @@ ROOT = Path(__file__).parent.parent
 @dataclass
 class JarvisConfig:
     root: Path
+    # dictation hotkey (jarvis.dictate — speech typed at the cursor)
     trigger_key: str = "KEY_F9"
+    # hold-to-talk hotkey for the assistant (jarvis.main --mode ptt|both).
+    # MUST differ from trigger_key: mission-dictate and mission-jarvis both
+    # watch the raw evdev stream, so a shared key fires both services.
+    ptt_key: str = "KEY_RIGHTCTRL"
+    # short beep when the PTT key goes down / comes up (0 disables)
+    ptt_beep_ms: int = 90
     sample_rate: int = 16000
     wake_word: str = "hey_jarvis"
     wake_threshold: float = 0.5
@@ -34,6 +41,13 @@ class JarvisConfig:
     vad_threshold: float = 0.5
     endpoint_silence_ms: int = 900
     max_utterance_s: int = 30
+    # wake capture re-opens the mic after this many seconds of no audio at all
+    # (device died mid-stream: BT dropout, unplug). The mic read timeout is ~1s
+    # so this is also roughly the consecutive-None count that signals loss.
+    mic_lost_after_s: int = 5
+    # hard ceiling on a single push-to-talk recording so a wedged/stuck trigger
+    # key can't grow the buffer without bound (~115MB/hour of int16 audio).
+    max_recording_s: int = 300
     # barge-in: consecutive speech frames (32ms each) before cutting TTS
     barge_in_frames: int = 6
     # ask-about-my-screen popup (jarvis.ask_screen)
@@ -50,6 +64,8 @@ class JarvisConfig:
         root = path.parent.resolve()
         cfg = cls(root=root)
         cfg.trigger_key = j.get("trigger_key", cfg.trigger_key)
+        cfg.ptt_key = j.get("ptt_key", cfg.ptt_key)
+        cfg.ptt_beep_ms = j.get("ptt_beep_ms", cfg.ptt_beep_ms)
         cfg.sample_rate = j.get("sample_rate", cfg.sample_rate)
         cfg.wake_word = j.get("wake_word", cfg.wake_word)
         cfg.wake_threshold = j.get("wake_threshold", cfg.wake_threshold)
@@ -61,6 +77,8 @@ class JarvisConfig:
         cfg.vad_threshold = j.get("vad_threshold", cfg.vad_threshold)
         cfg.endpoint_silence_ms = j.get("endpoint_silence_ms", cfg.endpoint_silence_ms)
         cfg.max_utterance_s = j.get("max_utterance_s", cfg.max_utterance_s)
+        cfg.mic_lost_after_s = j.get("mic_lost_after_s", cfg.mic_lost_after_s)
+        cfg.max_recording_s = j.get("max_recording_s", cfg.max_recording_s)
         cfg.barge_in_frames = j.get("barge_in_frames", cfg.barge_in_frames)
         cfg.ask_screen = {**cfg.ask_screen, **(j.get("ask_screen") or {})}
         cfg.dispatcher_url = j.get(

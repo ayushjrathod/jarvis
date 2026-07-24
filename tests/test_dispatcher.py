@@ -5,7 +5,9 @@ Run: .venv/bin/python -m unittest discover tests
 
 import asyncio
 import json
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -295,7 +297,6 @@ class TestRunnerTransientRetry(unittest.IsolatedAsyncioTestCase):
             result = await run_once("do it", cfg, None, [], {}, "task1")
         self.assertEqual(result["status"], "timeout")
         self.assertEqual(mock_spawn.call_count, 2)
-
     async def test_refusal_is_not_retried(self):
         cfg = _test_cfg()
         refusal_proc = _FakeProc(
@@ -323,6 +324,104 @@ class TestRunnerTransientRetry(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mock_spawn.call_count, 1)
 
 
+class TestDeniedToolSurfacing(unittest.IsolatedAsyncioTestCase):
+    """2026-07-21..23: the CLI denied the daily brief every Write, the model
+    gave up and explained itself, and the result line still said success — so
+    three briefs that wrote nothing settled 'done' and nobody noticed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.prompt = "Write today's brief to vault/briefs/x.md please"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _proc(self, denial=True):
+        proc = _FakeProc()
+        content = ("Claude requested permissions to write to vault/briefs/x.md,"
+                   " but you haven't granted it yet." if denial else "wrote it")
+        proc._lines.insert(0, json.dumps({"type": "user", "message": {"content": [
+            {"type": "tool_result", "is_error": denial, "content": content},
+        ]}}).encode() + b"\n")
+        return proc
+
+    async def _run(self, proc, text=None, writes_output=False):
+        cfg = _test_cfg()
+        cfg.root = self.root
+
+        async def readline_writing():   # the agent writes the file mid-stream
+            out = self.root / "vault" / "briefs"
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "x.md").write_text("# brief")
+            proc.readline = proc._orig_readline
+            return await proc.readline()
+
+        def spawn(*a, **kw):
+            if writes_output:
+                proc._orig_readline = proc.readline
+                proc.readline = readline_writing
+            return proc
+
+        with patch("dispatcher.runner.asyncio.create_subprocess_exec",
+                   AsyncMock(side_effect=spawn)):
+            return await run_once(text or self.prompt, cfg, None, [], {}, "task1")
+
+    async def test_denial_with_no_output_file_fails(self):
+        result = await self._run(self._proc())
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("blocked by tool permissions", result["error"])
+        self.assertIn("vault/briefs/x.md", result["error"])
+
+    async def test_denial_is_tolerated_when_the_output_was_still_written(self):
+        """The live 2026-07-24 case: Gmail MCP was denied, but the brief's
+        prompt says to skip email silently, and the file was written."""
+        result = await self._run(self._proc(), writes_output=True)
+        self.assertEqual(result["status"], "done")
+        self.assertTrue(result["denied_tools"])      # recorded, not fatal
+
+    async def test_stale_output_file_does_not_mask_a_denial(self):
+        out = self.root / "vault" / "briefs"
+        out.mkdir(parents=True)
+        f = out / "x.md"
+        f.write_text("yesterday's brief")
+        os.utime(f, (time.time() - 86400, time.time() - 86400))
+        result = await self._run(self._proc())
+        self.assertEqual(result["status"], "failed")
+
+    async def test_denial_without_a_declared_output_path_is_not_fatal(self):
+        result = await self._run(self._proc(), text="just answer me")
+        self.assertEqual(result["status"], "done")
+        self.assertTrue(result["denied_tools"])
+
+    async def test_clean_run_has_no_denied_tools(self):
+        result = await self._run(self._proc(denial=False))
+        self.assertEqual(result["status"], "done")
+        self.assertNotIn("denied_tools", result)
+
+
+
+class TestReapReader(unittest.IsolatedAsyncioTestCase):
+    """L2: the concurrent stderr drainer is always reaped, never orphaned."""
+
+    async def test_returns_completed_bytes(self):
+        from dispatcher.runner import reap_reader
+
+        async def r():
+            return b"stderr text"
+        self.assertEqual(await reap_reader(asyncio.create_task(r())), b"stderr text")
+
+    async def test_cancels_a_hung_reader(self):
+        from dispatcher.runner import reap_reader
+
+        async def r():
+            await asyncio.sleep(100)
+            return b"never"
+        t = asyncio.create_task(r())
+        self.assertEqual(await reap_reader(t, timeout=0.01), b"")
+        self.assertTrue(t.cancelled() or t.done())
+
+
 class TestStreamQuickBookkeeping(unittest.IsolatedAsyncioTestCase):
     """stream_quick must settle task/run rows on every exit path — including
     the client vanishing mid-stream (barge-in closes the SSE connection)."""
@@ -340,7 +439,7 @@ class TestStreamQuickBookkeeping(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _fake_stream(*events):
         async def stream(text, cfg, model_override=None, tools=None, context="",
-                         resume_session_id=None):
+                         resume_session_id=None, **kwargs):
             for ev in events:
                 yield ev
         return stream
@@ -371,6 +470,119 @@ class TestStreamQuickBookkeeping(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(got["status"], "cancelled")
         self.assertEqual(got["runs"][0]["status"], "cancelled")
         self.assertIn("disconnected", got["runs"][0]["error"])
+
+    async def test_cancel_midstream_not_clobbered_by_late_done(self):
+        # M2: cancel() arrives while the quick turn is streaming; a subsequent
+        # 'done' meta must not resurrect the task back to done.
+        task = await self.svc.create_task("q", "voice", "quick")
+        fake = self._fake_stream(
+            ("delta", "hi"),
+            ("meta", {"status": "done", "session_id": "s"}))
+        with patch("dispatcher.service.quick.stream", fake):
+            agen = self.svc.stream_quick(task)
+            self.assertEqual((await agen.__anext__())[0], "task")
+            self.assertEqual((await agen.__anext__())[0], "delta")
+            self.assertTrue(await self.svc.cancel(task["id"]))  # user barges in
+            rest = [e async for e in agen]
+        self.assertEqual(self.svc.db.get_task(task["id"])["status"], "cancelled")
+        self.assertNotIn("done", [e[0] for e in rest])  # no done event emitted
+
+
+class TestTrustBoundaryMetadata(unittest.TestCase):
+    """H1 pure guard: external metadata may NARROW tools/budget but never WIDEN
+    them, and can never inject a resume session."""
+
+    def test_untrusted_strips_grants_and_clamps_budget(self):
+        from dispatcher.service import sanitize_untrusted_metadata
+        out = sanitize_untrusted_metadata(
+            {"allowed_tools": ["Bash", "Write"], "resume_session_id": "evil",
+             "max_cost_usd": 100, "task_type": "summarize", "screenshot": "s.png"},
+            cost_cap=3.0)
+        self.assertNotIn("allowed_tools", out)
+        self.assertNotIn("resume_session_id", out)
+        self.assertEqual(out["max_cost_usd"], 3.0)          # clamped down to cap
+        self.assertEqual(out["task_type"], "summarize")     # innocuous keys kept
+        self.assertEqual(out["screenshot"], "s.png")        # screen path survives
+
+    def test_untrusted_keeps_lower_budget(self):
+        from dispatcher.service import sanitize_untrusted_metadata
+        out = sanitize_untrusted_metadata({"max_cost_usd": 0.25}, cost_cap=3.0)
+        self.assertEqual(out["max_cost_usd"], 0.25)         # narrowing allowed
+
+    def test_untrusted_drops_nonnumeric_budget(self):
+        from dispatcher.service import sanitize_untrusted_metadata
+        self.assertNotIn("max_cost_usd",
+                         sanitize_untrusted_metadata({"max_cost_usd": "lots"}, 3.0))
+        self.assertNotIn("max_cost_usd",
+                         sanitize_untrusted_metadata({"max_cost_usd": True}, 3.0))
+
+    def test_none_and_empty_metadata_passthrough(self):
+        from dispatcher.service import sanitize_untrusted_metadata
+        self.assertIsNone(sanitize_untrusted_metadata(None, 3.0))
+        self.assertEqual(sanitize_untrusted_metadata({}, 3.0), {})
+
+
+class TestTrustBoundaryDispatch(unittest.IsolatedAsyncioTestCase):
+    """H1 end-to-end: an untrusted /task carrying allowed_tools:[Bash] and a
+    huge budget must not reach the CLI with Bash or a raised cap; a trusted
+    server spawn keeps its metadata verbatim."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        cfg = Config(root=Path(self.tmp.name))
+        cfg.db_path = Path(self.tmp.name) / "test.db"
+        cfg.default_tools = ["Read", "Glob", "Grep"]
+        cfg.budgets = {"max_cost_per_task_usd": 3.00, "timeout_s": 5}
+        from dispatcher.service import Service
+        self.svc = Service(cfg)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    async def test_untrusted_agentic_cannot_grant_bash_or_raise_budget(self):
+        from dispatcher.runner import build_cmd, grants_bash
+        task = await self.svc.create_task(
+            "do a thing", "api", "agentic",
+            metadata={"allowed_tools": ["Bash", "Write"],
+                      "max_cost_usd": 100, "resume_session_id": "evil"})
+        # the row itself is stored already-sanitized
+        stored = json.loads(task["metadata"])
+        self.assertNotIn("allowed_tools", stored)
+        self.assertNotIn("resume_session_id", stored)
+        self.assertEqual(stored["max_cost_usd"], 3.00)
+
+        captured = {}
+
+        async def fake_run_once(text, cfg, model, tools, procs, task_id, **kw):
+            captured.update(tools=tools, max_cost_usd=kw.get("max_cost_usd"),
+                            resume=kw.get("resume_session_id"))
+            return {"status": "done", "num_turns": 1}
+
+        with patch("dispatcher.service.runner.run_once", fake_run_once):
+            await self.svc._run_agentic_inner(task)
+
+        # tools fell back to the configured read-only allowlist; no Bash, no resume
+        self.assertEqual(captured["tools"], ["Read", "Glob", "Grep"])
+        self.assertFalse(grants_bash(captured["tools"]))
+        self.assertIsNone(captured["resume"])
+        self.assertEqual(captured["max_cost_usd"], 3.00)
+
+        cmd = build_cmd(task["text"], self.svc.cfg, None,
+                        captured["tools"], max_cost_usd=captured["max_cost_usd"])
+        self.assertIn("--disallowedTools", cmd)
+        self.assertEqual(cmd[cmd.index("--disallowedTools") + 1], "Bash")
+        self.assertNotIn("Bash", cmd[cmd.index("--allowedTools") + 1])
+        self.assertEqual(cmd[cmd.index("--max-budget-usd") + 1], "3.0")
+
+    async def test_trusted_spawn_passes_metadata_through(self):
+        task = await self.svc.create_task(
+            "reflect", "reflection", "agentic", trusted=True,
+            metadata={"allowed_tools": ["Bash"], "max_cost_usd": 100,
+                      "resume_session_id": "sess-x"})
+        stored = json.loads(task["metadata"])
+        self.assertEqual(stored["allowed_tools"], ["Bash"])
+        self.assertEqual(stored["max_cost_usd"], 100)
+        self.assertEqual(stored["resume_session_id"], "sess-x")
 
 
 class TestVaultTolerance(unittest.TestCase):

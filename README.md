@@ -68,6 +68,14 @@ Open **http://127.0.0.1:8765/** — today's brief, task list (checkboxes update
 the vault files), live agent monitor, and a command box that behaves exactly
 like talking to Jarvis ("add a task: …" works typed).
 
+### Docs
+
+**http://127.0.0.1:8765/system-docs** (the "docs →" link in the dashboard
+header) — the full user guide (setup, service control, voice, memory,
+automations, config, troubleshooting) plus an HTTP API reference for every
+dispatcher route. Content lives in `ui/src/docs/content.js`; edit it and
+`npm run build`. FastAPI's generated Swagger UI stays at `/docs`.
+
 ### Service control (start / stop / status / logs)
 
 The dispatcher (and the daily-brief / weekly-review / backup timers) runs as

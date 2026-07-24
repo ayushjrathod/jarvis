@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -18,7 +19,8 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import automations, curator, embeddings, ingest, memory, queue_watcher, stt, vault
+from . import (automations, curator, embeddings, ingest, memory, queue_watcher,
+               spotify, stt, vault)
 from .quick import resolve_backend
 from .config import Config
 from .service import Service, make_ack, resolve_screenshot
@@ -28,6 +30,28 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
 
 def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+# /stt takes a raw audio body straight into memory; cap it so a stray/hostile
+# upload can't balloon RSS. ~25MB is minutes of Opus — far more than a question.
+MAX_STT_BYTES = 25 * 1024 * 1024
+
+# A browser page on another site can POST to http://localhost:8765 (the port is
+# guessable); those requests carry a cross-origin Origin header. Local clients
+# either send no Origin (curl, the jarvis python client, MediaRecorder to same
+# host) or a loopback one (the SPA and the ask-screen popup are served from the
+# dispatcher itself). So: reject only a *present, non-local* Origin on
+# state-changing methods. Absent Origin is always allowed.
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1", ""}
+_GUARDED_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def _origin_is_local(origin: str, extra_host: str | None = None) -> bool:
+    try:
+        host = urlsplit(origin).hostname or ""
+    except ValueError:
+        return False
+    return host in _LOCAL_HOSTS or (extra_host is not None and host == extra_host)
 
 
 class TaskIn(BaseModel):
@@ -45,6 +69,11 @@ class LearnIn(BaseModel):
 
 class AutomationIn(BaseModel):
     request: str            # natural language: "every morning, tell me …"
+    source: str = "api"
+
+
+class MediaIn(BaseModel):
+    command: str            # "play bohemian rhapsody", "pause", "volume 40"
     source: str = "api"
 
 
@@ -96,6 +125,18 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     app = FastAPI(title="mission-control dispatcher", lifespan=lifespan)
     app.state.service = svc
 
+    @app.middleware("http")
+    async def guard_origin(request: Request, call_next):
+        """Lightweight CSRF guard (M1): a state-changing request from a browser
+        page on some other origin is rejected; local clients (no Origin, or a
+        loopback/self Origin) pass through untouched."""
+        if request.method in _GUARDED_METHODS:
+            origin = request.headers.get("origin")
+            if origin and not _origin_is_local(origin, cfg.host):
+                return JSONResponse(status_code=403,
+                                    content={"detail": "cross-origin request rejected"})
+        return await call_next(request)
+
     @app.post("/task")
     async def post_task(t: TaskIn):
         # NL automation divert (Phase I): schedule-phrased requests become
@@ -114,6 +155,23 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                                    "automation_id": row["id"] if row else None})
 
             return StreamingResponse(confirm(), media_type="text/event-stream")
+
+        # Media divert: "play …"/"pause"/"skip" drive the local Spotify client
+        # instead of Claude. Deliberately AFTER the automation divert, so
+        # "every morning play jazz" still becomes a standing automation, and
+        # mode=auto only, so an explicit quick/agentic bypasses it.
+        mcfg = cfg.media or {}
+        if (mcfg.get("enabled") and mcfg.get("nl_detect", True)
+                and t.mode == "auto" and spotify.detect(t.text) is not None):
+            speech = await svc.media_command(t.text, t.source)
+
+            async def media_confirm():
+                # no task_id: a media command isn't a cancellable task row
+                yield sse("task", {"task_id": None, "kind": "media"})
+                yield sse("delta", {"text": speech})
+                yield sse("done", {"status": "done", "kind": "media"})
+
+            return StreamingResponse(media_confirm(), media_type="text/event-stream")
 
         kind, area = svc.route(t.text, t.mode, t.area)
         if kind == "agentic":
@@ -270,8 +328,11 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         if not job:
             return {"status": "nothing_to_consolidate"}
         svc.db.mark_episodes_consolidated(job["episode_ids"])
+        # carry episode_ids so a FAILED run can put them back in the pool (M6)
+        meta = {**job["metadata"], "episode_ids": job["episode_ids"]}
         task = await svc.submit(job["text"], source="timer", mode="agentic",
-                                area="memory", metadata=job["metadata"])
+                                area="memory", metadata=meta,
+                                trusted=True)  # server spawn (consolidation agent)
         # graph extraction (Phase J2) reads the same export, in parallel with
         # the block-consolidation agent
         try:
@@ -298,7 +359,12 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     async def transcribe(request: Request):
         """Raw-body audio upload (webm/opus from MediaRecorder, or wav) →
         transcript. Raw body on purpose: python-multipart isn't a dep."""
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > MAX_STT_BYTES:
+            raise HTTPException(413, "audio too large")
         data = await request.body()
+        if len(data) > MAX_STT_BYTES:  # chunked upload with no Content-Length
+            raise HTTPException(413, "audio too large")
         if len(data) < 100:
             raise HTTPException(400, "no audio")
         try:
@@ -314,12 +380,18 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             raise HTTPException(404, "no such screenshot")
         return FileResponse(p, media_type="image/png")
 
-    @app.get("/ask")
-    async def ask_page():
+    def _spa_index() -> FileResponse:
+        """Serve the SPA shell for a non-'/' page. The StaticFiles mount below
+        only falls back to index.html for directories, so every client-routed
+        path needs its own route."""
         index = cfg.root / "ui" / "dist" / "index.html"
         if not index.is_file():
             raise HTTPException(404, "ui not built")
         return FileResponse(index, media_type="text/html")
+
+    @app.get("/ask")
+    async def ask_page():
+        return _spa_index()
 
     # -- automation endpoints (Phase I) -------------------------------------
 
@@ -359,6 +431,25 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             raise HTTPException(404, "no such automation")
         return {"automation_id": automation_id, "status": "deleted"}
 
+    # -- media endpoints ----------------------------------------------------
+
+    def _require_media():
+        if not (cfg.media or {}).get("enabled"):
+            raise HTTPException(503, "media control is disabled in config.yaml")
+
+    @app.post("/media")
+    async def media_command(m: MediaIn):
+        """Same handler the POST /task divert uses, for the UI and scripts."""
+        _require_media()
+        if not m.command.strip():
+            raise HTTPException(400, "empty command")
+        return {"speech": await svc.media_command(m.command, m.source)}
+
+    @app.get("/media/state")
+    async def media_state():
+        _require_media()
+        return await asyncio.to_thread(spotify.state, cfg)
+
     # -- learning endpoints (Phase G) ---------------------------------------
 
     @app.post("/learn")
@@ -374,8 +465,10 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         meta = {"task_type": "learn"}
         if resume:
             meta["resume_session_id"] = resume
+        # server-constructed metadata (resume id is computed here, not caller-
+        # supplied): trusted so the learn-from-conversation resume survives
         task = await svc.submit(text, source=l.source, mode="agentic",
-                                area="learn", metadata=meta)
+                                area="learn", metadata=meta, trusted=True)
         return JSONResponse(status_code=202, content={
             "task_id": task["id"], "status": "queued", "resumed": bool(resume)})
 
@@ -402,6 +495,14 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         report = await asyncio.to_thread(curator.run, svc.db, cfg)
         await svc.hooks.fire({"event": "curated", **report})
         return report
+
+    # -- docs page ----------------------------------------------------------
+
+    @app.get("/system-docs")
+    async def docs_page():
+        """Human docs (guide + API reference). NOT /docs — that's FastAPI's
+        Swagger UI, which stays where it is."""
+        return _spa_index()
 
     # serve the built dashboard, if present (mounted last: API routes win)
     ui_dist = cfg.root / "ui" / "dist"

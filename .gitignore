@@ -22,3 +22,6 @@ ui/dist/
 models/
 *.onnx
 data/screenshots/
+
+# spotify client-credentials (client id/secret) — never commit
+data/spotify.json

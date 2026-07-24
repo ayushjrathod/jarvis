@@ -31,9 +31,11 @@ class Config:
     memory: dict = field(default_factory=dict)
     learning: dict = field(default_factory=dict)
     automations: dict = field(default_factory=dict)
+    media: dict = field(default_factory=dict)
     screenshots_dir: Path = None
     stt: dict = field(default_factory=dict)
     embeddings: dict = field(default_factory=dict)
+    security: dict = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "Config":
@@ -66,10 +68,19 @@ class Config:
         cfg.memory = d.get("memory", {})
         cfg.learning = d.get("learning", {})
         cfg.automations = d.get("automations", {})
+        cfg.media = d.get("media", {})
         cfg.screenshots_dir = rel(d.get("screenshots_dir", "data/screenshots"))
         cfg.stt = d.get("stt", {})
         cfg.embeddings = d.get("embeddings", {})
+        cfg.security = d.get("security", {})
         return cfg
+
+    @property
+    def privileged_areas(self) -> list[str]:
+        """Areas allowed to declare Bash / unscoped Edit-Write in their SKILL.md
+        frontmatter (security.privileged_areas). Empty by default — every other
+        area has those grants stripped at load time (areas.py)."""
+        return self.security.get("privileged_areas") or []
 
     def tools_for(self, task_type: str | None) -> list[str]:
         tt = self.task_types.get(task_type or "", {})

@@ -31,6 +31,7 @@ Every working session MUST:
 | I | v2 personal OS (txt/html/pdf/image ingest + vault/inbox, NL→standing automations, notify-or-not gate) | **implemented incl. PDF/OCR, acceptance passing** (review waived) |
 | J | v2 semantic + graph memory (sqlite-vec hybrid search, bge-small local embeddings, bi-temporal fact graph, weekly reconcile) | **implemented, acceptance passing** (review waived) |
 | — | Ask-about-my-screen (`<Super><Alt>a` → portal shot → popup → streamed answer) | **implemented, smoke passing — user E2E pending** (run scripts/setup_ask_screen.sh) |
+| — | Spotify media control ("hey jarvis, play …" → MPRIS, deterministic) | **implemented, 332 tests green — user E2E pending** (run scripts/setup_spotify.sh) |
 
 v2 (phases F–J: memory, learning loop, observability, personal OS, graph) is
 planned in `context/v2-plan.md` (user approved the direction 2026-07-18);
@@ -156,11 +157,15 @@ before writing from scratch.
 - Warm-load times (this CPU): all four models ~3s; STT of a short utterance
   ~1.1s; TTS starts instantly. Quick-path first delta ~3-5s on the CLI
   backend (Messages API path will cut this substantially).
-- **Trigger layout (settled 2026-07-10)**: `mission-jarvis` runs `--mode wake`
-  ("hey jarvis" → assistant, spoken reply); `mission-dictate` owns hold-F9
-  (speech typed at cursor via ydotool). Both share `trigger_key`/models via
-  config.yaml; don't run the assistant in `ptt`/`both` mode while
-  mission-dictate is up or F9 will trigger both.
+- **Trigger layout (updated 2026-07-22)**: `mission-jarvis` runs `--mode both`
+  — "hey jarvis" (wake word) **and hold-`ptt_key`** (default `KEY_RIGHTCTRL`)
+  both reach the assistant through the same handler; `mission-dictate` owns
+  hold-`trigger_key` (F9, speech typed at cursor via ydotool). The two keys
+  MUST differ — both services read the raw evdev stream, so a shared key fires
+  dictation and the assistant at once (main.py logs a warning if they match).
+  PTT needs no VAD: the key edge is the endpoint, and press/release each play a
+  short beep (`ptt_beep_ms`, 0 disables). Pressing PTT while Jarvis is speaking
+  is an explicit barge-in (stops playback + cancels the in-flight call).
 
 ## Operational notes (learned Phase F)
 
@@ -316,6 +321,74 @@ before writing from scratch.
   check and one real image-reading quick task).
 - Hold-F9 dictation types into the popup textarea for free (it's a focused
   text field); the mic button is the built-in alternative.
+
+## Operational notes (media control / Spotify)
+
+- **Deterministic by default**: `dispatcher/spotify.py` `detect()` is a pure
+  parser (sibling of `automations.detect`) — "play X", "pause", "skip",
+  "what's playing", "volume 40" never reach Claude, so they cost nothing and
+  land in well under a second. `POST /task` diverts on it (mode=auto only)
+  **after** the automation divert, so "every morning play jazz" still becomes
+  a standing automation. Non-music text returns None and routes as before;
+  a trailing "?" vetoes the divert (except "what's playing?"), and a VETO
+  list guards idioms ("play devil's advocate", "play it safe").
+- **LLM fallback**: music-shaped text the parser can't resolve ("put on
+  something chill") returns the `MAYBE` sentinel → one `media-parse` quick
+  task that chooses **search words only**; the action is always executed by
+  the deterministic path. Deliberately not an area — an area would need Bash
+  to reach D-Bus, which `security.privileged_areas` exists to prevent.
+  `media-parse` is excluded from quick-session continuity and never surfaced,
+  same hygiene as `automation-parse`/`notify-gate`.
+- **Playback is local**: MPRIS over jeepney (`org.mpris.MediaPlayer2.spotify`,
+  `OpenUri`/`Play`/`Pause`/`Next`/`Previous`, writable `Volume` property).
+  A play command launches the flatpak client if its bus name is absent
+  (`media.launch_cmd`, ~20s wait); transport commands against a dead player
+  just say "Spotify isn't running". All blocking calls run in
+  `asyncio.to_thread`. jeepney returns D-Bus errors as *replies*, not
+  exceptions — `_check()` handles that (same trap as `jarvis/ask_screen.py`).
+- **Search needs credentials, not Premium**: `GET /v1/search` under the
+  **client-credentials** flow (app-only; no user OAuth, no redirect dance).
+  `scripts/setup_spotify.sh` writes `data/spotify.json` (gitignored, mode
+  600); `SPOTIFY_CLIENT_ID`/`_SECRET` env override it. Missing credentials
+  degrade gracefully — transport still works, `play X` says to run the setup
+  script. Premium (including **Premium Student**, which is a full Premium
+  tier) is only needed for the user-OAuth Web API playback endpoints, which
+  this design deliberately avoids; the trade is no access to the user's own
+  playlists/liked songs.
+- Seams: `POST /media {command}`, `GET /media/state`. `run_intent` never
+  raises — every failure becomes a speakable sentence. Nothing in `jarvis/`
+  changed: the divert streams a `delta`, which the voice brain already speaks.
+
+## Operational notes (learned in the codebase-review remediation)
+
+- **Trust boundary (H1/H2)**: metadata from an external source
+  (api/queue/voice/ui/screen) can NARROW tools/budget but never WIDEN them —
+  `sanitize_untrusted_metadata` drops `allowed_tools`/`resume_session_id` and
+  clamps `max_cost_usd` to the cap; only server-internal spawns pass
+  `trusted=True`. Areas strip Bash/unscoped Edit-Write from SKILL.md
+  frontmatter at load unless listed in `security.privileged_areas` (empty by
+  default) — a reflection/learn run editing `areas/**` can't grant itself Bash.
+- **Timer agents get their tools from disk, not the wire** (learned the hard
+  way 2026-07-24): `scripts/run_agent.py` sends `metadata.agent = <name>`, and
+  the dispatcher resolves `areas/<area>/agents/<name>.md`'s `allowed_tools`
+  itself (`AreaRegistry.agent_tools`, slug-guarded, sanitized like SKILL.md).
+  Sending the grant in metadata instead (the old way) had it stripped by the
+  trust boundary — the daily brief silently wrote nothing for three days
+  (2026-07-21..23), all three runs falsely `done`.
+- **Denied tools no longer masquerade as success**: the headless CLI reports a
+  missing `--allowedTools` grant as an ordinary `is_error` tool_result and lets
+  the model continue, so a run that was denied every write still ended
+  subtype=success. `runner.py` now flags denials; a denial that stopped the run
+  producing the output file its prompt names (mtime vs a pre-spawn timestamp) →
+  `failed`; a tolerable denial (e.g. Gmail MCP absent, the brief writes anyway
+  and skips its email section by design) → `done` with the denial recorded in
+  `denied_tools` and logged as a warning.
+- Other review fixes now live: `/stt` body-size cap + origin guard, real
+  quick-path cancel (proc registration + cancelled-guard), SQLite
+  `busy_timeout=15s`, memory block-file write allowlist + scoped summarize
+  Write, **failed consolidation surfaced + episodes rolled back** to the pool,
+  orphan-vector sweep, DST-correct `zoneinfo` for automations + a
+  memory-statement divert veto, Piper both-file atomic guard.
 
 ## Known quirks / open items
 

@@ -1,6 +1,49 @@
 # STATE — read me first each session
 
-_Last updated: 2026-07-19 (session 12, end)_
+_Last updated: 2026-07-24 (session 17, end)_
+
+## Session 17 (2026-07-24): daily-brief regression fixed (timer trust boundary)
+
+Found live on session start: the daily brief wrote **nothing** on 07-21/22/23
+(3 runs, all falsely `done`, ~$0.92 wasted); weekly review would break the same
+way Sun 07-26. **Cause: session-13's own H1 trust boundary.**
+`sanitize_untrusted_metadata` strips `allowed_tools` off external requests, but
+`scripts/run_agent.py` (every timer's submit path) sent the brief's
+`Edit(vault/briefs/**)` grant in exactly that key → dropped → agent fell back
+to read-only → every Write denied. A denied-every-write run *still* reported
+`success` (CLI surfaces a missing grant as an ordinary is_error tool_result),
+which is why it hid 3 days.
+
+**Fix (2 parts, live-verified):** (1) the dispatcher now resolves an agent's
+tools **from disk** (`AreaRegistry.agent_tools`, slug-guarded, same sanitizer as
+SKILL.md); `run_agent.py` sends `metadata.agent` (a reference), not the grant —
+restores the tools without reopening H1. (2) `runner.py` flags permission
+denials; a denial that stopped the run producing its **declared output file**
+(mtime vs pre-spawn `wall_t0`) → `failed`; a tolerable denial (Gmail MCP absent,
+brief written anyway) → `done` + `denied_tools` recorded + warning logged.
+**332 tests green** (+12). Live: fresh brief `8ca3f9b4bdc9` → `done`, file
+written, Gmail denial tolerated. **Still uncommitted — rides the sessions-13–17
+review batch** (this fix *is* session-13 fallout). Details:
+`context/sessions/2026-07-24-1.md`.
+
+## Session 16 (2026-07-23): Spotify media control ("hey jarvis, play …")
+
+Music commands now bypass Claude entirely: `dispatcher/spotify.py` parses
+"play X" / "pause" / "skip" / "what's playing" / "volume 40" deterministically
+and drives the local Spotify desktop client over **MPRIS** (jeepney — no new
+deps). Song lookup is one **client-credentials** Web API search (app-only auth,
+**no Premium needed**; researched this session — Premium Student *is* full
+Premium, so the user-OAuth path stays open if playlists/liked songs are wanted
+later). Vague-but-musical text ("put on something chill") costs one
+`media-parse` quick call that picks **search words only** — the action stays
+deterministic, so no area and no Bash/D-Bus reach for the model.
+`POST /task` diverts on it (mode=auto, after the automations divert), plus
+`POST /media` and `GET /media/state`. **320 tests green** (263 → 320);
+dispatcher restarted and the divert verified live with no Claude run; normal
+routing unaffected. **Uncommitted**, like sessions 13-15.
+**User-side: run `bash scripts/setup_spotify.sh`** (free app registration at
+developer.spotify.com) — until then `play <song>` says so, transport works.
+Details: `context/sessions/2026-07-23-1.md`.
 
 ## Current phase
 
@@ -8,10 +51,85 @@ _Last updated: 2026-07-19 (session 12, end)_
 under systemd** — user approved + installed the deps 2026-07-19 (sqlite-vec,
 fastembed, pymupdf, rapidocr, jeepney) and waived phase reviews. Also
 shipped: ask-about-my-screen (ssplan.md) and the Layer-13 Bash hardening.
-**Only user-side items remain** (ask-screen manual E2E after
-setup_ask_screen.sh, Gmail OAuth, reboot test, dashboard visual pass).
-Deliberately unbuilt: H4 complexity tiers, media area, Kokoro swap,
-multi-agent fan-out (all "do not build unprompted").
+**Session 13 ran a full codebase review + remediation** — 8 HIGH / 12 MED /
+~18 LOW findings triaged into 7 work units, all applied (261 tests green,
+uncommitted, awaiting user review). **Only user-side items remain** (ask-screen
+manual E2E after setup_ask_screen.sh, Gmail OAuth, reboot test, dashboard
+visual pass). Deliberately unbuilt: H4 complexity tiers, media area, Kokoro
+swap, multi-agent fan-out (all "do not build unprompted").
+
+## Session 15 (2026-07-22): hold-to-talk assistant on Right Ctrl
+
+The assistant now has a second trigger next to "hey jarvis": **hold
+`jarvis.ptt_key` (KEY_RIGHTCTRL) → listen → release → ask**, same
+STT/dispatcher/streamed-TTS path, no VAD endpointing (the key edge is the
+endpoint). New config `ptt_key` + `ptt_beep_ms` (90ms press/release beeps);
+`ptt_key` is deliberately separate from `trigger_key` (F9 = mission-dictate)
+because both services watch raw evdev — main.py warns if they're equal.
+Pressing PTT mid-reply barges in (stops playback → cancels the call).
+`mission-jarvis.service` switched `--mode wake` → `--mode both`, reinstalled
+and restarted (journal shows "watching 4 keyboard(s) for 97"). 263 tests
+green. **Uncommitted**, like sessions 13/14. User-side check: hold Right Ctrl,
+speak, release — the reply should be spoken.
+
+## Session 14 (2026-07-22): docs page at /system-docs
+
+In-app documentation now ships with the dashboard: **http://127.0.0.1:8765/system-docs**
+(linked from the dashboard header) — user guide + HTTP API reference for all
+26 routes, rendered by `ui/src/Docs.jsx` from data in `ui/src/docs/content.js`.
+Path is `/system-docs` on purpose: FastAPI's Swagger UI keeps `/docs` (user's
+call), and a test now guards that. `dispatcher/main.py` grew a shared
+`_spa_index()` helper behind both `/ask` and `/system-docs`. 263 tests green,
+`ui/dist` rebuilt, **uncommitted** like session 13. Details:
+`context/sessions/2026-07-22-2.md`.
+
+## Session 13 (2026-07-22): fresh codebase review → full remediation
+
+Fresh four-agent review of the whole codebase → findings in
+`context/reviews/2026-07-19-codebase-review.md`, actionable plan in
+`…-fix-plan.md` (7 conflict-free work units A–G, execution log at its foot).
+**All units A–G applied this session; 192 → 261 tests green; NO commits.**
+
+- **A — trust boundary (H1+H2)**: `sanitize_untrusted_metadata` + `trusted=`
+  flag so external metadata can NARROW but never WIDEN tools/budget/resume;
+  internal spawns marked trusted. Areas strip Bash/unscoped Edit-Write from
+  SKILL.md frontmatter at load unless in `security.privileged_areas`.
+- **B — graph cap (H3)**: `graph.candidate_ids` threaded into apply; LLM
+  `invalidated_ids` intersected with the exact prompt candidate set, bools
+  rejected, per-batch add cap.
+- **C — chunker (M5+L6)**: junk-word filter tokenizes per-line (keeps prose),
+  absent index_dir no longer purges its index.
+- **D — voice (H4–H7, M7–M9, L7–L11)**: sub-frame TTS interrupt, barge races
+  the queue, mic-loss watchdog, id-clear on ack, non-2xx→spoken error,
+  separate barge VAD, control-char injection strip, PTT cap. (3 sub-agents.)
+- **E — dispatcher (M1 /stt cap+origin guard, M2 real quick-cancel via
+  procs registration + cancelled-guard, M3 busy_timeout=15s, L1 atomic
+  add_fact, L2 stderr reaping).**
+- **F — memory (M4 block-file allowlist + scoped summarize Write, M6 surface
+  failed consolidation + roll episodes back on failure, L3 orphan-vector
+  sweep + existence-checked vec insert, L4 DST-correct zoneinfo, L5
+  memory-statement divert veto).**
+- **G — UI/ops (H8 Piper both-file+atomic guard, M10 postTask resp.ok,
+  M11 dev proxy /automations+/stats, M12 AskScreen stable-id patch, L12
+  AgentMonitor live-step append+refetch, L13 config fixture test, L14
+  skipUnless optional-dep, L15 doctor timer glob, L16 widget mutation
+  notes, L17 setup_ask_screen printf %q).** ui/dist rebuilt.
+
+Not built (listed in the fix-plan's "Coverage gaps" section, optional):
+POST /task HTTP-layer test, notify-gate wiring test, reflection auto-queue
+test, /events SSE contract test, /memory/search routing test.
+
+**Next: user reviews the diff; then commit (per-unit or squashed) on the
+user's word.** Do NOT commit unprompted. Two things to remember at commit
+time (detail in `context/sessions/2026-07-22-1.md`):
+- **ui/dist is gitignored + force-added** — the rebuilt bundle's new hashed
+  assets are untracked/ignored; run `git add -f ui/dist/assets/index-lkUaqwu2.js
+  ui/dist/assets/index-A83EmG_w.css` or the committed dist references missing
+  files.
+- **Fold the changed behaviors into CLAUDE.md operational notes** (origin guard
+  + /stt cap, memory block-file allowlist, failed-consolidation surfacing +
+  rollback, automations DST + statement veto) — deferred to commit time so
+  uncommitted behavior isn't documented as live.
 
 ## Session 12 (cont. 3): deps landed → Phase I completed + Phase J shipped
 

@@ -52,6 +52,22 @@ def _variant(value):
     return value[1] if isinstance(value, tuple) and len(value) == 2 else value
 
 
+def _request_path(reply) -> str:
+    """Pull the Request object path out of the portal's Screenshot reply.
+
+    jeepney's blocking send_and_get_reply returns D-Bus ERROR messages without
+    raising; the old code took body[0] as an object path regardless, so an
+    error reply's text got fed to MatchRule → a misleading MatchRuleInvalid
+    dialog. Detect the ERROR message type first and surface the portal's actual
+    error text, guarding an empty body against IndexError (L10)."""
+    from jeepney import MessageType
+
+    if reply.header.message_type == MessageType.error:
+        detail = reply.body[0] if reply.body else "unknown D-Bus error"
+        fail(f"Screenshot portal error: {detail}")
+    return reply.body[0]
+
+
 def take_screenshot() -> str | None:
     """xdg-desktop-portal Screenshot(interactive=true, modal=true).
     Returns the file:// URI, or None when the user cancelled the selection.
@@ -86,7 +102,7 @@ def take_screenshot() -> str | None:
                 ("", {"handle_token": ("s", token),
                       "interactive": ("b", True),
                       "modal": ("b", True)})))
-            request_path = reply.body[0]
+            request_path = _request_path(reply)
             if request_path != predicted:
                 alt = rule_for(request_path)
                 bus.AddMatch(alt)
@@ -137,11 +153,16 @@ def prune(screenshots_dir: Path, keep: int):
 
 def launch_popup(cfg: JarvisConfig, shot_id: str):
     ask = cfg.ask_screen
+    chromium = ask.get("chromium_bin", "chromium")
+    # Precheck: a missing binary makes Popen raise FileNotFoundError, which is
+    # invisible from a GUI shortcut with no terminal — surface it as a dialog
+    # with the exact binary name instead (M9).
+    if shutil.which(chromium) is None:
+        fail(f"chromium not found: {chromium} — set jarvis.ask_screen.chromium_bin")
     w, h = ask.get("window_size", [520, 720])
     url = f"{cfg.dispatcher_url}/ask?shot={shot_id}"
     subprocess.Popen(
-        [ask.get("chromium_bin", "chromium"), f"--app={url}",
-         f"--window-size={w},{h}"],
+        [chromium, f"--app={url}", f"--window-size={w},{h}"],
         start_new_session=True,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     log.info("popup launched: %s", url)
@@ -161,10 +182,18 @@ def main():
     if uri is None:
         log.info("selection cancelled")
         sys.exit(0)
-    screenshots_dir = cfg.root / "data" / "screenshots"
-    dest = store(uri, screenshots_dir)
-    prune(screenshots_dir, int(cfg.ask_screen.get("keep_last", 20)))
-    launch_popup(cfg, dest.stem)
+    # store/prune/launch_popup all ran uncaught from a terminal-less GUI
+    # shortcut, so any failure (bad uri, unwritable dir, chromium missing) was
+    # silent. Wrap them in the same fail() dialog path as the screenshot (M9).
+    # launch_popup's own fail() raises SystemExit (a BaseException), so its
+    # precise "chromium not found" message passes through this `except Exception`.
+    try:
+        screenshots_dir = cfg.root / "data" / "screenshots"
+        dest = store(uri, screenshots_dir)
+        prune(screenshots_dir, int(cfg.ask_screen.get("keep_last", 20)))
+        launch_popup(cfg, dest.stem)
+    except Exception as e:
+        fail(f"Could not open the ask window: {e}")
 
 
 if __name__ == "__main__":

@@ -50,12 +50,24 @@ dispatcher:
     quick_max_tokens: 1024
     transient_retry_delay_s: 2    # backoff before the one retry on spawn/timeout error
 
+  # Trust boundary (mechanical, not conventional). Only server-internal spawns
+  # (reflection, notify gate, consolidation, graph, learn, requeue) may widen a
+  # task's tools/budget or inject a resume session via metadata; external
+  # sources (api/queue/voice/ui/screen) can NARROW but never widen. Areas listed
+  # here may declare Bash / unscoped Edit-Write in their SKILL.md frontmatter;
+  # every other area has those grants stripped at load time. Keep empty unless
+  # an area genuinely needs shell/unrestricted-write access.
+  security:
+    privileged_areas: []
+
   task_defaults:
     allowed_tools: [Read, Glob, Grep]   # read-only baseline for unattended runs
 
   task_types:
     summarize:
-      allowed_tools: [Read, Glob, Grep, Write]
+      # Write is path-scoped to the vault: a summary writer has no business
+      # touching source, config, or systemd units (M4).
+      allowed_tools: [Read, Glob, Grep, "Write(vault/**)"]
 
   # Memory (Phase F): raw episode capture + always-in-context blocks + vault
   # search index. Blocks are plain markdown in blocks_dir — edit them freely;
@@ -117,6 +129,25 @@ dispatcher:
     notify_sources: [automation, timer]
     notify_desktop: true          # notify-send, if installed
 
+  # Media control: "play bohemian rhapsody" / "pause" / "skip" / "what's
+  # playing" / "volume 40" drive the local Spotify desktop client over MPRIS
+  # (D-Bus) instead of reaching Claude — deterministic, sub-second, free.
+  # Finding a song by name is the one thing MPRIS can't do, so it costs one
+  # Spotify Web API search under the client-credentials flow (app-only auth:
+  # no user OAuth, no Premium needed — playback happens in your own client).
+  # llm_fallback: vague-but-musical phrasing ("put on something chill") gets a
+  # single media-parse call that picks SEARCH WORDS only; the action itself is
+  # always deterministic. An empty/absent block disables the whole feature.
+  media:
+    enabled: true
+    nl_detect: true               # divert music phrasing in POST /task (mode=auto)
+    llm_fallback: true
+    player: spotify
+    launch_cmd: ["flatpak", "run", "com.spotify.Client"]
+    credentials: data/spotify.json   # written by scripts/setup_spotify.sh, gitignored
+    market: IN
+    search_limit: 5
+
   # USD per million tokens, for quick-path cost computation (agentic cost comes
   # from the CLI's total_cost_usd). Cached from docs 2026-07-05.
   prices:
@@ -126,7 +157,10 @@ dispatcher:
     claude-haiku-4-5: { input: 1.0,  output: 5.0 }
 
 jarvis:
-  trigger_key: KEY_F9
+  trigger_key: KEY_F9          # dictation (mission-dictate): hold → typed at cursor
+  ptt_key: KEY_RIGHTCTRL       # assistant hold-to-talk (mission-jarvis): hold → ask
+                               # must differ from trigger_key — both watch raw evdev
+  ptt_beep_ms: 90              # feedback beeps on press/release (0 disables)
   sample_rate: 16000
   wake_word: hey_jarvis        # stock openWakeWord model name
   wake_threshold: 0.2            # tuned from near-miss logs: user's natural "hey jarvis" scores 0.21-0.25
@@ -145,6 +179,8 @@ jarvis:
   vad_threshold: 0.5
   endpoint_silence_ms: 900     # stop capture after this much trailing silence
   max_utterance_s: 30
+  mic_lost_after_s: 5          # re-open the mic after this many seconds of no audio (device died mid-stream)
+  max_recording_s: 300         # hard cap on one push-to-talk recording (guards a wedged trigger key)
   barge_in_frames: 6           # 6 x 32ms ≈ 192ms of speech cuts TTS + aborts call
   # Ask-about-my-screen: GNOME shortcut -> python -m jarvis.ask_screen
   # (portal area-select screenshot -> chromium --app popup on the dispatcher).

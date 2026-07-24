@@ -4,9 +4,9 @@
 Usage: run_agent.py <area> <agent>            (e.g. run_agent.py tasks daily-brief)
 
 Reads areas/<area>/agents/<agent>.md, substitutes {{DATE}}/{{DATE_HUMAN}}/
-{{WEEK_START}}, POSTs the body to /task (mode=agentic) with the frontmatter's
-allowed_tools as the tool override. Exits nonzero if the dispatcher is down —
-systemd journals the failure.
+{{WEEK_START}}, POSTs the body to /task (mode=agentic) naming the agent, whose
+allowed_tools the dispatcher then resolves from that file itself. Exits nonzero
+if the dispatcher is down — systemd journals the failure.
 """
 
 import json
@@ -61,7 +61,11 @@ def main():
         "area": area,
         "metadata": {
             "task_type": meta.get("task_type", agent),
-            "allowed_tools": meta.get("allowed_tools"),
+            # Name the agent; do NOT send its allowed_tools. We're an external
+            # HTTP client, so the dispatcher's trust boundary strips tool grants
+            # off the wire (that silently broke the daily brief). It reads this
+            # same file's frontmatter itself instead.
+            "agent": agent,
         },
     }
     req = urllib.request.Request(

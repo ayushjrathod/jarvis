@@ -11,7 +11,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import automations, graph, limits, memory, notify, quick, reflection, runner, telemetry
+from . import (automations, graph, limits, memory, notify, quick, reflection,
+               runner, spotify, telemetry)
 from .areas import AreaRegistry
 from .classifier import classify
 from .config import Config
@@ -27,7 +28,7 @@ TERMINAL = {"done", "failed", "cancelled"}
 # sessions the way a human source's follow-ups do (Phase G lesson: meta-work
 # leaking into conversational machinery causes weird cross-contamination).
 NO_CONTINUITY_SOURCES = {"automation", "automation-parse", "notify-gate",
-                         "graph-extract", "graph-reconcile"}
+                         "media-parse", "graph-extract", "graph-reconcile"}
 
 # Ask-about-my-screen: extra system context for screenshot-question tasks.
 SCREEN_CONTEXT = (
@@ -54,6 +55,40 @@ def make_ack(text: str) -> str:
     return f"On it — {short}{'…' if len(words) > 8 else ''}"
 
 
+# Metadata keys an UNtrusted caller must never be able to widen with: granting
+# tools or injecting a resume session. max_cost_usd is clamped (not dropped) so
+# an external caller can still narrow the budget. Internal server spawns pass
+# trusted=True and keep all three (they legitimately set them).
+_TRUSTED_ONLY_META_KEYS = ("allowed_tools", "resume_session_id")
+
+
+def sanitize_untrusted_metadata(metadata: dict | None, cost_cap: float) -> dict | None:
+    """Enforce the trust boundary (H1) on metadata supplied by an external
+    source (api/queue/voice/ui/screen): drop tool/session grants and clamp the
+    budget to the configured cap. The invariant is that an untrusted task can
+    NARROW its tools/budget but never WIDEN them, and can never inject a resume
+    session. Everything else (screenshot, task_type, notify, …) passes through.
+    Returns a sanitized copy; the input is not mutated."""
+    if not metadata:
+        return metadata
+    clean = dict(metadata)
+    stripped = [k for k in _TRUSTED_ONLY_META_KEYS if clean.pop(k, None) is not None]
+    budget = clean.get("max_cost_usd")
+    if budget is None:
+        pass
+    elif isinstance(budget, bool) or not isinstance(budget, (int, float)):
+        # a non-numeric budget can't be honored as a narrowing — drop it so the
+        # configured default cap applies at build time
+        clean.pop("max_cost_usd", None)
+        stripped.append("max_cost_usd")
+    elif budget > cost_cap:
+        clean["max_cost_usd"] = cost_cap
+        stripped.append(f"max_cost_usd({budget}->{cost_cap})")
+    if stripped:
+        log.warning("sanitized untrusted metadata: %s", ", ".join(stripped))
+    return clean
+
+
 def is_resume_error(error: str | None) -> bool:
     """True when a failure is the resumed session having vanished (CLI session
     GC / config wipe): 'No conversation found with session ID: …'. The right
@@ -74,7 +109,8 @@ class Service:
         self.sem = asyncio.Semaphore(cfg.max_concurrent_agentic)
         self.procs: dict = {}      # task_id -> subprocess (for cancel/barge-in)
         self.bg: dict = {}         # task_id -> asyncio.Task
-        self.areas = AreaRegistry(cfg.root / "areas")
+        self.areas = AreaRegistry(cfg.root / "areas",
+                                  privileged_areas=cfg.privileged_areas)
         # quick-path continuity: source -> (last CLI session_id, monotonic time
         # of last completed turn). In-memory on purpose — the idle window is
         # minutes, a restart just means one fresh start.
@@ -129,7 +165,15 @@ class Service:
             return mode, area_name
         return (hint or classify(text)), area_name
 
-    async def create_task(self, text, source, kind, area=None, metadata=None) -> dict:
+    async def create_task(self, text, source, kind, area=None, metadata=None,
+                          trusted=False) -> dict:
+        # Trust boundary (H1): only server-internal spawns (trusted=True) may set
+        # allowed_tools/resume_session_id or a budget above the cap. Everything
+        # from an external source is sanitized before it is stored, so both the
+        # quick and agentic paths read already-safe metadata off the row.
+        if not trusted:
+            metadata = sanitize_untrusted_metadata(
+                metadata, self.cfg.budgets.get("max_cost_per_task_usd", 0.50))
         task = self.db.create_task(text, source, kind, area, metadata)
         if area:  # skill telemetry (Phase G) — best-effort, never blocks dispatch
             try:
@@ -140,12 +184,18 @@ class Service:
         return task
 
     async def submit(self, text, source="api", mode="auto", area=None,
-                     metadata=None, match_area=True) -> dict:
+                     metadata=None, match_area=True, trusted=False) -> dict:
         """Fire-and-forget entry point (queue watcher, timers). Quick tasks run
         in the background with output stored in the run row; HTTP clients that
-        want streamed quick answers go through create_task + stream_quick."""
+        want streamed quick answers go through create_task + stream_quick.
+
+        trusted=True is set ONLY by server-internal spawns (reflection, notify
+        gate, consolidation, graph, learn, limit-requeue) that legitimately pass
+        allowed_tools/max_cost_usd/resume_session_id; external callers leave it
+        False so their metadata can only narrow, never widen (H1)."""
         kind, area_name = self.route(text, mode, area, match_area)
-        task = await self.create_task(text, source, kind, area_name, metadata)
+        task = await self.create_task(text, source, kind, area_name, metadata,
+                                      trusted=trusted)
         if kind == "agentic":
             self.start_agentic(task)
         else:
@@ -168,6 +218,10 @@ class Service:
             self.quick_sessions.pop(source, None)
             return None
         return session_id
+
+    def _is_cancelled(self, task_id: str) -> bool:
+        row = self.db.get_task(task_id)
+        return bool(row and row["status"] == "cancelled")
 
     async def stream_quick(self, task: dict):
         """Async generator of (event_name, payload) pairs; writes run rows and
@@ -215,6 +269,12 @@ class Service:
                          or self._fresh_quick_session(task["source"]))
             attempt, idx = 0, 0
             while idx < len(models):
+                # cancel() may have fired between attempts (it kills the live
+                # subprocess and sets 'cancelled'); don't spawn a fresh turn over
+                # a cancelled task (M2).
+                if self._is_cancelled(task["id"]):
+                    finished = True
+                    return
                 model_override = models[idx]
                 attempt += 1
                 label = model_override or self.cfg.models.get("quick") or "cli-default"
@@ -236,6 +296,7 @@ class Service:
                         send_text, self.cfg, model_override,
                         tools=q_tools, context=q_context,
                         resume_session_id=resume_id,
+                        procs=self.procs, task_id=task["id"],
                     ):
                         if kind == "delta":
                             delta_times.append(time.monotonic())
@@ -282,6 +343,12 @@ class Service:
                     resume_id = None
                     continue
 
+                # cancel() may have killed the subprocess mid-stream and already
+                # written 'cancelled'; the kill surfaces here as a failed/short
+                # meta, so re-check before settling and don't overwrite it (M2).
+                if self._is_cancelled(task["id"]):
+                    finished = True
+                    return
                 final = "done" if status == "done" else "failed"
                 if (final == "done" and meta.get("session_id")
                         and self.cfg.quick_session_idle_minutes
@@ -349,7 +416,10 @@ class Service:
         meta = json.loads(task["metadata"]) if task.get("metadata") else {}
         area = self.areas.get(task["area"]) if task.get("area") else None
         tools = (
-            meta.get("allowed_tools")                                # agent-file override
+            meta.get("allowed_tools")                       # trusted spawn override
+            # agent file resolved from disk: an untrusted caller may NAME an
+            # agent but never hand us its grants (see AreaRegistry.agent_tools)
+            or self.areas.agent_tools(task.get("area"), meta.get("agent"))
             or (area.allowed_tools if area and area.allowed_tools else None)
             or self.cfg.tools_for(meta.get("task_type"))
         )
@@ -421,6 +491,17 @@ class Service:
                 requeue_delay = self._limit_requeue_delay(limit)
                 speech += " I'll retry the task after that."
             self.db.set_task_status(task["id"], final)
+            if (final == "failed"
+                    and meta.get("task_type") == "memory-consolidate"
+                    and meta.get("episode_ids")):
+                # the episodes were marked consolidated at hand-off; the run
+                # failed, so return them to the pool for the next pass (M6)
+                try:
+                    n = self.db.mark_episodes_unconsolidated(meta["episode_ids"])
+                    log.warning("consolidation %s failed; %d episode(s) requeued",
+                                task["id"], n)
+                except Exception:
+                    log.exception("episode roll-back failed for %s", task["id"])
             self._capture_episode(task, final, result.get("output_text"))
             suppress = self._maybe_notify(task, meta, final,
                                           result.get("output_text"),
@@ -450,6 +531,7 @@ class Service:
         await self.submit(
             reflection.PROMPT, source="reflection", mode="agentic",
             match_area=False,  # the prompt's own text must not match triggers
+            trusted=True,      # server spawn: sets tools/budget/resume itself
             metadata={
                 "task_type": "reflection",
                 "resume_session_id": result["session_id"],
@@ -513,7 +595,7 @@ class Service:
                 meta["resume_session_id"] = session_id
             gate_task = await self.create_task(
                 notify.gate_prompt(task["text"], answer),
-                "notify-gate", "quick", None, meta)
+                "notify-gate", "quick", None, meta, trusted=True)
             reply, status = await self._collect_quick(gate_task)
             verdict, text = (notify.parse_gate(reply) if status == "done"
                              else ("notify", ""))
@@ -554,7 +636,7 @@ class Service:
         Returns (row_or_None, speakable_confirmation)."""
         task = await self.create_task(
             automations.parse_prompt(request), "automation-parse", "quick",
-            None, {"task_type": "automation-parse"})
+            None, {"task_type": "automation-parse"}, trusted=True)
         reply, status = await self._collect_quick(task)
         try:
             if status != "done":
@@ -573,6 +655,44 @@ class Service:
                  spec["task_text"][:80], automations.describe(spec))
         return row, f"Scheduled: {spec['task_text']} — {automations.describe(spec)}."
 
+    # -- media control ------------------------------------------------------
+
+    async def media_command(self, text: str, source: str = "api") -> str:
+        """Run a music command, returning the one sentence to speak.
+
+        Deterministic first (no LLM, no tokens, sub-second). Only music-shaped
+        text the parser can't resolve — "put on something chill" — costs a
+        single `media-parse` quick call, which chooses SEARCH WORDS ONLY; the
+        action itself is always executed by the deterministic path. That keeps
+        the model out of the privileged loop: no area, no Bash, no D-Bus reach.
+        """
+        mcfg = self.cfg.media or {}
+        intent = spotify.detect(text)
+        if intent is None:
+            return "I couldn't work out what to play."
+        if intent is spotify.MAYBE:
+            if not mcfg.get("llm_fallback", True):
+                return "I couldn't work out what to play."
+            intent = await self._parse_media(text, source)
+            if intent is None:
+                return "I couldn't work out what to play."
+        return await asyncio.to_thread(spotify.run_intent, self.cfg, intent)
+
+    async def _parse_media(self, text: str, source: str) -> "spotify.Intent | None":
+        """One quick JSON call → mechanically validated play intent (the
+        automation-parse pattern). None on anything malformed."""
+        task = await self.create_task(
+            spotify.parse_prompt(text), "media-parse", "quick", None,
+            {"task_type": "media-parse", "origin_source": source}, trusted=True)
+        reply, status = await self._collect_quick(task)
+        try:
+            if status != "done":
+                raise ValueError(f"parse task status {status}")
+            return spotify.validate_parsed(spotify.parse_response(reply))
+        except ValueError as e:
+            log.warning("media parse failed for %r: %s", text[:80], e)
+            return None
+
     # -- knowledge graph (Phase J2/J3) --------------------------------------
 
     def graph_enabled(self) -> bool:
@@ -586,15 +706,18 @@ class Service:
         """Nightly fact extraction over the consolidation export: one quick
         JSON call, deterministic apply (graph.py). None = parse failure —
         the export file is still on disk for a manual replay."""
+        candidates = graph.candidate_ids(self.db)  # the exact set the prompt shows
         task = await self.create_task(
             graph.extraction_prompt(self.db, episodes_text, self._today()),
-            "graph-extract", "quick", None, {"task_type": "graph-extract"})
+            "graph-extract", "quick", None, {"task_type": "graph-extract"},
+            trusted=True)
         reply, status = await self._collect_quick(task)
         try:
             if status != "done":
                 raise ValueError(f"extract task status {status}")
             counts = graph.apply_extraction(
-                self.db, graph.parse_reply(reply), episode_ids)
+                self.db, graph.parse_reply(reply), episode_ids,
+                allowed_ids=candidates)
         except ValueError as e:
             log.warning("graph extraction failed: %s", e)
             return None
@@ -624,14 +747,17 @@ class Service:
         invalidated (never deleted). Cheap no-op while the graph is small."""
         if len(self.db.active_facts(limit=2)) < 2:
             return {"status": "nothing_to_reconcile", **self.db.graph_counts()}
+        candidates = graph.candidate_ids(self.db, graph.RECONCILE_LIMIT)
         task = await self.create_task(
             graph.reconcile_prompt(self.db, self._today()),
-            "graph-reconcile", "quick", None, {"task_type": "graph-reconcile"})
+            "graph-reconcile", "quick", None, {"task_type": "graph-reconcile"},
+            trusted=True)
         reply, status = await self._collect_quick(task)
         try:
             if status != "done":
                 raise ValueError(f"reconcile task status {status}")
-            counts = graph.apply_reconciliation(self.db, graph.parse_reply(reply))
+            counts = graph.apply_reconciliation(
+                self.db, graph.parse_reply(reply), allowed_ids=candidates)
         except ValueError as e:
             log.warning("graph reconciliation failed: %s", e)
             return {"status": "failed", "error": str(e)}
@@ -661,6 +787,9 @@ class Service:
                 await self.submit(
                     task["text"], source="timer", mode="agentic",
                     area=task.get("area"),
+                    # re-submitting an already-validated timer task: keep its
+                    # (already-sanitized) metadata intact rather than re-clamping
+                    trusted=True,
                     metadata={**meta, "limit_requeues": meta.get("limit_requeues", 0) + 1},
                 )
             finally:
