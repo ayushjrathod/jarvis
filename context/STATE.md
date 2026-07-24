@@ -22,9 +22,17 @@ denials; a denial that stopped the run producing its **declared output file**
 (mtime vs pre-spawn `wall_t0`) → `failed`; a tolerable denial (Gmail MCP absent,
 brief written anyway) → `done` + `denied_tools` recorded + warning logged.
 **332 tests green** (+12). Live: fresh brief `8ca3f9b4bdc9` → `done`, file
-written, Gmail denial tolerated. **Still uncommitted — rides the sessions-13–17
-review batch** (this fix *is* session-13 fallout). Details:
-`context/sessions/2026-07-24-1.md`.
+written, Gmail denial tolerated. Details: `context/sessions/2026-07-24-1.md`.
+
+**Committed** (user reviewed the batch, chose two commits): `672a994` harden —
+session-13 review remediation (session-13-only files); `af693b2` feat —
+sessions 14–17 (ask-screen finalize, media control, docs page, PTT trigger, the
+brief fix) + the shared dispatcher files session 13 also touched. File-level
+split (hunk staging unavailable here), so only HEAD is verified green (332
+tests); `ui/dist` assets force-added past the ignore; `data/spotify.json` stays
+gitignored; CLAUDE.md folded the deferred hardening + timer-trust notes.
+**Working tree clean.** Only user-side items remain (Gmail OAuth, reboot test,
+ask-screen/media E2E, dashboard visual pass).
 
 ## Session 16 (2026-07-23): Spotify media control ("hey jarvis, play …")
 
