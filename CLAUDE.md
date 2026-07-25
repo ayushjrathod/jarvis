@@ -32,6 +32,7 @@ Every working session MUST:
 | J | v2 semantic + graph memory (sqlite-vec hybrid search, bge-small local embeddings, bi-temporal fact graph, weekly reconcile) | **implemented, acceptance passing** (review waived) |
 | — | Ask-about-my-screen (`<Super><Alt>a` → portal shot → popup → streamed answer) | **implemented, smoke passing — user E2E pending** (run scripts/setup_ask_screen.sh) |
 | — | Spotify media control ("hey jarvis, play …" → MPRIS, deterministic) | **implemented, 332 tests green — user E2E pending** (run scripts/setup_spotify.sh) |
+| — | Phone access via Tailscale + installable PWA dashboard | **implemented, 334 tests green — user setup pending** (run scripts/setup_tailscale.sh) |
 
 v2 (phases F–J: memory, learning loop, observability, personal OS, graph) is
 planned in `context/v2-plan.md` (user approved the direction 2026-07-18);
@@ -389,6 +390,56 @@ before writing from scratch.
   Write, **failed consolidation surfaced + episodes rolled back** to the pool,
   orphan-vector sweep, DST-correct `zoneinfo` for automations + a
   memory-statement divert veto, Piper both-file atomic guard.
+
+## Operational notes (phone access — Tailscale + PWA)
+
+- **Chosen option** (research in `future/phone-access-and-feature-gaps.md`):
+  Tailscale, because it needs **no token-auth middleware and opens no public
+  port** — the dispatcher stays bound to `127.0.0.1` and **Tailscale Serve**
+  proxies it as tailnet HTTPS. Only your own devices reach it. ngrok was
+  rejected (its free tier withholds auth, forcing bearer-token middleware).
+- **The one code change**: the origin guard (`dispatcher/main.py`
+  `_origin_is_local` / `guard_origin`) is a **CSRF check, not auth** — it 403s a
+  state-changing request carrying a *non-local* `Origin`. The dashboard loaded
+  over `https://<box>.<tailnet>.ts.net` POSTs with exactly that Origin, so the
+  hostname must be trusted: `security.public_hosts` (config.yaml, a string or
+  list) feeds `cfg.public_hosts` into the guard alongside loopback + `cfg.host`.
+  It is **only** the origin allowlist and grants no authentication — Tailscale is
+  the access control. Verified: an allowlisted host passes, a different
+  cross-origin site still 403s (tests/test_ask_screen.py).
+- **Serve unit**: `systemd/mission-tailscale-serve.service` (oneshot,
+  RemainAfterExit) runs `tailscale serve --bg --https=443 http://127.0.0.1:8765`.
+  Prereqs (operator perms so `serve` needs no sudo, HTTPS/MagicDNS enabled) are
+  set by `scripts/setup_tailscale.sh`, which is idempotent and **prints the exact
+  `public_hosts` line** for the machine's MagicDNS name.
+- **User-side steps** (nothing here can do them): `sudo pacman -S tailscale` →
+  `scripts/setup_tailscale.sh` → paste the printed `public_hosts` line into
+  config.yaml → `systemctl --user restart mission-dispatcher` → install the
+  Tailscale app on the phone, join the same tailnet, open the URL.
+- **PWA**: `ui/public/` holds `manifest.webmanifest`, `sw.js`, and PIL-generated
+  icons (192/512/maskable/apple-touch, dark "MC" tile matching the dashboard
+  theme); `ui/index.html` links them, `ui/src/main.jsx` registers the worker.
+  The service worker is **deliberately minimal** — a live SSE dashboard, so it
+  only makes the app installable + caches the shell/hashed assets and **never**
+  touches `/events` or any POST/API GET. StaticFiles serves everything in
+  `ui/public/` from `/` after `npm run build`; a defensive
+  `mimetypes.add_type(".webmanifest")` in main.py keeps the content-type right on
+  pre-3.14 interpreters. No new dispatcher routes were needed.
+
+## Operational notes (dashboard "talk to Jarvis" button)
+
+- The CommandBox widget (`ui/src/widgets/CommandBox.jsx`) has a mic button that
+  is the **browser-side** twin of "hey jarvis": click to start, click again to
+  stop → `getUserMedia`/`MediaRecorder` → `POST /stt` → `postTask` (mode auto,
+  source **`ui-voice`**) streams the answer → spoken with the Web Speech API
+  (`window.speechSynthesis` — there is **no server `/tts`**; a "mute reply"
+  toggle suppresses it). The server mic (sounddevice) belongs to on-device
+  jarvis only; a browser/phone can't use it, hence the browser records itself.
+  Source is `ui-voice`, deliberately not the on-device `voice`, so their CLI
+  sessions don't conflate. For phone use the mic needs a **secure context** —
+  the Tailscale Serve URL is HTTPS (loopback is also secure). Caveat: iOS Safari
+  can throttle `speechSynthesis` from async code — speaking is best-effort and
+  never blocks the UI.
 
 ## Known quirks / open items
 

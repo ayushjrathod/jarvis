@@ -28,4 +28,5 @@ echo
 echo "Dashboard: http://127.0.0.1:8765/"
 echo "Jarvis wake word (after input-group + audio setup): systemctl --user enable --now mission-jarvis"
 echo "Dictation on F9 (after ydotool setup): systemctl --user enable --now mission-dictate"
+echo "Phone access over Tailscale (installs its own serve unit): scripts/setup_tailscale.sh"
 echo "Survive logout/reboot without login: loginctl enable-linger $USER"

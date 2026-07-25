@@ -66,6 +66,22 @@ header .sub { color: var(--dim); font-size: 0.85rem; }
   cursor: pointer;
 }
 .command-form button:disabled { opacity: 0.5; cursor: default; }
+/* voice button ("talk to Jarvis") — outlined, big enough to tap on a phone */
+.command-form button.mic {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  font-weight: 500;
+  white-space: nowrap;
+  min-width: 2.6rem;
+  padding: 0 0.9rem;
+}
+.command-form button.mic:hover:not(:disabled) { border-color: var(--accent); }
+.command-form button.mic.recording { border-color: var(--bad); color: var(--bad); }
+
+.command-tools { margin: 0.4rem 0 0; }
+.mute-toggle { display: inline-flex; align-items: center; gap: 0.35rem; color: var(--dim); font-size: 0.85rem; cursor: pointer; }
+.asked { margin: 0.6rem 0 0; color: var(--accent); font-weight: 600; overflow-wrap: anywhere; }
 
 pre.brief {
   white-space: pre-wrap;

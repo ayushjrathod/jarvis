@@ -1,6 +1,75 @@
 # STATE — read me first each session
 
-_Last updated: 2026-07-24 (session 17, end)_
+_Last updated: 2026-07-24 (session 19, end)_
+
+## Session 19 (2026-07-24): "talk to Jarvis" voice button on the dashboard
+
+Follow-on to session 18. New mic button on the **main dashboard** (CommandBox
+widget) = the same loop as "hey jarvis", browser-side: click to start listening,
+click again to stop → `getUserMedia`/`MediaRecorder` → `POST /stt` → `postTask`
+(mode auto, source **`ui-voice`**) streams the answer into the widget → speaks it
+with the Web Speech API (`speechSynthesis`; there is no server `/tts`). For phone
+use over the Tailscale HTTPS URL (mic needs a secure context — Serve is HTTPS).
+
+- **UI only, no Python/API change** (`/stt` + `/task` already exist + proxied).
+  `jarvis/*.py` untouched. Changed: `ui/src/widgets/CommandBox.jsx` (mic toggle +
+  shared `runTask` + `say()` + "mute reply" toggle) and `ui/src/styles.css`
+  (dashboard-scoped `.command-form button.mic` styles, tap-sized).
+- **334 tests green** (UI-only; build is the bar). `ui/dist` rebuilt —
+  **JS `index-DZvyj-0c.js`, CSS `index-BKjwyAup.css`** (CSS changed this time).
+  Running dispatcher already serves it (StaticFiles, no restart).
+- **Uncommitted.** Commit-time: `git add -f` the two new dist assets, stage the
+  deletion of the committed baseline `index-CjFcS_Jm.js` + `index-qeg-kXaw.css`
+  (session 18's rebuild was never committed), `ui/dist/index.html` modified.
+- **User-side**: grant mic permission; caveat — iOS Safari can throttle
+  `speechSynthesis` from async code (best-effort, never blocks). Details:
+  `context/sessions/2026-07-24-3.md`.
+
+## Session 18 (2026-07-24): phone access via Tailscale + installable PWA
+
+Implemented the phone-access work from `future/phone-access-and-feature-gaps.md`.
+User picked **Tailscale** (over LAN-only/Cloudflare/ngrok) and **yes** to the PWA.
+
+- **Origin guard now trusts a configurable front-door host.** The guard
+  (`dispatcher/main.py` `_origin_is_local`/`guard_origin`) is CSRF-only, not
+  auth; the SPA loaded over `https://<box>.<tailnet>.ts.net` POSTs with that
+  Origin and would 403. New `security.public_hosts` (config.yaml, str-or-list) →
+  `Config.public_hosts` → fed into the guard beside loopback + `cfg.host`. It's
+  ONLY the origin allowlist; Tailscale is the access control (dispatcher stays on
+  127.0.0.1, Serve fronts HTTPS — no token middleware, no public port). ngrok was
+  rejected in the doc precisely because it *would* force bearer-token middleware.
+- **Serve unit + setup script** (both user-side, can't test here):
+  `systemd/mission-tailscale-serve.service` (oneshot `tailscale serve --bg
+  --https=443 http://127.0.0.1:8765`); `scripts/setup_tailscale.sh` idempotently
+  brings up tailscaled, sets the user as operator, installs+enables the unit, and
+  **prints the exact `public_hosts` line** for the box's MagicDNS name.
+- **PWA** (shipped, live-verified served): `ui/public/{manifest.webmanifest,
+  sw.js}` + PIL-generated icons (192/512/maskable/apple-touch/favicon, dark "MC"
+  tile); `ui/index.html` links them, `ui/src/main.jsx` registers the worker.
+  Worker is minimal on purpose (live SSE dashboard) — installable + shell/asset
+  cache only, never `/events` or POSTs. `mimetypes.add_type(".webmanifest")` in
+  main.py is defensive (this Python's stdlib already knows it). `ui/dist` rebuilt
+  (new JS hash `index-BsED9CnX.js`; CSS unchanged `index-qeg-kXaw.css`).
+- **334 tests green** (+2 origin-guard: allowlisted host passes, other
+  cross-origin still 403s). Dispatcher restarted on the new code; live-checked
+  `/manifest.webmanifest` → 200 `application/manifest+json`, `/sw.js`, all icons
+  200, SPA index carries the manifest link.
+- **Uncommitted** (session 17 committed its own batch; this is new). Commit-time
+  notes: the rebuilt JS `ui/dist/assets/index-BsED9CnX.js` is **gitignored** →
+  `git add -f` it; stage the deletion of the old `index-CjFcS_Jm.js`; the CSS
+  hash is unchanged (`index-qeg-kXaw.css`, already tracked). `ui/public/` is
+  **not** ignored — the icons + manifest + sw commit normally. Serve unit and
+  setup script are new untracked files.
+- **User-side**: `sudo pacman -S tailscale` → `scripts/setup_tailscale.sh` →
+  paste the printed `public_hosts` line → restart dispatcher → Tailscale app on
+  the phone → open the URL, add to home screen. Details:
+  `context/sessions/2026-07-24-2.md`.
+- **LIVE (user ran setup, same session):** tailnet name
+  `archlinux.tail79c6ce.ts.net`; `config.yaml public_hosts` set to it; user
+  enabled HTTPS Serve in the admin console; `mission-tailscale-serve` active +
+  enabled. Verified from the box: `https://archlinux.tail79c6ce.ts.net/health`,
+  `/`, and `/manifest.webmanifest` all 200 over tailnet HTTPS. Only the phone
+  join + add-to-home-screen remains.
 
 ## Session 17 (2026-07-24): daily-brief regression fixed (timer trust boundary)
 

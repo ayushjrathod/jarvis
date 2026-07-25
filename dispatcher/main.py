@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
+from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 
@@ -26,6 +28,12 @@ from .config import Config
 from .service import Service, make_ack, resolve_screenshot
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+
+# StaticFiles types the PWA manifest by extension. Python 3.14's stdlib already
+# maps .webmanifest, but older interpreters don't and would serve it as
+# text/plain (Chrome then warns and skips the install prompt) — pin it so the
+# content-type is correct regardless of interpreter.
+mimetypes.add_type("application/manifest+json", ".webmanifest")
 
 
 def sse(event: str, data: dict) -> str:
@@ -46,12 +54,12 @@ _LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1", ""}
 _GUARDED_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
-def _origin_is_local(origin: str, extra_host: str | None = None) -> bool:
+def _origin_is_local(origin: str, extra_hosts: "Iterable[str]" = ()) -> bool:
     try:
         host = urlsplit(origin).hostname or ""
     except ValueError:
         return False
-    return host in _LOCAL_HOSTS or (extra_host is not None and host == extra_host)
+    return host in _LOCAL_HOSTS or host in set(extra_hosts)
 
 
 class TaskIn(BaseModel):
@@ -132,7 +140,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         loopback/self Origin) pass through untouched."""
         if request.method in _GUARDED_METHODS:
             origin = request.headers.get("origin")
-            if origin and not _origin_is_local(origin, cfg.host):
+            if origin and not _origin_is_local(origin, (cfg.host, *cfg.public_hosts)):
                 return JSONResponse(status_code=403,
                                     content={"detail": "cross-origin request rejected"})
         return await call_next(request)

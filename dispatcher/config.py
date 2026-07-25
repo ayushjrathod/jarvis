@@ -76,6 +76,18 @@ class Config:
         return cfg
 
     @property
+    def public_hosts(self) -> list[str]:
+        """Hostnames of any non-loopback front door the CSRF origin guard should
+        trust for same-origin SPA POSTs — e.g. a Tailscale Serve
+        `<machine>.<tailnet>.ts.net` name or a LAN IP (security.public_hosts,
+        a string or a list). This is ONLY the origin-guard allowlist; it grants
+        no authentication. Tailscale keeps the dispatcher on loopback and proxies
+        HTTPS in front, so reaching it off-network needs no token middleware and
+        opens no public port (scripts/setup_tailscale.sh)."""
+        v = self.security.get("public_hosts") or []
+        return [v] if isinstance(v, str) else list(v)
+
+    @property
     def privileged_areas(self) -> list[str]:
         """Areas allowed to declare Bash / unscoped Edit-Write in their SKILL.md
         frontmatter (security.privileged_areas). Empty by default — every other

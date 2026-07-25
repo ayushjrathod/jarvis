@@ -59,6 +59,17 @@ dispatcher:
   # an area genuinely needs shell/unrestricted-write access.
   security:
     privileged_areas: []
+    # Phone access (see future/phone-access-and-feature-gaps.md, Tailscale
+    # chosen). Front-door hostnames BESIDES loopback that the CSRF origin guard
+    # should trust for same-origin SPA POSTs — the dashboard loaded over
+    # Tailscale Serve sends its own POSTs with that Origin, and the guard would
+    # otherwise 403 them. Add your tailnet name here, e.g.
+    #   public_hosts: ["your-box.your-tailnet.ts.net"]
+    # (scripts/setup_tailscale.sh prints the exact line). This is ONLY the
+    # origin allowlist, NOT authentication: Tailscale is the access control —
+    # the dispatcher stays on 127.0.0.1 and Serve proxies HTTPS in front, so no
+    # public port is opened and no token middleware is needed.
+    public_hosts: ["archlinux.tail79c6ce.ts.net"]
 
   task_defaults:
     allowed_tools: [Read, Glob, Grep]   # read-only baseline for unattended runs

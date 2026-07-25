@@ -136,6 +136,24 @@ class TestEndpoints(unittest.TestCase):
                             headers={"origin": "https://evil.example"})
         self.assertEqual(r.status_code, 200)
 
+    def test_public_host_origin_allowed(self):
+        # phone access: the SPA loaded over Tailscale Serve POSTs with that
+        # Origin; security.public_hosts must let it through the CSRF guard.
+        self.cfg.security = {"public_hosts": ["box.tail.ts.net"]}
+        client = TestClient(create_app(self.cfg))
+        with patch("dispatcher.stt.get_stt", return_value=_FakeSTT()):
+            r = client.post("/stt", content=b"x" * 500,
+                            headers={"origin": "https://box.tail.ts.net"})
+        self.assertEqual(r.status_code, 200)
+
+    def test_public_host_does_not_open_others(self):
+        # allowlisting one host must not admit a different cross-origin site
+        self.cfg.security = {"public_hosts": ["box.tail.ts.net"]}
+        client = TestClient(create_app(self.cfg))
+        r = client.post("/stt", content=b"x" * 500,
+                        headers={"origin": "https://evil.example"})
+        self.assertEqual(r.status_code, 403)
+
 
 class TestScreenshotQuickPath(unittest.IsolatedAsyncioTestCase):
     """Step-4 behavior: first turn wraps the prompt + grants Read; resumed

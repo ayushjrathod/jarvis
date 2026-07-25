@@ -1,0 +1,20 @@
+[Unit]
+Description=Mission Control — Tailscale Serve (HTTPS front door for the dispatcher over the tailnet)
+# Serve just re-asserts config into the tailscaled daemon, so it needs the
+# daemon up and the dispatcher listening on loopback first.
+After=network-online.target tailscaled.service mission-dispatcher.service
+Wants=network-online.target
+Requires=mission-dispatcher.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Publish the loopback dispatcher on the tailnet as HTTPS:443. Prerequisites
+# (done by scripts/setup_tailscale.sh): tailscaled up, HTTPS/MagicDNS enabled in
+# the admin console, and this user set as a Tailscale operator so `serve` runs
+# without sudo. --bg persists the mapping in the daemon; the oneshot then exits.
+ExecStart=/usr/bin/tailscale serve --bg --https=443 http://127.0.0.1:8765
+ExecStop=/usr/bin/tailscale serve --https=443 off
+
+[Install]
+WantedBy=default.target

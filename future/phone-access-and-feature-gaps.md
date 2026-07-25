@@ -161,10 +161,16 @@ Researched, then dropped by the user mid-session. Preserved for revival:
 
 ## Open decisions
 
-1. Which phone-access option (recommendation: **Tailscale**; cheapest: **LAN-only**).
-2. Whether the PWA manifest rides along with it.
+1. ~~Which phone-access option~~ — **Tailscale chosen (session 18, 2026-07-24)**;
+   the origin-guard + serve-unit + setup-script + PWA are implemented. User-side:
+   `sudo pacman -S tailscale` then `scripts/setup_tailscale.sh` (installs the
+   Tailscale app on the phone, joins the tailnet, adds the printed
+   `public_hosts` line to config.yaml). See CLAUDE.md "phone access (Tailscale)".
+2. ~~Whether the PWA manifest rides along~~ — **yes, shipped** (session 18):
+   manifest + service worker + icons in `ui/public/`, dashboard installs to the
+   phone home screen.
 3. Whether any of the other gaps above (event-driven proactivity, approval queue,
-   local-model fallback) get promoted into a v3 phase plan.
+   local-model fallback) get promoted into a v3 phase plan. **Still open.**
 
 ## Sources
 
