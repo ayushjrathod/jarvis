@@ -258,13 +258,28 @@ before writing from scratch.
   past-due row can't instant-fire. Empty/absent `automations:` config block
   disables the whole feature (that's what keeps unit tests LLM-free).
 - **Notify gate**: 'done' automation/timer results run a `notify-gate` quick
-  task that **resumes the settled run's own session** (measured $0.009 —
-  cheaper than reflection) → `NOTIFY: <summary>` fires an SSE `notify` event
+  task (self-contained prompt: request + clipped result inlined)
+  → `NOTIFY: <summary>` fires an SSE `notify` event
   (with `speech`) + notify-send; `SKIP:` is logged + `notify_skipped` event
   only. Fail-open: gate breakage notifies with a generic summary. done/failed
   events suppressed by policy carry `surface: false`; the jarvis brain
   honors both — **reflection/consolidation completions are no longer spoken**
   (before Phase I every agentic 'done' was announced when jarvis was up).
+- **Meta-task cost (corrected 2026-07-26 — the old "warm resume is nearly
+  free" claim was wrong).** The one-off $0.009 gate measurement on 2026-07-18
+  never reproduced: the next 11 runs averaged **$0.141**. Two causes, both
+  measured, both fixed: (1) resuming the settled run replays a long agentic
+  transcript as input for a one-line verdict — $0.141 resumed vs $0.103 fresh,
+  so `_notify_gate` no longer passes `resume_session_id`; (2) the real floor is
+  the Claude Code system prompt itself (~16k cache-creation tokens on **every**
+  cold `claude -p`), so the model rate dominates — `models.meta`
+  (haiku) + `models.meta_task_types` now route the pure-classification tasks
+  (notify-gate, automation-parse, media-parse), each of which has mechanical
+  validation downstream. Live after the change: $0.0405 vs $0.189 for the
+  preceding real gate run. `graph-extract` is deliberately excluded — its
+  output is fact text that lands in the knowledge graph. Clearing `models.meta`
+  restores the old routing. **Only an `ANTHROPIC_API_KEY` removes the floor
+  entirely** (the Messages API path carries no Claude Code system prompt).
 - Internal quick sources (`automation`, `automation-parse`, `notify-gate`)
   are excluded from quick-session continuity — unrelated machine tasks must
   not chain each other's CLI sessions. The gate resumes via metadata

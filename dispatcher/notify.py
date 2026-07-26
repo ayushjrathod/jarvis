@@ -3,11 +3,14 @@ quick-path judgment decides whether the result is worth surfacing (spoken
 notice + desktop notification) or only worth logging.
 
 Gate idea after khoj's automations notify check (AGPL-3.0 — pattern
-re-implemented, no code copied). The gate run resumes the finished task's own
-CLI session where possible (same warm-cache trick as Phase G reflections,
-measured ~$0.02) with the result text inlined as a fallback for vanished
-sessions. Failure policy is fail-open: the user asked to be told, so a broken
-gate notifies with a generic summary rather than silently dropping results.
+re-implemented, no code copied). The gate prompt is self-contained: it inlines
+the request and the (clipped) result, so the run needs no session continuity.
+It ran with `--resume` on the settled task's session until 2026-07-26, on the
+theory that a warm cache made it nearly free; live data said otherwise
+(12 runs averaging $0.141 — resuming a long agentic transcript costs more than
+it saves), so it now runs fresh on `models.meta`. Failure policy is fail-open:
+the user asked to be told, so a broken gate notifies with a generic summary
+rather than silently dropping results.
 """
 
 from __future__ import annotations

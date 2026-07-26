@@ -8,7 +8,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from dispatcher import automations, notify
+from dispatcher import automations, notify, service
 from dispatcher.db import Database
 from dispatcher.ingest import (chunk_html, chunk_markdown, chunk_plaintext,
                                html_to_markdown, ingest_vault)
@@ -462,6 +462,45 @@ class TestNotifyGatePieces(unittest.TestCase):
         self.assertLess(len(p), 2500)
         p2 = notify.gate_prompt("check", None)
         self.assertIn("(no text output)", p2)
+
+
+class TestMetaModelRouting(unittest.TestCase):
+    """Internal classification tasks run on the cheap model (2026-07-26):
+    measured $0.103/gate-call on sonnet vs $0.028 on haiku."""
+
+    class _Cfg:
+        def __init__(self, models):
+            self.models = models
+
+    MODELS = {"quick": "claude-sonnet-5", "meta": "claude-haiku-4-5"}
+
+    def mm(self, task_type, models=None):
+        cfg = self._Cfg(self.MODELS if models is None else models)
+        return service.meta_model(cfg, {"task_type": task_type} if task_type else {})
+
+    def test_plumbing_types_get_the_meta_model(self):
+        for tt in service.DEFAULT_META_TASK_TYPES:
+            self.assertEqual(self.mm(tt), "claude-haiku-4-5", tt)
+
+    def test_normal_and_quality_sensitive_tasks_keep_models_quick(self):
+        # None == "use models.quick". graph-extract is deliberately excluded:
+        # its output is fact text that lands in the knowledge graph.
+        for tt in (None, "graph-extract", "reflection", "memory-consolidate"):
+            self.assertIsNone(self.mm(tt), tt)
+
+    def test_unset_meta_key_restores_old_behavior(self):
+        self.assertIsNone(self.mm("notify-gate", {"quick": "claude-sonnet-5"}))
+        self.assertIsNone(
+            self.mm("notify-gate", {**self.MODELS, "meta": ""}))
+
+    def test_task_types_are_configurable(self):
+        models = {**self.MODELS, "meta_task_types": ["graph-extract"]}
+        self.assertEqual(self.mm("graph-extract", models), "claude-haiku-4-5")
+        self.assertIsNone(self.mm("notify-gate", models))
+
+    def test_missing_metadata_is_safe(self):
+        self.assertIsNone(service.meta_model(self._Cfg(self.MODELS), {}))
+        self.assertIsNone(service.meta_model(self._Cfg(self.MODELS), None))
 
 
 class TestSurfacingPolicy(unittest.TestCase):

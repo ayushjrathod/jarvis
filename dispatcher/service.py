@@ -30,6 +30,21 @@ TERMINAL = {"done", "failed", "cancelled"}
 NO_CONTINUITY_SOURCES = {"automation", "automation-parse", "notify-gate",
                          "media-parse", "graph-extract", "graph-reconcile"}
 
+# Internal plumbing tasks that ask for a *classification*, not prose: a
+# NOTIFY/SKIP verdict, a schedule spec, a set of search words. Each has
+# mechanical validation downstream (parse_gate / validate_spec / the
+# deterministic media executor), so a small model is safe here — and the
+# saving is not marginal. Measured on this box, one gate call:
+#   sonnet + --resume  $0.141   (what these cost before 2026-07-26)
+#   sonnet, fresh      $0.103
+#   haiku,  fresh      $0.028
+# The floor is the Claude Code system prompt itself (~16k cache-creation
+# tokens on every cold `claude -p`), which is why the model rate dominates.
+# graph-extract is deliberately NOT here: its output is model-authored fact
+# text that lands in the knowledge graph, so quality outranks the ~$0.14.
+# Override with `models.meta_task_types` in config.yaml.
+DEFAULT_META_TASK_TYPES = ("notify-gate", "automation-parse", "media-parse")
+
 # Ask-about-my-screen: extra system context for screenshot-question tasks.
 SCREEN_CONTEXT = (
     "The user is asking about a screenshot they just captured. Answer from "
@@ -47,6 +62,19 @@ def resolve_screenshot(cfg: Config, name: str) -> Path | None:
     if p.parent != base or not p.is_file():
         return None
     return p
+
+
+def meta_model(cfg: Config, task_meta: dict) -> str | None:
+    """The cheap model to run this quick task on, or None for the normal
+    `models.quick`. None whenever the task isn't internal plumbing or
+    `models.meta` is unset, so clearing that key restores the old behavior."""
+    tt = (task_meta or {}).get("task_type")
+    if not tt:
+        return None
+    types = cfg.models.get("meta_task_types", DEFAULT_META_TASK_TYPES)
+    if tt not in types:
+        return None
+    return cfg.models.get("meta") or None
 
 
 def make_ack(text: str) -> str:
@@ -262,9 +290,13 @@ class Service:
                     log.warning("task %s: screenshot %r not found; answering without it",
                                 task["id"], task_meta["screenshot"])
 
-            models = [None, self.cfg.models.get("fallback", "claude-opus-4-8")]
-            # metadata override first: the notify gate resumes the settled
-            # run's own session rather than this source's conversation
+            # first entry: the cheap model for internal classification tasks,
+            # None (= models.quick) for everything else. Refusal/limit retries
+            # still climb to the fallback model.
+            models = [meta_model(self.cfg, task_meta),
+                      self.cfg.models.get("fallback", "claude-opus-4-8")]
+            # metadata override first: an internal spawn may name the session it
+            # wants continued rather than this source's conversation
             resume_id = (task_meta.get("resume_session_id")
                          or self._fresh_quick_session(task["source"]))
             attempt, idx = 0, 0
@@ -585,14 +617,18 @@ class Service:
     async def _notify_gate(self, task: dict, answer: str | None,
                            session_id: str | None, key: str):
         """Run the notify-or-not judgment as its own quick task (cost stays
-        in the books), resuming the settled run's session when it has one.
-        Fail-open: any breakage notifies with a generic summary rather than
-        silently swallowing a result the user asked for."""
+        in the books). Fail-open: any breakage notifies with a generic summary
+        rather than silently swallowing a result the user asked for.
+
+        Deliberately does NOT resume the settled run's session (it did until
+        2026-07-26). The gate prompt already inlines the request and result,
+        so resuming only replays a long agentic transcript as input for a
+        one-line verdict — measured $0.141 resumed vs $0.103 fresh on the same
+        model. `session_id` is kept in the signature for callers/tests.
+        """
         fallback = f"Finished: {task['text'][:100]}"
         try:
             meta = {"task_type": "notify-gate"}
-            if session_id:
-                meta["resume_session_id"] = session_id
             gate_task = await self.create_task(
                 notify.gate_prompt(task["text"], answer),
                 "notify-gate", "quick", None, meta, trusted=True)

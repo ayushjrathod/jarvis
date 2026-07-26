@@ -30,6 +30,13 @@ dispatcher:
     # refusal fallback (locked decision #3)
     fallback: claude-opus-4-8
     classifier: claude-haiku-4-5
+    # Internal plumbing tasks (a NOTIFY/SKIP verdict, a schedule spec, search
+    # words) run here instead of models.quick — each is a classification with
+    # mechanical validation downstream, and the rate difference is the whole
+    # cost of these runs: measured $0.103 sonnet vs $0.028 haiku per gate call.
+    # Clear this key to send them back to models.quick.
+    meta: claude-haiku-4-5
+    meta_task_types: [notify-gate, automation-parse, media-parse]
 
   # messages_api | claude_cli | auto (auto: messages_api if API credentials found)
   quick_backend: auto
