@@ -25,3 +25,7 @@ data/screenshots/
 
 # spotify client-credentials (client id/secret) — never commit
 data/spotify.json
+
+# Local secrets (e.g. ANTHROPIC_API_KEY) — never commit
+.env
+.env.*

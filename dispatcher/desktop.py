@@ -423,15 +423,37 @@ def _clipboard_set(intent: Intent) -> str:
     return f"Copied {text[:60]}{'…' if len(text) > 60 else ''}."
 
 
+def screen_locked() -> bool | None:
+    """True/False, or None when the lock state can't be determined.
+
+    Asks the **session bus**, not `loginctl show-session self`. The dispatcher
+    is a systemd *user* service, and a user service belongs to
+    `user@1000.service`, not to a login session — so loginctl answers
+    "Caller does not belong to any known session" every time. The original
+    `_status` swallowed that as a DesktopError, which meant the lock state was
+    silently never reported (found 2026-07-26 while verifying the lock verb).
+    """
+    try:
+        out = _run(["gdbus", "call", "--session",
+                    "-d", "org.gnome.ScreenSaver",
+                    "-o", "/org/gnome/ScreenSaver",
+                    "-m", "org.gnome.ScreenSaver.GetActive"])
+    except DesktopError:
+        return None
+    low = out.lower()
+    if "true" in low:
+        return True
+    if "false" in low:
+        return False
+    return None
+
+
 def _status() -> str:
     level, muted = get_volume()
     bits = [f"system volume {round(level * 100)}%" + (" (muted)" if muted else "")]
-    try:
-        locked = _run(["loginctl", "show-session", "self", "-p", "LockedHint"])
-        if "yes" in locked.lower():
-            bits.append("screen locked")
-    except DesktopError:
-        pass
+    locked = screen_locked()
+    if locked is not None:
+        bits.append("screen locked" if locked else "screen unlocked")
     return "Right now: " + ", ".join(bits) + "."
 
 

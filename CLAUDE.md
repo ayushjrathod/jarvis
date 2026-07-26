@@ -542,6 +542,36 @@ before writing from scratch.
   pending confirmations, which is the safe direction to fail.
 - Seams: `POST /desktop {command}`, `POST /desktop/confirm {confirm_id,
   approve}`, `GET /desktop/verbs` (what the tier can do and under what policy).
+- **A systemd *user* service is not in a login session.** It lives under
+  `user@1000.service`, so `loginctl show-session self` answers "Caller does not
+  belong to any known session" from the dispatcher — the original `_status`
+  swallowed that as a DesktopError and therefore *never once* reported lock
+  state. Lock state now comes from the session bus
+  (`org.gnome.ScreenSaver.GetActive`), which does work there; `screen_locked()`
+  returns None for "couldn't tell" so it never reads as "definitely unlocked".
+  `loginctl lock-session` (no ID) **does** work from that context — verified,
+  accidentally, by locking the screen for real 2026-07-26.
+
+## Operational notes (browser verification of the dashboard)
+
+- The dashboard can be inspected headlessly with **chromium + CDP over Node's
+  built-in WebSocket — zero deps** (`node --version` 22, `typeof WebSocket ===
+  "function"`). Launch `chromium --headless=new --remote-debugging-port=9222
+  --user-data-dir=…`, take the ws URL from `http://127.0.0.1:9222/json`.
+  `Page.captureScreenshot` + `Emulation.setDeviceMetricsOverride` give a real
+  look at phone widths. As session 6 noted, `--dump-dom` is useless here (the
+  SSE `/events` stream never lets the page finish loading) — wait on explicit
+  DOM conditions instead of load events.
+- **Always `Network.setCacheDisabled` + a cache-busting query.** A rebuilt
+  bundle gets a new hashed filename, but chromium caches `index.html` itself,
+  so a re-measure after a CSS fix can silently re-test the OLD stylesheet —
+  which is exactly what made a fixed overflow look unfixed on 2026-07-26.
+- Found this way: the CommandBox `Send` button was **clipped at 390px** (the
+  phone PWA width) ever since the session-19 mic button made that row too wide.
+  Cause is the classic one — an `<input>` carries an intrinsic min-width from
+  its size attribute, so a flex row won't shrink it and pushes the last button
+  off-screen. `min-width: 0` on `.command-form input`, the same fix session 6
+  applied to `.card`.
 
 ## Operational notes (dashboard "talk to Jarvis" button)
 

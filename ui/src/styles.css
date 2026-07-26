@@ -47,6 +47,11 @@ header .sub { color: var(--dim); font-size: 0.85rem; }
 .command-form { display: flex; gap: 0.5rem; }
 .command-form input {
   flex: 1;
+  /* an <input> carries an intrinsic min-width from its size attribute, so a
+     flex row refuses to shrink it and pushes Send off-screen instead — at
+     390px (the phone PWA) the button was clipped by 5px. Same fix as the
+     min-width: 0 on .card. */
+  min-width: 0;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 8px;

@@ -174,6 +174,46 @@ class TestRunIntentNeverRaises(unittest.TestCase):
         self.assertEqual(run.call_args[0][0][3], "1.00")
 
 
+class TestScreenLocked(unittest.TestCase):
+    """Lock state comes from the session bus, not `loginctl show-session self`:
+    the dispatcher is a systemd user service, which belongs to
+    user@1000.service rather than a login session, so loginctl always answers
+    "Caller does not belong to any known session" and the old code silently
+    reported nothing."""
+
+    def test_parses_both_states(self):
+        with mock.patch.object(desktop, "_run", return_value="(true,)\n"):
+            self.assertIs(desktop.screen_locked(), True)
+        with mock.patch.object(desktop, "_run", return_value="(false,)\n"):
+            self.assertIs(desktop.screen_locked(), False)
+
+    def test_unavailable_is_none_not_false(self):
+        # "we couldn't tell" must not read as "definitely unlocked"
+        with mock.patch.object(desktop, "_run",
+                               side_effect=desktop.DesktopError("no gdbus")):
+            self.assertIsNone(desktop.screen_locked())
+        with mock.patch.object(desktop, "_run", return_value="weird output"):
+            self.assertIsNone(desktop.screen_locked())
+
+    def test_asks_the_session_bus(self):
+        with mock.patch.object(desktop, "_run", return_value="(false,)") as run:
+            desktop.screen_locked()
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[0], "gdbus")
+        self.assertIn("--session", argv)
+        self.assertNotIn("loginctl", argv)
+
+    def test_status_reports_lock_state(self):
+        with mock.patch.object(desktop, "get_volume", return_value=(0.26, False)), \
+             mock.patch.object(desktop, "screen_locked", return_value=True):
+            self.assertIn("screen locked", desktop.run_intent(desktop.Intent("status")))
+        with mock.patch.object(desktop, "get_volume", return_value=(0.26, False)), \
+             mock.patch.object(desktop, "screen_locked", return_value=None):
+            out = desktop.run_intent(desktop.Intent("status"))
+        self.assertNotIn("screen", out)          # unknown → say nothing about it
+        self.assertIn("26%", out)
+
+
 class TestResolveApp(unittest.TestCase):
     ENTRIES = {"firefox": "firefox", "files": "org.gnome.Nautilus",
                "libreoffice files demo": "lo-demo", "text editor": "org.gnome.TextEditor"}
