@@ -112,6 +112,29 @@ class _Timeout(Exception):
         self.seconds = seconds
 
 
+# The CLI backend is the SUBSCRIPTION path — that is the whole reason it
+# exists here (CLAUDE.md: no API credentials, subscription OAuth only). But the
+# `claude` CLI prefers an API key over the claude.ai login whenever one is in
+# the environment, and says so:
+#   "claude.ai connectors are disabled because ANTHROPIC_API_KEY or another
+#    auth source is set and takes precedence over your claude.ai login"
+# So an exported key doesn't just add an option, it *replaces* the subscription
+# — and with an unfunded key every `claude -p` fails outright (observed
+# 2026-07-27). Even with a funded one it would silently bill CLI runs, at ~18k
+# system-prompt tokens each, to API credit instead of the subscription.
+# Strip it: code that wants the API should use the messages_api backend.
+_STRIPPED_CLI_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+
+
+def cli_env(cfg) -> dict:
+    """Environment for a `claude` subprocess: inherited, pinned to the
+    project's CLAUDE_CONFIG_DIR, minus any API credentials."""
+    env = {k: v for k, v in os.environ.items() if k not in _STRIPPED_CLI_VARS}
+    if cfg.claude_config_dir:
+        env["CLAUDE_CONFIG_DIR"] = cfg.claude_config_dir
+    return env
+
+
 def grants_bash(tools: list[str] | None) -> bool:
     return any(t == "Bash" or t.startswith("Bash(") for t in tools or [])
 
@@ -223,9 +246,7 @@ async def _attempt(text: str, cfg: Config, model: str | None, tools: list[str],
                     on_step=None) -> dict:
     cmd = build_cmd(text, cfg, model, tools, system_extra,
                     resume_session_id, max_cost_usd)
-    env = dict(os.environ)
-    if cfg.claude_config_dir:
-        env["CLAUDE_CONFIG_DIR"] = cfg.claude_config_dir
+    env = cli_env(cfg)
 
     # capture before spawn: any output the run writes must post-date this, or a
     # stale prior file could vouch for a run that actually wrote nothing

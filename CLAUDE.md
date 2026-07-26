@@ -136,10 +136,10 @@ before writing from scratch.
   are `--allowedTools` + `--max-budget-usd` + wall-clock timeout.
 - A bare `claude -p` run carries ~$0.15–0.25 notional cost (system-prompt
   overhead) — budget caps below that always trip `error_max_budget_usd`.
-- **No API credentials on this machine** (subscription OAuth only): quick path
-  auto-falls back from Messages API to `claude -p` stream-json
-  (`quick_backend: auto`). Adding `ANTHROPIC_API_KEY` flips it to the
-  low-latency Messages API path with server-side refusal fallbacks.
+- **API credentials**: `.env` (gitignored) is loaded by
+  `mission-dispatcher.service` via `EnvironmentFile=-`. See "Operational notes
+  (Messages API backend)" below — the path is production-ready, but
+  `quick_backend` is **pinned to `claude_cli`** until the account has credit.
 
 ## Operational notes (learned Phase B)
 
@@ -551,6 +551,54 @@ before writing from scratch.
   returns None for "couldn't tell" so it never reads as "definitely unlocked".
   `loginctl lock-session` (no ID) **does** work from that context — verified,
   accidentally, by locking the screen for real 2026-07-26.
+
+## Operational notes (Messages API backend)
+
+- The `messages_api` quick backend had **never executed on this machine** and
+  was missing three things the CLI path provides. Switching to it would have
+  silently dropped all three; all are now implemented and live-verified against
+  the real API (`scripts/smoke_messages_api.py`, 8/8):
+  1. **Memory blocks** — `_stream_api` didn't even take a `context` parameter,
+     so locked decision #4 would have been lost. Now folded into `system`.
+  2. **Conversation continuity** — the API is stateless. `quick.HistoryStore`
+     is the equivalent of the CLI's `--resume` transcript, and deliberately
+     mints/returns a `session_id` so `quick_sessions` and
+     `metadata.resume_session_id` in service.py work **unchanged** for both
+     backends. Bounded per session (`budgets.quick_history_turns`, 6) and
+     LRU-capped across sessions, because every turn is re-sent as input tokens.
+     A refusal is never recorded — replaying it would poison the thread.
+  3. **Barge-in** — `quick.ApiAbort` duck-types the two attributes
+     `Service.cancel`/`shutdown` touch (`returncode`, `kill()`), so decision #7
+     works identically on both backends with no change to either caller.
+- The Anthropic client is **pooled per event loop** (`quick.api_client`,
+  released in `Service.shutdown`). A fresh `AsyncAnthropic` per turn meant a
+  fresh TLS handshake per voice question — measured ~300ms of the TTFT.
+- **Measured 2026-07-27** (same question, same memory context):
+  cost **$0.00051 vs $0.14052** on the CLI — **275x** cheaper, because the CLI
+  pays ~16-18k cache-creation tokens of Claude Code system prompt every cold
+  run. TTFT ~1.5-1.8s vs ~3.2-3.8s — roughly **2x**, not the "sub-second" that
+  was predicted before measuring.
+- **Two traps, both now handled in code:**
+  - An **unusable key** (no credit, revoked) would take the whole quick path
+    down, since `auto` routes to the API the moment the env var exists. A
+    request that fails **before emitting any delta** with a billing/auth error
+    falls through to the CLI transparently, and `disable_api()` puts the API on
+    a 15-minute cooldown so a dud key costs one round-trip per window rather
+    than one per question. Mid-stream failures still raise — half an answer is
+    already spoken, and restarting would repeat it.
+  - The `claude` CLI **prefers `ANTHROPIC_API_KEY` over the claude.ai login**
+    ("claude.ai connectors are disabled because ANTHROPIC_API_KEY … takes
+    precedence"), so an exported key *replaces* the subscription — with an
+    unfunded key every `claude -p` fails outright, and with a funded one CLI
+    runs would silently bill API credit at ~18k system-prompt tokens each.
+    `runner.cli_env` strips `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` from
+    **every** `claude` subprocess (quick and agentic): the CLI path is the
+    subscription path, and code wanting the API uses the API backend.
+- **To switch on**: add credit, then set `quick_backend: auto` in config.yaml
+  and restart. Verify with `set -a; . ./.env; set +a;
+  .venv/bin/python scripts/smoke_messages_api.py`.
+- Note `tools` still force the CLI backend (the API path has no file access),
+  so ask-about-my-screen and any Read-scoped quick task are unaffected either way.
 
 ## Operational notes (browser verification of the dashboard)
 

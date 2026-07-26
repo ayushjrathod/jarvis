@@ -39,7 +39,16 @@ dispatcher:
     meta_task_types: [notify-gate, automation-parse, media-parse]
 
   # messages_api | claude_cli | auto (auto: messages_api if API credentials found)
-  quick_backend: auto
+  #
+  # PINNED to claude_cli 2026-07-27. The API path is now production-ready
+  # (memory blocks, conversation continuity, barge-in — all live-verified), but
+  # the key in .env has **no credit**, so `auto` would spend a doomed
+  # round-trip on the first question of every 15-minute cooldown window before
+  # falling back. Nothing breaks either way: an unusable key degrades to the
+  # CLI automatically. **Flip this to `auto` once the account has credit** —
+  # measured then: $0.00051/question vs $0.14052 on the CLI (275x), TTFT
+  # ~1.5-1.8s vs ~3.2-3.8s.
+  quick_backend: claude_cli
 
   # Quick-path conversation continuity (CLI backend): a follow-up within this
   # window resumes the previous claude session (`claude -p --resume`), so
@@ -55,6 +64,11 @@ dispatcher:
     quick_max_cost_usd: 1.00
     timeout_s: 600                # wall-clock kill for agentic runs
     quick_max_tokens: 1024
+    # messages_api backend only: how many prior exchanges a resumed quick
+    # session replays. The CLI backend keeps its own transcript behind
+    # `--resume`; the Messages API is stateless, so every turn is re-sent as
+    # input tokens — this is the cost/context dial.
+    quick_history_turns: 6
     transient_retry_delay_s: 2    # backoff before the one retry on spawn/timeout error
 
   # Trust boundary (mechanical, not conventional). Only server-internal spawns

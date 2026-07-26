@@ -5,6 +5,12 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=%h/Documents/code/jarvis
+# Optional local secrets (ANTHROPIC_API_KEY). The leading "-" means a missing
+# file is not an error. KEY=value lines only — no `export`, no shell quoting.
+# Note the dispatcher strips these credentials from every `claude` subprocess
+# (runner.cli_env): the CLI path is the SUBSCRIPTION path, and the CLI would
+# otherwise prefer the key over the claude.ai login.
+EnvironmentFile=-%h/Documents/code/jarvis/.env
 ExecStart=%h/Documents/code/jarvis/.venv/bin/python -m dispatcher.main
 Restart=on-failure
 RestartSec=3
