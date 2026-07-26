@@ -442,6 +442,32 @@ before writing from scratch.
   `mimetypes.add_type(".webmanifest")` in main.py keeps the content-type right on
   pre-3.14 interpreters. No new dispatcher routes were needed.
 
+## Operational notes (degraded mode when the plan cap hits)
+
+- The plan-wide session cap took the assistant out twice (sessions 7 and 10):
+  the quick path failed, spoke the reset time, and stayed dead until the
+  window rolled over. `dispatcher/offline.py` now answers from the local
+  Phase F/J index instead — the same hybrid BM25+vector search `/memory/search`
+  runs, **extractive only**: verbatim quotes with the source file named, no
+  generation, because the one thing worse than "I'm rate-limited" is a
+  confident sentence nobody wrote. Config: `memory.offline_fallback` (default
+  true). Internal plumbing sources are excluded — a machine task wants a real
+  failure, not a consolation paragraph it might act on.
+- **The relevance anchor is the load-bearing part.** KNN always returns
+  *something*: asked about "the airspeed velocity of a laden swallow", the
+  index cheerfully handed back its three least-unrelated chunks, which then
+  got quoted as "here's what I already have on it". So a degraded answer is
+  only offered when **BM25 matched a real term** somewhere first; ranking
+  still uses the hybrid path, so vectors keep floating the right chunk up —
+  they just can't conjure a topic from nothing. `<!-- -->` comments are
+  stripped from snippets (USER.md/MEMORY.md open with an editor instruction
+  that otherwise eats the whole quote).
+- The run still settles **failed** (the model call really did fail, and the
+  cost/latency stats stay clean); the `done` SSE payload carries
+  `degraded: true` so a client can label where the text came from.
+- This is the seam a **local model** would plug into later — that needs a
+  dependency and a user decision; this needed neither.
+
 ## Operational notes (desktop control — computer-use T1)
 
 - **Spike first, and it narrowed the tier** (2026-07-26, GNOME/Wayland here).

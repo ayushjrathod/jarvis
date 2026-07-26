@@ -12,8 +12,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import (automations, desktop, graph, limits, memory, notify, quick,
-               reflection, runner, spotify, telemetry)
+from . import (automations, desktop, embeddings, graph, limits, memory, notify,
+               offline, quick, reflection, runner, spotify, telemetry)
 from .areas import AreaRegistry
 from .classifier import classify
 from .config import Config
@@ -394,8 +394,16 @@ class Service:
                         meta["session_id"], time.monotonic())
                 speech = (limits.limit_speech(limit)
                           if final == "failed" and limit else None)
+                # Plan-wide cap: don't just report the outage — answer from the
+                # local index if it holds anything (no model, no generation).
+                degraded = None
+                if final == "failed" and limit and not collected:
+                    degraded = await self._degraded_answer(task, speech)
+                    if degraded:
+                        speech = degraded
+                        yield ("delta", {"text": degraded})
                 self.db.set_task_status(task["id"], final)
-                answer = "".join(collected) or None
+                answer = "".join(collected) or degraded
                 self._capture_episode(task, final, answer)
                 finished = True
                 suppress = self._maybe_notify(task, task_meta, final, answer,
@@ -404,6 +412,7 @@ class Service:
                                 model=label, error=meta.get("error"), speech=speech,
                                 ttft_ms=lat.get("ttft_ms"),
                                 tokens_per_s=lat.get("tokens_per_s"),
+                                **({"degraded": True} if degraded else {}),
                                 **({"surface": False} if suppress else {}))
                 yield ("done", {
                     "task_id": task["id"], "status": final,
@@ -411,6 +420,9 @@ class Service:
                     "error": meta.get("error"), "speech": speech,
                     "ttft_ms": lat.get("ttft_ms"),
                     "tokens_per_s": lat.get("tokens_per_s"),
+                    # tells the client the text it just got came from the local
+                    # index, not from Claude
+                    **({"degraded": True} if degraded else {}),
                 })
                 return
         finally:
@@ -745,6 +757,26 @@ class Service:
             return {"status": "unrecognized",
                     "speech": "I couldn't work out what to do on the desktop."}
         return await self.run_desktop_intent(intent, source)
+
+    async def _degraded_answer(self, task: dict, limit_speech: str | None) -> str | None:
+        """Answer a rate-limited question from the local index instead of
+        dying until the window resets. Off by default for internal plumbing
+        sources — a machine task wants a real failure, not a consolation
+        paragraph it might act on."""
+        if not (self.cfg.memory or {}).get("offline_fallback", True):
+            return None
+        if task["source"] in NO_CONTINUITY_SOURCES:
+            return None
+        try:
+            hits = await asyncio.to_thread(
+                offline.search_memory, self.cfg, self.db, embeddings, task["text"])
+        except Exception:
+            log.exception("offline fallback failed for %s", task["id"])
+            return None
+        log.info("task %s rate-limited; answering from memory (%d hit(s))",
+                 task["id"], len(hits))
+        return offline.compose(limit_speech or "Claude is unavailable right now.",
+                               hits)
 
     def pending_desktop_for(self, source: str) -> str | None:
         """The newest unexpired confirmation parked for this source, if any."""

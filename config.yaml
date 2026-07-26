@@ -99,6 +99,14 @@ dispatcher:
       MEMORY.md: 3200
     index_dirs: [vault]            # ingest walks these for /memory/search
     reindex_on_start: true
+    # When Claude's plan-wide session cap is hit, a quick question falls back
+    # to the local hybrid index and answers EXTRACTIVELY — verbatim quotes with
+    # the source file named, no generation — instead of only reporting the
+    # outage and going dead until the window resets (which is what happened in
+    # sessions 7 and 10). Internal plumbing sources are excluded: a machine
+    # task wants a real failure, not a consolation paragraph. This is also the
+    # seam a local model would plug into later.
+    offline_fallback: true
     # Knowledge graph (Phase J2/J3): nightly fact extraction rides the
     # consolidation export; weekly reconcile timer invalidates duplicates/
     # contradictions (never deletes). Facts surface in /memory/search.
