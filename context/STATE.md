@@ -1,6 +1,55 @@
 # STATE — read me first each session
 
-_Last updated: 2026-07-24 (session 19, end)_
+_Last updated: 2026-07-26 (session 20, end)_
+
+## Session 20 (2026-07-26): cost fix · computer-use T1 · degraded mode · inbox watcher
+
+User asked "what's next" and chose **all four** offered directions. All four
+landed, each committed separately. **407 tests green** (334 → 407).
+Full detail: `context/sessions/2026-07-26-1.md`.
+
+**Session-start finding — the session-17 fix held.** The weekly review that
+session 17 predicted would break on Sunday 07-26 wrote correctly
+(`vault/briefs/week-2026-07-26.md`, fired 22:49 as a catch-up), as did both
+daily briefs. The nightly consolidator also **corrected its own bad memory**
+(rewrote the stale "Write gate blocks everything" MEMORY.md entry). Phone is
+on the tailnet; Spotify creds and the ask-screen keybinding are in place.
+
+1. **`7ba934b` meta-task cost.** CLAUDE.md's "warm resume is nearly free"
+   claim was wrong: only the first notify-gate run ever cost $0.009, the 11
+   since averaged **$0.141**. Measured the causes — resuming a long transcript
+   for a one-line verdict ($0.141 vs $0.103 fresh), and the ~16k-token Claude
+   Code system prompt on every cold `claude -p` making the model rate dominate
+   ($0.103 sonnet vs $0.028 haiku). Fixed both: gate no longer resumes, and
+   `models.meta`/`models.meta_task_types` route notify-gate, automation-parse
+   and media-parse to haiku. `graph-extract` excluded on purpose (its output is
+   graph fact text). Live: **$0.0405 vs $0.189** for the previous real run.
+2. **`90d90dc` computer-use T1.** Spike first — and it **disproved the design
+   doc**: `Shell.Eval` is locked and `Shell.Introspect` returns AccessDenied,
+   so window management needs a shell extension; brightness needs
+   brightnessctl. Both deferred. Shipped `dispatcher/desktop.py` zero-dep
+   (status/volume/mute/lock/launch/open/clipboard) with the §5 safety plane:
+   allow/confirm/deny per verb failing closed, `open` scheme-restricted at the
+   executor (**a test caught `javascript:` passing the guard** — urlparse is
+   the wrong tool for opaque schemes), SSE `confirm` + dashboard ConfirmBar +
+   **voice "yeah"/"nope"** answering.
+3. **`aee97a6` degraded mode.** The plan cap no longer kills the assistant:
+   a rate-limited quick question is answered **extractively** from the local
+   hybrid index. Live testing found the load-bearing detail — KNN always
+   returns something, so a BM25 relevance anchor is required or unrelated
+   chunks get quoted as answers.
+4. **`56d41bb` inbox watcher.** First non-clock trigger: a file landing in
+   `vault/inbox/` is indexed and acknowledged automatically (two-phase settle,
+   seeded first pass, removals reindex without notifying).
+
+**Not built, deliberately: the approval queue.** The surface now exists and is
+reusable, but nothing outbound exists to gate (Gmail is read-only and not
+OAuthed). Wire it to the first real outbound action rather than building it
+speculatively.
+
+**User-side, unchanged:** Gmail OAuth · reboot test (still never run) · phone
+add-to-home-screen · ask-screen/media E2E · dashboard visual pass (the new
+ConfirmBar has not been seen in a browser).
 
 ## Session 19 (2026-07-24): "talk to Jarvis" voice button on the dashboard
 
