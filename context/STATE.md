@@ -42,6 +42,27 @@ on the tailnet; Spotify creds and the ask-screen keybinding are in place.
    `vault/inbox/` is indexed and acknowledged automatically (two-phase settle,
    seeded first pass, removals reindex without notifying).
 
+**Follow-up (`7100ffe`) — closed the three loose ends session 20 flagged:**
+- Removed the 6 **fabricated** task+episode rows my degraded-mode testing left
+  behind (synthetic session-limit failures). They would have been fed to
+  tonight's 02:30 consolidation as real events. Success rate 86.5% → 97.8%;
+  orphan vectors swept; DB backed up first, and the delete asserted every row
+  carried the synthetic error marker before touching anything.
+- **Browser pass via chromium + CDP** (Node built-in WebSocket, zero deps).
+  ConfirmBar verified for real: renders above the grid, Yes/No work, click →
+  executes → resolved row → nothing left parked, wraps fine at 390px. But it
+  exposed a **pre-existing bug**: the CommandBox `Send` button was clipped at
+  phone width, and had been since session 19's mic button. Fixed with
+  `min-width: 0` on the input. **Cache-disable when re-measuring** — the first
+  re-check silently re-tested the cached old stylesheet.
+- **`lock` verb verified** — and next to it, `_status` could *never* report
+  lock state: a systemd **user** service isn't in a login session, so
+  `loginctl show-session self` always failed and the error was swallowed. Now
+  reads the session bus (`ScreenSaver.GetActive`), with None for "couldn't
+  tell". 411 tests green.
+- Also gitignored `.env` — an untracked secrets file was sitting where a
+  `git add -A` would have committed it.
+
 **Not built, deliberately: the approval queue.** The surface now exists and is
 reusable, but nothing outbound exists to gate (Gmail is read-only and not
 OAuthed). Wire it to the first real outbound action rather than building it
