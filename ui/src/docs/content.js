@@ -261,7 +261,7 @@ export const endpoints = [
       { method: "POST", path: "/task/{id}/cancel", summary: "Cancel a queued or running task, killing the subprocess.", params: "—", returns: "{task_id, status}" },
       { method: "GET", path: "/task/{id}/steps", summary: "Full step timeline of an agentic run (init, text, tool_use, tool_result, result).", params: "—", returns: "step rows" },
       { method: "GET", path: "/tasks", summary: "Recent task history with costs.", params: "status, kind, limit (default 50)", returns: "task rows" },
-      { method: "GET", path: "/events", summary: "Live server-sent event feed powering the dashboard.", params: "—", returns: "SSE: queued, started, done, failed, refused, cancelled, requeued, step, notify, automation" },
+      { method: "GET", path: "/events", summary: "Live server-sent event feed powering the dashboard.", params: "—", returns: "SSE: queued, started, done, failed, refused, cancelled, requeued, step, notify, automation, confirm" },
       { method: "GET", path: "/stats", summary: "Tasks by status, cost per source, success rate, quick-path latency, recent reflections.", params: "days (default 7)", returns: "stats object" },
       { method: "GET", path: "/health", summary: "Liveness plus a snapshot of the running configuration.", params: "—", returns: "{status, …}" },
     ],
@@ -299,6 +299,17 @@ export const endpoints = [
       { method: "GET", path: "/automations", summary: "All automations with human-readable schedules.", params: "—", returns: "automation rows" },
       { method: "POST", path: "/automations/{id}/toggle", summary: "Pause or resume; resuming recomputes the next run time.", params: "—", returns: "updated automation" },
       { method: "DELETE", path: "/automations/{id}", summary: "Delete an automation.", params: "—", returns: "{automation_id, status}" },
+    ],
+  },
+  {
+    group: "Media & desktop",
+    id: "api-desktop",
+    items: [
+      { method: "POST", path: "/media", summary: "Deterministic music command — play, pause, skip, what's playing, volume. Drives the local Spotify client over MPRIS; no model involved.", params: "command, source", returns: "{speech}" },
+      { method: "GET", path: "/media/state", summary: "What the local player is doing right now.", params: "—", returns: "player state" },
+      { method: "POST", path: "/desktop", summary: "Deterministic desktop verb — lock, launch an app, open a URL, system volume/mute, read or set the clipboard. A verb whose policy is 'confirm' parks instead of running and returns a confirm_id.", params: "command, source", returns: "{status, speech, confirm_id?}" },
+      { method: "POST", path: "/desktop/confirm", summary: "Answer a parked confirmation. Ids are single-use and expire after confirm_timeout_s.", params: "confirm_id, approve", returns: "{status, speech}" },
+      { method: "GET", path: "/desktop/verbs", summary: "Every desktop verb and its current allow / confirm / deny policy.", params: "—", returns: "{verbs, pending}" },
     ],
   },
   {

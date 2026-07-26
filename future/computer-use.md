@@ -4,6 +4,30 @@ _Drafted 2026-07-23 (session 16). **Exploration only — nothing here is approve
 or built.** Deps named below are NOT installed; all of them need user approval
 per the working-style rule in CLAUDE.md._
 
+> **UPDATE 2026-07-26 (session 20): the spike ran and T1 shipped.**
+> `dispatcher/desktop.py` implements the deterministic tier with zero new
+> dependencies, plus the §5 safety plane (allow/confirm/deny per verb, SSE
+> `confirm` event, dashboard banner, voice yes/no). See CLAUDE.md
+> "Operational notes (desktop control)".
+>
+> **Two T1 verbs in §3 turned out not to be reachable on this box**, which is
+> what the spike was for:
+> - **Window list / focus / close.** `org.gnome.Shell.Eval` → `(false, '')`
+>   (locked since GNOME 41, unsafe-mode only) and
+>   `org.gnome.Shell.Introspect.GetWindows` / `.GetRunningApplications` →
+>   `AccessDenied` (GNOME restricts Introspect to whitelisted callers). Needs a
+>   GNOME shell extension, i.e. a user-installed dependency. **Deferred.**
+> - **Screen brightness.** `org.gnome.SettingsDaemon.Power` exposes only
+>   `.Power.Keyboard` on this version, and
+>   `/sys/class/backlight/intel_backlight/brightness` is root-owned. Needs
+>   `brightnessctl` + a udev rule. **Deferred.**
+>
+> Still open from §7: the API-key question (Q1), the T2/T3 dep approvals (Q2),
+> and whether anything runs unattended (Q3). Q4 (default posture) is answered
+> in code — see the `computer.policy` block in config.yaml and the reasoning
+> in `dispatcher/desktop.py`'s docstring.
+> `grim` was NOT re-tested; ask-screen's portal path already works.
+
 Goal: let the assistant *act on* the desktop, not just read a screenshot of it.
 Today we can see the screen (ask-about-my-screen) and type at the cursor
 (dictation via ydotool) — what's missing is a sanctioned action channel and a

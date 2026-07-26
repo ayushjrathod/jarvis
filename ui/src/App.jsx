@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { subscribeEvents } from "./api.js";
 import { widgets } from "./widgets/index.js";
+import ConfirmBar from "./widgets/ConfirmBar.jsx";
 
 export default function App() {
   // one SSE subscription for the whole app; widgets react to lastEvent
@@ -25,6 +26,7 @@ export default function App() {
           docs →
         </a>
       </header>
+      <ConfirmBar lastEvent={lastEvent} />
       <main className="grid">
         {widgets.map(({ id, title, Component }) => (
           <section key={id} className={`card card-${id}`}>

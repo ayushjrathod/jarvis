@@ -77,7 +77,7 @@ export async function postTask(text, { onDelta, source = "ui", mode, metadata } 
 
 const EVENT_NAMES = ["queued", "started", "done", "failed", "refused", "cancelled",
                      "requeued", "step", "notify", "notify_skipped",
-                     "automation", "automation_created"];
+                     "automation", "automation_created", "confirm"];
 
 export function subscribeEvents(onEvent) {
   const es = new EventSource("/events");

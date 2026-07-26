@@ -33,6 +33,7 @@ Every working session MUST:
 | — | Ask-about-my-screen (`<Super><Alt>a` → portal shot → popup → streamed answer) | **implemented, smoke passing — user E2E pending** (run scripts/setup_ask_screen.sh) |
 | — | Spotify media control ("hey jarvis, play …" → MPRIS, deterministic) | **implemented, 332 tests green — user E2E pending** (run scripts/setup_spotify.sh) |
 | — | Phone access via Tailscale + installable PWA dashboard | **implemented, 334 tests green — user setup pending** (run scripts/setup_tailscale.sh) |
+| K1 | Desktop control (computer-use T1: volume/mute/lock/launch/open/clipboard + allow-confirm-deny safety plane) | **implemented, 382 tests green, live-verified** — window mgmt + brightness deferred (need deps, see notes) |
 
 v2 (phases F–J: memory, learning loop, observability, personal OS, graph) is
 planned in `context/v2-plan.md` (user approved the direction 2026-07-18);
@@ -440,6 +441,56 @@ before writing from scratch.
   `ui/public/` from `/` after `npm run build`; a defensive
   `mimetypes.add_type(".webmanifest")` in main.py keeps the content-type right on
   pre-3.14 interpreters. No new dispatcher routes were needed.
+
+## Operational notes (desktop control — computer-use T1)
+
+- **Spike first, and it narrowed the tier** (2026-07-26, GNOME/Wayland here).
+  `future/computer-use.md` assumed window list/focus/close via GNOME Shell
+  D-Bus; it isn't reachable: `Shell.Eval` returns `(false, '')` (locked since
+  GNOME 41) and `Shell.Introspect.GetWindows`/`.GetRunningApplications` return
+  **AccessDenied**. Screen brightness is out too — this gsd exposes only
+  `.Power.Keyboard`, and `/sys/class/backlight/*/brightness` is root-owned.
+  Both need a dependency (a shell extension / `brightnessctl` + udev), so both
+  are **deferred, not built**. Everything else in T1 shipped.
+- **`dispatcher/desktop.py`** is the sibling of `spotify.py`: pure `detect()`
+  parser → never-raises `run_intent()` → service divert, so `lock the screen`,
+  `open firefox`, `system volume 40`, `what's on my clipboard` reach **no
+  model**, cost nothing, and answer in well under a second. Verbs: status,
+  volume, mute, lock, launch, open, clipboard_get, clipboard_set — all over
+  binaries that were already installed (wpctl / loginctl / gtk-launch /
+  xdg-open / wl-copy / wl-paste). **Zero new dependencies.** Deliberately not
+  an area, for the same reason media control isn't: an area would need Bash to
+  reach the session bus, which `security.privileged_areas` exists to prevent.
+- **Volume phrasing is qualified on purpose.** `spotify.detect` owns bare
+  "volume 40" (player volume) and the media divert runs first, so every desktop
+  volume pattern demands system/master/computer — otherwise the two parsers
+  fight over one sentence.
+- **Safety plane** (`computer.policy` in config.yaml): allow / confirm / deny
+  per verb, failing **closed** — an unknown verb or an unrecognised policy
+  value denies, and an absent/disabled `computer:` block denies everything
+  (which is also what keeps the unit tests side-effect-free). Defaults are
+  *not* "every write verb confirms": these verbs are reversible and low-stakes,
+  and confirming "system volume 40" by voice every time would be worse than no
+  feature. The two that do confirm are `clipboard_get` (the clipboard routinely
+  holds passwords, and it's the one verb that reads user data into a model's
+  context) and `open` (arbitrary URL = exfiltration channel + the obvious
+  prompt-injection payload).
+- **`open` hard-restricts schemes at the executor** (http/https/file), so it
+  holds even if an operator sets `open: allow`. `desktop.scheme_of` is
+  hand-rolled because urlparse is actively wrong here: the dangerous schemes
+  are the *opaque* ones with no "//", so normalizing a bare host by prepending
+  "//" makes urlparse read `javascript:alert(1)` as a host with an empty
+  scheme — i.e. it silently passes the exact input the guard exists to stop.
+  A unit test pins that regression.
+- **Confirmations**: a `confirm` verdict parks the intent (in-memory,
+  `confirm_timeout_s`, 120s) and fires an SSE `confirm` event instead of
+  acting. Answer it two ways — the `ConfirmBar` banner above the dashboard
+  grid, or **a bare "yeah"/"nope" by voice**, which only applies when that
+  same source has one pending (a stray "yes" in conversation routes normally).
+  Ids are single-use; a replay reports expired. A dispatcher restart drops
+  pending confirmations, which is the safe direction to fail.
+- Seams: `POST /desktop {command}`, `POST /desktop/confirm {confirm_id,
+  approve}`, `GET /desktop/verbs` (what the tier can do and under what policy).
 
 ## Operational notes (dashboard "talk to Jarvis" button)
 

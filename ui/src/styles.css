@@ -291,3 +291,34 @@ table.docs-table td.ep code { font-size: 0.85rem; }
 .chip.method-post { background: rgba(63, 185, 108, 0.15); color: var(--ok); }
 .chip.method-delete { background: rgba(224, 93, 93, 0.15); color: var(--bad); }
 .docs-endpoints .chip { margin-right: 0.45rem; }
+
+/* Desktop-verb confirmations (computer-use T1). Above the grid, warn-toned:
+   a blocking question with a timeout, not a status readout. */
+.confirmbar { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem; }
+.confirm-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  background: var(--card);
+  border: 1px solid var(--warn);
+  border-left-width: 4px;
+  border-radius: 10px;
+  padding: 0.7rem 1rem;
+}
+.confirm-row.resolved { border-color: var(--border); color: var(--dim); }
+.confirm-q { font-weight: 600; overflow-wrap: anywhere; }
+.confirm-actions { display: flex; gap: 0.5rem; }
+.confirm-row button {
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  /* tap-sized for the phone PWA, same bar as the CommandBox mic button */
+  padding: 0.45rem 1.1rem;
+  font: inherit;
+  cursor: pointer;
+}
+.confirm-row button:hover { border-color: var(--accent); }
+.confirm-row button.yes { border-color: var(--ok); color: var(--ok); }

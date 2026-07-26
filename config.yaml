@@ -166,6 +166,37 @@ dispatcher:
     market: IN
     search_limit: 5
 
+  # Desktop control (computer-use tier T1 — see future/computer-use.md).
+  # Deterministic verbs only: no pixels, no coordinates, no synthetic input,
+  # and no new dependencies (wpctl / gtk-launch / xdg-open / wl-copy /
+  # loginctl were all already installed). Set enabled: false to turn the whole
+  # surface off — every verb then denies and POST /desktop 503s.
+  #
+  # NOT built, because the 2026-07-26 spike proved they need a dependency on
+  # this GNOME: window list/focus/close (Shell.Eval locked, Shell.Introspect
+  # AccessDenied — needs a shell extension) and screen brightness (no gsd
+  # Screen interface; the sysfs node is root-owned — needs brightnessctl).
+  computer:
+    enabled: true
+    nl_detect: true               # divert desktop phrasing in POST /task (mode=auto)
+    confirm_timeout_s: 120        # unanswered confirmations expire (then deny)
+    # allow → run it; confirm → ask first (SSE `confirm` event + /desktop/confirm);
+    # deny → refuse with a spoken reason. Unknown verbs and unknown values deny.
+    # clipboard_get and open default to confirm: the clipboard routinely holds
+    # passwords, and an arbitrary URL is both an exfiltration channel and the
+    # obvious prompt-injection payload. The rest are reversible and low-stakes,
+    # and confirming "system volume 40" by voice every time would be worse UX
+    # than not having the feature.
+    policy:
+      status: allow
+      volume: allow
+      mute: allow
+      lock: allow
+      launch: allow
+      clipboard_set: allow
+      clipboard_get: confirm
+      open: confirm
+
   # USD per million tokens, for quick-path cost computation (agentic cost comes
   # from the CLI's total_cost_usd). Cached from docs 2026-07-05.
   prices:

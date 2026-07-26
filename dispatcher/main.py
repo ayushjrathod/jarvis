@@ -21,8 +21,8 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import (automations, curator, embeddings, ingest, memory, queue_watcher,
-               spotify, stt, vault)
+from . import (automations, curator, desktop, embeddings, ingest, memory,
+               queue_watcher, spotify, stt, vault)
 from .quick import resolve_backend
 from .config import Config
 from .service import Service, make_ack, resolve_screenshot
@@ -83,6 +83,16 @@ class AutomationIn(BaseModel):
 class MediaIn(BaseModel):
     command: str            # "play bohemian rhapsody", "pause", "volume 40"
     source: str = "api"
+
+
+class DesktopIn(BaseModel):
+    command: str            # "lock the screen", "open firefox", "system volume 40"
+    source: str = "api"
+
+
+class DesktopConfirmIn(BaseModel):
+    confirm_id: str
+    approve: bool = True
 
 
 def create_app(cfg: Config | None = None) -> FastAPI:
@@ -180,6 +190,29 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                 yield sse("done", {"status": "done", "kind": "media"})
 
             return StreamingResponse(media_confirm(), media_type="text/event-stream")
+
+        # Desktop divert (computer-use T1): "lock the screen", "open firefox",
+        # "what's on my clipboard". After the media divert so "play …" stays
+        # with Spotify, and mode=auto only, like the others. A verb whose
+        # policy is "confirm" streams the question instead of acting.
+        # A source with a parked confirmation also diverts on a bare yes/no, so
+        # the question can be answered by voice rather than only by button.
+        ccfg = cfg.computer or {}
+        if (ccfg.get("enabled") and ccfg.get("nl_detect", True)
+                and t.mode == "auto"
+                and (desktop.detect(t.text) is not None
+                     or (svc.pending_desktop_for(t.source)
+                         and desktop.parse_answer(t.text) is not None))):
+            outcome = await svc.desktop_command(t.text, t.source)
+
+            async def desktop_reply():
+                yield sse("task", {"task_id": None, "kind": "desktop"})
+                yield sse("delta", {"text": outcome["speech"]})
+                yield sse("done", {"status": "done", "kind": "desktop",
+                                   "desktop_status": outcome["status"],
+                                   "confirm_id": outcome.get("confirm_id")})
+
+            return StreamingResponse(desktop_reply(), media_type="text/event-stream")
 
         kind, area = svc.route(t.text, t.mode, t.area)
         if kind == "agentic":
@@ -457,6 +490,36 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     async def media_state():
         _require_media()
         return await asyncio.to_thread(spotify.state, cfg)
+
+    # -- desktop control (computer-use T1) ----------------------------------
+
+    def _require_computer():
+        if not (cfg.computer or {}).get("enabled"):
+            raise HTTPException(503, "desktop control is disabled in config.yaml")
+
+    @app.post("/desktop")
+    async def desktop_command(d: DesktopIn):
+        """Same handler the POST /task divert uses, for the UI and scripts.
+        A verb whose policy is 'confirm' returns needs_confirmation + a
+        confirm_id rather than acting; answer it at /desktop/confirm."""
+        _require_computer()
+        if not d.command.strip():
+            raise HTTPException(400, "empty command")
+        return await svc.desktop_command(d.command, d.source)
+
+    @app.post("/desktop/confirm")
+    async def desktop_confirm(c: DesktopConfirmIn):
+        _require_computer()
+        return await svc.confirm_desktop(c.confirm_id, c.approve)
+
+    @app.get("/desktop/verbs")
+    async def desktop_verbs():
+        """What this tier can do and under what policy — the honest surface
+        for the dashboard and for anyone wondering why a verb refused."""
+        _require_computer()
+        return {"verbs": {v: desktop.policy(cfg.computer, v)
+                          for v in sorted(desktop.ALL_VERBS)},
+                "pending": len(svc.pending_desktop)}
 
     # -- learning endpoints (Phase G) ---------------------------------------
 

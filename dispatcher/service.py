@@ -8,11 +8,12 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import (automations, graph, limits, memory, notify, quick, reflection,
-               runner, spotify, telemetry)
+from . import (automations, desktop, graph, limits, memory, notify, quick,
+               reflection, runner, spotify, telemetry)
 from .areas import AreaRegistry
 from .classifier import classify
 from .config import Config
@@ -143,6 +144,10 @@ class Service:
         # of last completed turn). In-memory on purpose — the idle window is
         # minutes, a restart just means one fresh start.
         self.quick_sessions: dict[str, tuple[str, float]] = {}
+        # desktop verbs awaiting a yes/no: confirm_id -> {intent, source,
+        # expires}. In-memory like quick_sessions — a restart cancels pending
+        # confirmations, which is the safe direction to fail.
+        self.pending_desktop: dict[str, dict] = {}
 
     async def fire(self, event: str, task: dict, **extra):
         payload = {
@@ -713,6 +718,91 @@ class Service:
             if intent is None:
                 return "I couldn't work out what to play."
         return await asyncio.to_thread(spotify.run_intent, self.cfg, intent)
+
+    # -- desktop control (computer-use T1) ----------------------------------
+
+    async def desktop_command(self, text: str, source: str) -> dict:
+        """Deterministic desktop verb → {speech, status, confirm_id?}.
+
+        Mirrors media_command, with the safety plane in front: `policy()`
+        decides allow / confirm / deny per verb. A "confirm" verdict parks the
+        intent in `self.pending_desktop` and returns needs_confirmation — the
+        caller surfaces it (SSE `confirm` event + spoken question) and the user
+        answers through `confirm_desktop`. No LLM anywhere on this path.
+        """
+        # A bare "yeah"/"no" answers this source's parked confirmation — that's
+        # what makes the confirm plane usable by voice, where there are no
+        # buttons. Only consulted when that source really has one pending, so a
+        # stray "yes" in conversation can't trigger a desktop verb.
+        cid = self.pending_desktop_for(source)
+        if cid:
+            answer = desktop.parse_answer(text)
+            if answer is not None:
+                return await self.confirm_desktop(cid, answer)
+
+        intent = desktop.detect(text)
+        if intent is None:
+            return {"status": "unrecognized",
+                    "speech": "I couldn't work out what to do on the desktop."}
+        return await self.run_desktop_intent(intent, source)
+
+    def pending_desktop_for(self, source: str) -> str | None:
+        """The newest unexpired confirmation parked for this source, if any."""
+        self._expire_desktop_confirms()
+        hits = [(e["expires"], c) for c, e in self.pending_desktop.items()
+                if e["source"] == source]
+        return max(hits)[1] if hits else None
+
+    async def run_desktop_intent(self, intent, source: str) -> dict:
+        ccfg = self.cfg.computer or {}
+        verdict = desktop.policy(ccfg, intent.verb)
+        if verdict == "deny":
+            log.info("desktop: denied %s (policy)", intent.verb)
+            return {"status": "denied",
+                    "speech": f"I'm not allowed to {intent.describe()}."}
+        if verdict == "confirm":
+            cid = uuid.uuid4().hex[:12]
+            self.pending_desktop[cid] = {
+                "intent": intent, "source": source,
+                "expires": time.monotonic() + ccfg.get("confirm_timeout_s", 120),
+            }
+            self._expire_desktop_confirms()
+            speech = f"Shall I {intent.describe()}?"
+            # no task row backs a desktop verb, so build the event payload
+            # directly rather than going through fire(event, task, …)
+            await self.hooks.fire({
+                "event": "confirm", "task_id": None, "kind": "desktop",
+                "source": source, "text": intent.describe(),
+                "confirm_id": cid, "verb": intent.verb,
+                "description": intent.describe(), "speech": speech,
+            })
+            log.info("desktop: %s awaiting confirmation (%s)", intent.verb, cid)
+            return {"status": "needs_confirmation", "confirm_id": cid,
+                    "speech": speech}
+        speech = await asyncio.to_thread(desktop.run_intent, intent)
+        log.info("desktop: ran %s -> %s", intent.verb, speech[:80])
+        return {"status": "done", "speech": speech}
+
+    async def confirm_desktop(self, confirm_id: str, approve: bool) -> dict:
+        """Answer a parked desktop confirmation. Unknown/expired ids are
+        reported rather than silently executed."""
+        self._expire_desktop_confirms()
+        entry = self.pending_desktop.pop(confirm_id, None)
+        if entry is None:
+            return {"status": "expired",
+                    "speech": "That request already expired."}
+        if not approve:
+            log.info("desktop: user declined %s", entry["intent"].verb)
+            return {"status": "declined", "speech": "Okay, skipping it."}
+        speech = await asyncio.to_thread(desktop.run_intent, entry["intent"])
+        log.info("desktop: confirmed %s -> %s", entry["intent"].verb, speech[:80])
+        return {"status": "done", "speech": speech}
+
+    def _expire_desktop_confirms(self):
+        now = time.monotonic()
+        for cid in [c for c, e in self.pending_desktop.items()
+                    if e["expires"] <= now]:
+            self.pending_desktop.pop(cid, None)
 
     async def _parse_media(self, text: str, source: str) -> "spotify.Intent | None":
         """One quick JSON call → mechanically validated play intent (the
