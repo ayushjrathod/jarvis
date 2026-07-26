@@ -21,7 +21,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import (automations, curator, desktop, embeddings, ingest, memory,
+from . import (automations, curator, desktop, embeddings, inbox, ingest, memory,
                queue_watcher, spotify, stt, vault)
 from .quick import resolve_backend
 from .config import Config
@@ -134,8 +134,10 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                      if (cfg.automations or {}).get("enabled") else None)
         embedder = (asyncio.create_task(_embed_refresh_loop())
                     if embeddings.enabled(cfg) else None)
+        inbox_watcher = (asyncio.create_task(inbox.watch(svc))
+                         if (cfg.inbox or {}).get("enabled") else None)
         yield
-        for t in (watcher, reindex, scheduler, embedder):
+        for t in (watcher, reindex, scheduler, embedder, inbox_watcher):
             if t:
                 t.cancel()
         await svc.shutdown()

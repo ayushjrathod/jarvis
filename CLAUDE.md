@@ -442,6 +442,31 @@ before writing from scratch.
   `mimetypes.add_type(".webmanifest")` in main.py keeps the content-type right on
   pre-3.14 interpreters. No new dispatcher routes were needed.
 
+## Operational notes (inbox watcher — event-driven proactivity)
+
+- Everything proactive before this was **clock**-driven (timers, the
+  automations scheduler). `dispatcher/inbox.py` is the first thing that reacts
+  to the world changing: drop a file in `vault/inbox/` and it's indexed and
+  acknowledged without anyone asking. Config block `inbox:` (enabled, dir,
+  check_interval_s 60, notify, summarize).
+- **Polling, not inotify** — the dispatcher already polls for two other things,
+  a minute of latency is irrelevant for "I saved a file", and inotify would
+  mean a dependency plus watch-descriptor edge cases on a synced directory.
+- **Two-phase settle**: a file fires only when its (mtime, size) is unchanged
+  across two consecutive polls, so a large PDF still being written isn't
+  indexed at half length. The first pass **seeds without firing**, so a restart
+  doesn't re-announce the whole directory.
+- `step()` returns **(arrived, removed)**. Removals trigger a reindex but no
+  notification — without that a deleted file stays searchable until the next
+  restart; arrivals get both.
+- **Deterministic by default**: arrival → reindex + embed + "Indexed X —
+  searchable now" (desktop + SSE `notify`), which costs nothing.
+  `inbox.summarize: true` additionally spends one read-only quick call per file
+  to say what it is — opt-in, because cheap surprises are still surprises.
+- Live-verified: file dropped → picked up on the next poll → reindexed
+  (`added: 1`) → immediately searchable via `/memory/search` with no manual
+  reindex → deletion swept its rows.
+
 ## Operational notes (degraded mode when the plan cap hits)
 
 - The plan-wide session cap took the assistant out twice (sessions 7 and 10):
