@@ -1,6 +1,40 @@
 # STATE — read me first each session
 
-_Last updated: 2026-07-26 (session 20, end)_
+_Last updated: 2026-07-27 (session 21, end)_
+
+## Session 21 (2026-07-27): Messages API backend made production-ready
+
+User opened `.env` (an `ANTHROPIC_API_KEY` was already sitting in it) and asked
+for next steps. **Nothing was reading that file** — no `EnvironmentFile` on the
+unit, the variable absent from the running dispatcher, backend still
+`claude_cli`. Full detail: `context/sessions/2026-07-27-1.md`. **439 tests
+green** (411 → 439). Commit `ce93ea0`.
+
+- **The API backend had never executed here**, and was missing three things the
+  CLI path provides — switching would have silently dropped all three:
+  **memory blocks** (`_stream_api` didn't even take `context`; locked decision
+  #4), **continuity** (now `quick.HistoryStore`, which mints a `session_id` so
+  `quick_sessions`/`resume_session_id` work unchanged on both backends), and
+  **barge-in** (`quick.ApiAbort` duck-types what `Service.cancel` touches;
+  decision #7). Client is now pooled per loop — a fresh TLS handshake per voice
+  question was ~300ms of TTFT.
+- **Measured:** $0.00051/question vs **$0.14052** on the CLI (**275x** — the
+  CLI pays ~16-18k system-prompt tokens per cold run), TTFT ~1.5-1.8s vs
+  ~3.2-3.8s (~2x). The earlier "sub-second" prediction was **wrong**.
+- **Two traps, both found by testing with the real key, both fixed in code:**
+  the key **has no credit**, and `auto` routes to the API the moment the env
+  var exists — so an unusable key would 400 every question (now falls through
+  to the CLI + a 15-min cooldown); and the **`claude` CLI prefers the key over
+  the claude.ai login**, so an exported key *replaces* the subscription
+  (`runner.cli_env` now strips it from every `claude` subprocess).
+- **Wired in but pinned:** the unit loads `.env` via `EnvironmentFile=-`, and
+  **`quick_backend: claude_cli`** deliberately. → **Flip that one line to
+  `auto` once the account has credit**, restart, and verify with
+  `scripts/smoke_messages_api.py`. Until then nothing changes and nothing
+  breaks.
+- **Agentic path verified before the overnight timers** (`cli_env` is on that
+  path too): real agentic run at 01:40 → `done`, correct output, $0.2587 =
+  the subscription path. The 02:30/03:30/07:30 timers are safe.
 
 ## Session 20 (2026-07-26): cost fix · computer-use T1 · degraded mode · inbox watcher
 
