@@ -1,6 +1,41 @@
 # STATE — read me first each session
 
-_Last updated: 2026-07-27 (session 21, end)_
+_Last updated: 2026-07-27 (session 22, end)_
+
+## Session 22 (2026-07-27): API key dropped — subscription only
+
+User: "i will be not adding credits to api key so remove its usage rely on
+claude code." Done — commit `9b949ec`. **415 tests** (439 → 415; the API path
+took 29 tests with it, 4 focused `cli_env` tests replace them).
+
+- **`dispatcher/quick.py` 400 → 163 lines**, one backend. Removed
+  `_stream_api`, `HistoryStore`, `ApiAbort`, the pooled client, the
+  unusable-key fallback/cooldown, `resolve_backend`, the `quick_backend` /
+  `quick_history_turns` config keys, `scripts/smoke_messages_api.py` and
+  `tests/test_quick_api.py`. All recoverable at `ce93ea0`.
+- **Supersedes half of locked decision #2** ("quick Q&A → streaming Messages
+  API"). Substance unchanged (quick streams, agentic runs headless), mechanism
+  changed. Written into CLAUDE.md explicitly, since that decision is otherwise
+  marked do-not-re-evaluate.
+- **`runner.cli_env` kept and now more important** (own test file): the CLI
+  *prefers* an API key over the claude.ai login, so a stray key **replaces**
+  the subscription. The unit lost the `EnvironmentFile` it gained yesterday;
+  `doctor.sh` now flags an exported key as a hazard, not an opportunity.
+  `.env` is untouched on disk (yours, gitignored) but nothing reads it.
+- **Real pre-existing bug found by running the acceptance suite**:
+  `task_types.summarize` granted `Write(vault/**)`, and a bare `Write(path)`
+  rule is **silently ignored** by this CLI — the write is denied. Probed
+  directly: `Write(vault/**)` alone → "I need your permission";
+  adding `Edit(vault/**)` → file written, zero denials. Session 13 (M4)
+  introduced the scoping, session 17's denial detection surfaced it, and the
+  daily-brief agent already had the right form plus a comment. **smoke_phase_a
+  back to 7/7.**
+- Live after restart: key absent from the dispatcher env, quick answer used
+  the memory blocks ("Neovim"), follow-up resumed the session ("spell that
+  backwards" → "mivoeN").
+
+**Next:** computer-use **T2/T3** is the only substantial unbuilt item (see
+`future/computer-use.md`); T3 needs no new dependencies.
 
 ## Session 21 (2026-07-27): Messages API backend made production-ready
 
