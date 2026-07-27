@@ -31,8 +31,8 @@ Every working session MUST:
 | I | v2 personal OS (txt/html/pdf/image ingest + vault/inbox, NL→standing automations, notify-or-not gate) | **implemented incl. PDF/OCR, acceptance passing** (review waived) |
 | J | v2 semantic + graph memory (sqlite-vec hybrid search, bge-small local embeddings, bi-temporal fact graph, weekly reconcile) | **implemented, acceptance passing** (review waived) |
 | — | Ask-about-my-screen (`<Super><Alt>a` → portal shot → popup → streamed answer) | **implemented, smoke passing — user E2E pending** (run scripts/setup_ask_screen.sh) |
-| — | Spotify media control ("hey jarvis, play …" → MPRIS, deterministic) | **implemented, 332 tests green — user E2E pending** (run scripts/setup_spotify.sh) |
-| — | Phone access via Tailscale + installable PWA dashboard | **implemented, 334 tests green — user setup pending** (run scripts/setup_tailscale.sh) |
+| — | Spotify media control ("hey jarvis, play …" → MPRIS, deterministic) | **implemented — user E2E pending** (run scripts/setup_spotify.sh) |
+| — | Phone access via Tailscale + installable PWA dashboard | **implemented, live — user add-to-home-screen pending** |
 | K1 | Desktop control (computer-use T1: volume/mute/lock/launch/open/clipboard + allow-confirm-deny safety plane) | **implemented, live-verified** — window mgmt + brightness deferred (need deps, see notes) |
 | — | Meta-task cost fix (`models.meta` → haiku for gate/parse tasks; notify gate no longer resumes) | **implemented, live-verified** — $0.141 → $0.0405 per gate run |
 | — | Degraded mode (plan-cap failures answered extractively from the local hybrid index) | **implemented, live-verified** |
@@ -40,7 +40,8 @@ Every working session MUST:
 | — | Messages API backend | **built, then REMOVED 2026-07-27** — user is not funding an API key; subscription CLI only (recoverable at `ce93ea0`) |
 | K2 | Computer-use T2 (AT-SPI) / T3 (browser over CDP) | **not started** — T3 needs no new deps; offered and deferred twice |
 
-_Test count as of 2026-07-27: **439**, `.venv/bin/python -m unittest discover tests`._
+_Test count as of 2026-07-27: **415**, `.venv/bin/python -m unittest discover tests`.
+Acceptance: `scripts/smoke_phase_a.sh` 7/7._
 
 v2 (phases F–J: memory, learning loop, observability, personal OS, graph) is
 planned in `context/v2-plan.md` (user approved the direction 2026-07-18);
@@ -205,9 +206,9 @@ before writing from scratch.
 
 - Learning loop: an agentic run finishing 'done' with `num_turns >=
   learning.reflection_min_turns` (12) auto-queues a **reflection** task that
-  resumes the run's CLI session (`--resume`, warm cache — measured $0.019)
-  with `Edit(areas/**)`-scoped tools and the Hermes-derived review prompt in
-  `dispatcher/reflection.py`. "Nothing to save." is a normal outcome.
+  resumes the run's CLI session (`--resume`) with `Edit(areas/**)`-scoped
+  tools and the Hermes-derived review prompt in `dispatcher/reflection.py`.
+  "Nothing to save." is a normal outcome.
   Reflections never reflect, never enter episodes, and never match areas
   (`match_area=False` — the prompt's own text hits area triggers otherwise;
   learned live).
@@ -221,7 +222,13 @@ before writing from scratch.
   empty request distills the source's recent quick conversation (session
   resume). Voice: "learn this as a skill".
 - `claude -p --resume` works from the agentic runner too (same session store
-  as the quick path) — that's what makes reflection nearly free.
+  as the quick path). **It is not, however, "nearly free"** — the original
+  $0.019 measurement never reproduced: two real reflections averaged **$0.108**
+  (see the meta-task cost note under Phase I). Every cold `claude -p` re-sends
+  the ~16-18k-token Claude Code system prompt whether or not it resumes, so the
+  resume buys conversational context, not a cheap run. Reflection is
+  deliberately left on `models.quick`, unlike the gate/parse tasks: it authors
+  skills, so quality outranks the difference.
 
 ## Operational notes (learned Phase H)
 

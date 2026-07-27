@@ -39,6 +39,12 @@ took 29 tests with it, 4 focused `cli_env` tests replace them).
 
 ## Session 21 (2026-07-27): Messages API backend made production-ready
 
+> **SUPERSEDED by session 22 (above): this backend was removed the same day.**
+> Kept because the *measurements* below are still the reference for what the
+> subscription CLI path costs, and because the two traps it documents (a key
+> replacing the subscription; `cli_env`) still apply. **Ignore the
+> "flip to `auto`" instruction** — there is no `quick_backend` setting any more.
+
 User opened `.env` (an `ANTHROPIC_API_KEY` was already sitting in it) and asked
 for next steps. **Nothing was reading that file** — no `EnvironmentFile` on the
 unit, the variable absent from the running dispatcher, backend still
