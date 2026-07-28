@@ -21,11 +21,11 @@ dispatcher:
   stt: { model: small.en, compute: int8, language: en }
 
   models:
-    # quick path: Messages API when credentials exist, else claude -p stream-json
+    # quick path (claude -p stream-json, subscription login)
     quick: claude-sonnet-5
     # explicit so dispatcher runs don't inherit the CLI default (~/.claude-per settings)
     agentic: claude-sonnet-5
-    # passed as --effort on all claude -p runs (quick CLI backend + agentic)
+    # passed as --effort on all claude -p runs (quick + agentic)
     effort: medium
     # refusal fallback (locked decision #3)
     fallback: claude-opus-4-8
@@ -38,19 +38,13 @@ dispatcher:
     meta: claude-haiku-4-5
     meta_task_types: [notify-gate, automation-parse, media-parse]
 
-  # messages_api | claude_cli | auto (auto: messages_api if API credentials found)
-  #
-  # PINNED to claude_cli 2026-07-27. The API path is now production-ready
-  # (memory blocks, conversation continuity, barge-in — all live-verified), but
-  # the key in .env has **no credit**, so `auto` would spend a doomed
-  # round-trip on the first question of every 15-minute cooldown window before
-  # falling back. Nothing breaks either way: an unusable key degrades to the
-  # CLI automatically. **Flip this to `auto` once the account has credit** —
-  # measured then: $0.00051/question vs $0.14052 on the CLI (275x), TTFT
-  # ~1.5-1.8s vs ~3.2-3.8s.
-  quick_backend: claude_cli
+  # The quick path runs `claude -p` on the **Claude Code subscription login**
+  # (claude_config_dir above). The Anthropic Messages API backend was removed
+  # 2026-07-27 — the user is not funding an API key, and a key in the
+  # environment would make the CLI abandon the subscription for it
+  # (runner.cli_env strips them from every subprocess for that reason).
 
-  # Quick-path conversation continuity (CLI backend): a follow-up within this
+  # Quick-path conversation continuity: a follow-up within this
   # window resumes the previous claude session (`claude -p --resume`), so
   # "what about tomorrow?" keeps context. Tracked per source (voice/api/…);
   # 0 disables — every turn starts fresh. Idle-freshness pattern per openclaw
@@ -64,11 +58,6 @@ dispatcher:
     quick_max_cost_usd: 1.00
     timeout_s: 600                # wall-clock kill for agentic runs
     quick_max_tokens: 1024
-    # messages_api backend only: how many prior exchanges a resumed quick
-    # session replays. The CLI backend keeps its own transcript behind
-    # `--resume`; the Messages API is stateless, so every turn is re-sent as
-    # input tokens — this is the cost/context dial.
-    quick_history_turns: 6
     transient_retry_delay_s: 2    # backoff before the one retry on spawn/timeout error
 
   # Trust boundary (mechanical, not conventional). Only server-internal spawns
@@ -97,9 +86,15 @@ dispatcher:
 
   task_types:
     summarize:
-      # Write is path-scoped to the vault: a summary writer has no business
-      # touching source, config, or systemd units (M4).
-      allowed_tools: [Read, Glob, Grep, "Write(vault/**)"]
+      # Path-scoped to the vault: a summary writer has no business touching
+      # source, config, or systemd units (M4).
+      # `Edit(path/**)` is what actually grants the **Write** tool — a bare
+      # `Write(path/**)` rule is silently ignored and the write is denied
+      # (same caveat the daily-brief agent documents; verified again
+      # 2026-07-27 with a direct CLI probe). Scoping this to Write(vault/**)
+      # alone in session 13 broke the summarize task type, and session 17's
+      # denial detection is what finally surfaced it.
+      allowed_tools: [Read, Glob, Grep, "Edit(vault/**)", "Write(vault/**)"]
 
   # Memory (Phase F): raw episode capture + always-in-context blocks + vault
   # search index. Blocks are plain markdown in blocks_dir — edit them freely;
@@ -157,7 +152,7 @@ dispatcher:
   # scheduler submits due rows as normal tasks (source=automation). nl_detect
   # diverts schedule-phrased /task texts into automation creation (one LLM
   # parse, then mechanical validation). notify_gate: finished automation/timer
-  # results pass a quick LLM judgment (resumes the run's session — cheap)
+  # results pass a quick LLM judgment on models.meta (cheap)
   # before being surfaced; SKIP = logged only, and internal task types
   # (reflection, consolidation) are never announced. An empty/absent block
   # disables the whole feature.

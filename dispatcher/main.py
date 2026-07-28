@@ -22,8 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import (automations, curator, desktop, embeddings, inbox, ingest, memory,
-               queue_watcher, spotify, stt, vault)
-from .quick import resolve_backend
+               queue_watcher, quick, spotify, stt, vault)
 from .config import Config
 from .service import Service, make_ack, resolve_screenshot
 
@@ -285,7 +284,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             "status": "ok",
             "db": str(cfg.db_path),
             "queue_dir": str(cfg.queue_dir),
-            "quick_backend": resolve_backend(cfg),
+            "quick_backend": quick.BACKEND,
             "running_tasks": len(svc.bg),
         }
 

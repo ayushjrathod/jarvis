@@ -5,12 +5,9 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=%h/Documents/code/jarvis
-# Optional local secrets (ANTHROPIC_API_KEY). The leading "-" means a missing
-# file is not an error. KEY=value lines only — no `export`, no shell quoting.
-# Note the dispatcher strips these credentials from every `claude` subprocess
-# (runner.cli_env): the CLI path is the SUBSCRIPTION path, and the CLI would
-# otherwise prefer the key over the claude.ai login.
-EnvironmentFile=-%h/Documents/code/jarvis/.env
+# Deliberately NO EnvironmentFile: the quick path runs on the Claude Code
+# subscription login, and an ANTHROPIC_API_KEY in this environment would make
+# the `claude` CLI abandon that login in favour of the key (removed 2026-07-27).
 ExecStart=%h/Documents/code/jarvis/.venv/bin/python -m dispatcher.main
 Restart=on-failure
 RestartSec=3

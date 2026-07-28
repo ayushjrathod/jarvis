@@ -37,7 +37,7 @@ Every working session MUST:
 | — | Meta-task cost fix (`models.meta` → haiku for gate/parse tasks; notify gate no longer resumes) | **implemented, live-verified** — $0.141 → $0.0405 per gate run |
 | — | Degraded mode (plan-cap failures answered extractively from the local hybrid index) | **implemented, live-verified** |
 | — | Inbox watcher (first *event*-driven trigger: file lands in `vault/inbox/` → indexed + announced) | **implemented, live-verified** |
-| — | Messages API backend made production-ready (memory blocks, continuity, barge-in, pooled client) | **implemented, live-verified 8/8 — pinned off pending account credit** |
+| — | Messages API backend | **built, then REMOVED 2026-07-27** — user is not funding an API key; subscription CLI only (recoverable at `ce93ea0`) |
 | K2 | Computer-use T2 (AT-SPI) / T3 (browser over CDP) | **not started** — T3 needs no new deps; offered and deferred twice |
 
 _Test count as of 2026-07-27: **439**, `.venv/bin/python -m unittest discover tests`._
@@ -66,9 +66,12 @@ SQLite schema, and the four voice ABC signatures must be approved by the user.
 
 1. **Single dispatch path** — the dispatcher is the ONLY component that invokes
    Claude. Voice, dashboard, timers, queue files are all clients.
-2. **Quick vs agentic routing** — quick Q&A → streaming Messages API; agentic →
+2. **Quick vs agentic routing** — quick Q&A streams immediately; agentic →
    `claude -p` headless with per-task-type `--allowedTools`, `--max-turns`, spend
    cap. Prefer read-only scopes; never blanket permission-skipping unattended.
+   (The quick path originally streamed via the Messages API; **superseded
+   2026-07-27** — both paths now run `claude -p` on the subscription login. The
+   routing distinction is unchanged; see "Operational notes (Claude auth)".)
 3. **Refusal fallback** — headless `stop_reason: "refusal"` → auto-retry on
    configurable fallback model (default a current Opus/Sonnet), log both attempts.
 4. **Memory** — markdown vault for context/notes/briefs (read natively from
@@ -143,10 +146,9 @@ before writing from scratch.
   are `--allowedTools` + `--max-budget-usd` + wall-clock timeout.
 - A bare `claude -p` run carries ~$0.15–0.25 notional cost (system-prompt
   overhead) — budget caps below that always trip `error_max_budget_usd`.
-- **API credentials**: `.env` (gitignored) is loaded by
-  `mission-dispatcher.service` via `EnvironmentFile=-`. See "Operational notes
-  (Messages API backend)" below — the path is production-ready, but
-  `quick_backend` is **pinned to `claude_cli`** until the account has credit.
+- **Subscription auth only** — no API-key path exists any more (removed
+  2026-07-27). See "Operational notes (Claude auth)" below; a stray
+  `ANTHROPIC_API_KEY` in the environment is actively harmful, and is stripped.
 
 ## Operational notes (learned Phase B)
 
@@ -164,8 +166,8 @@ before writing from scratch.
   itself through speakers. Use headphones or PipeWire echo-cancel
   (`pactl load-module module-echo-cancel`) until tuned.
 - Warm-load times (this CPU): all four models ~3s; STT of a short utterance
-  ~1.1s; TTS starts instantly. Quick-path first delta ~3-5s on the CLI
-  backend (Messages API path will cut this substantially).
+  ~1.1s; TTS starts instantly. Quick-path first delta ~3-5s — that is the
+  floor on this path (the Claude Code system prompt is re-sent every cold run).
 - **Trigger layout (updated 2026-07-22)**: `mission-jarvis` runs `--mode both`
   — "hey jarvis" (wake word) **and hold-`ptt_key`** (default `KEY_RIGHTCTRL`)
   both reach the assistant through the same handler; `mission-dictate` owns
@@ -231,8 +233,7 @@ before writing from scratch.
   old json format did.
 - Quick runs record `ttft_ms` / `itl_p95_ms` / `tokens_per_s` (additive
   `runs` columns via the idempotent MIGRATIONS loop in db.py). First real
-  number: CLI backend TTFT ≈ 2.6s — the Messages API comparison is now
-  measurable, not anecdotal.
+  number: TTFT ≈ 2.6s, and later measurements put it around 3-3.8s.
 - `GET /stats?days=N`: tasks by status, per-source cost, success rate,
   quick-latency averages, recent reflection outcomes. Dashboard
   "Observability" widget renders tiles + a "Jarvis learned" strip
@@ -286,8 +287,9 @@ before writing from scratch.
   validation downstream. Live after the change: $0.0405 vs $0.189 for the
   preceding real gate run. `graph-extract` is deliberately excluded — its
   output is fact text that lands in the knowledge graph. Clearing `models.meta`
-  restores the old routing. **Only an `ANTHROPIC_API_KEY` removes the floor
-  entirely** (the Messages API path carries no Claude Code system prompt).
+  restores the old routing. The floor itself is **permanent** on this path —
+  the Messages API would have avoided it (measured $0.00051 vs $0.14052 a
+  question) but was removed 2026-07-27; `models.meta` is the lever that remains.
 - Internal quick sources (`automation`, `automation-parse`, `notify-gate`)
   are excluded from quick-session continuity — unrelated machine tasks must
   not chain each other's CLI sessions. The gate resumes via metadata
@@ -559,53 +561,33 @@ before writing from scratch.
   `loginctl lock-session` (no ID) **does** work from that context — verified,
   accidentally, by locking the screen for real 2026-07-26.
 
-## Operational notes (Messages API backend)
+## Operational notes (Claude auth — subscription only)
 
-- The `messages_api` quick backend had **never executed on this machine** and
-  was missing three things the CLI path provides. Switching to it would have
-  silently dropped all three; all are now implemented and live-verified against
-  the real API (`scripts/smoke_messages_api.py`, 8/8):
-  1. **Memory blocks** — `_stream_api` didn't even take a `context` parameter,
-     so locked decision #4 would have been lost. Now folded into `system`.
-  2. **Conversation continuity** — the API is stateless. `quick.HistoryStore`
-     is the equivalent of the CLI's `--resume` transcript, and deliberately
-     mints/returns a `session_id` so `quick_sessions` and
-     `metadata.resume_session_id` in service.py work **unchanged** for both
-     backends. Bounded per session (`budgets.quick_history_turns`, 6) and
-     LRU-capped across sessions, because every turn is re-sent as input tokens.
-     A refusal is never recorded — replaying it would poison the thread.
-  3. **Barge-in** — `quick.ApiAbort` duck-types the two attributes
-     `Service.cancel`/`shutdown` touch (`returncode`, `kill()`), so decision #7
-     works identically on both backends with no change to either caller.
-- The Anthropic client is **pooled per event loop** (`quick.api_client`,
-  released in `Service.shutdown`). A fresh `AsyncAnthropic` per turn meant a
-  fresh TLS handshake per voice question — measured ~300ms of the TTFT.
-- **Measured 2026-07-27** (same question, same memory context):
-  cost **$0.00051 vs $0.14052** on the CLI — **275x** cheaper, because the CLI
-  pays ~16-18k cache-creation tokens of Claude Code system prompt every cold
-  run. TTFT ~1.5-1.8s vs ~3.2-3.8s — roughly **2x**, not the "sub-second" that
-  was predicted before measuring.
-- **Two traps, both now handled in code:**
-  - An **unusable key** (no credit, revoked) would take the whole quick path
-    down, since `auto` routes to the API the moment the env var exists. A
-    request that fails **before emitting any delta** with a billing/auth error
-    falls through to the CLI transparently, and `disable_api()` puts the API on
-    a 15-minute cooldown so a dud key costs one round-trip per window rather
-    than one per question. Mid-stream failures still raise — half an answer is
-    already spoken, and restarting would repeat it.
-  - The `claude` CLI **prefers `ANTHROPIC_API_KEY` over the claude.ai login**
-    ("claude.ai connectors are disabled because ANTHROPIC_API_KEY … takes
-    precedence"), so an exported key *replaces* the subscription — with an
-    unfunded key every `claude -p` fails outright, and with a funded one CLI
-    runs would silently bill API credit at ~18k system-prompt tokens each.
-    `runner.cli_env` strips `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` from
-    **every** `claude` subprocess (quick and agentic): the CLI path is the
-    subscription path, and code wanting the API uses the API backend.
-- **To switch on**: add credit, then set `quick_backend: auto` in config.yaml
-  and restart. Verify with `set -a; . ./.env; set +a;
-  .venv/bin/python scripts/smoke_messages_api.py`.
-- Note `tools` still force the CLI backend (the API path has no file access),
-  so ask-about-my-screen and any Read-scoped quick task are unaffected either way.
+- **The Messages API backend was removed 2026-07-27** at the user's direction
+  (they are not funding an API key). `dispatcher/quick.py` is now one backend:
+  `claude -p --output-format stream-json` on the Claude Code **subscription
+  login**. Gone with it: `HistoryStore`, `ApiAbort`, the pooled client, the
+  unusable-key fallback/cooldown, `quick_backend` config, `resolve_backend`,
+  `scripts/smoke_messages_api.py` (~240 lines + 29 tests). Recoverable from
+  git at `ce93ea0` if that ever changes.
+- **This supersedes half of locked decision #2** ("quick Q&A → streaming
+  Messages API"). The decision's substance — quick streams, agentic runs
+  headless — is unchanged; only the mechanism is. Recorded here rather than
+  silently, because that decision is otherwise marked do-not-re-evaluate.
+- **`runner.cli_env` stays, and matters more now.** The `claude` CLI *prefers*
+  an API key over the claude.ai login when one is in the environment and says
+  so ("claude.ai connectors are disabled because ANTHROPIC_API_KEY … takes
+  precedence"). A stray key therefore **replaces** the subscription: an
+  unfunded one breaks every run, a funded one silently bills each ~18k-token
+  cold start to API credit. `cli_env` strips `ANTHROPIC_API_KEY`/
+  `ANTHROPIC_AUTH_TOKEN` from **every** `claude` subprocess, quick and agentic.
+  `mission-dispatcher.service` deliberately has **no** `EnvironmentFile`.
+- The cost floor is therefore permanent: ~16-18k cache-creation tokens of
+  Claude Code system prompt on every cold `claude -p`, ~$0.10-0.14 a question
+  notional, TTFT ~3s. That is what makes `models.meta` (haiku for internal
+  classification work) the one lever that actually moved the number.
+- Costs logged on this path are **notional** — you are on a subscription, not
+  metered billing.
 
 ## Operational notes (browser verification of the dashboard)
 

@@ -144,12 +144,6 @@ class Service:
         # of last completed turn). In-memory on purpose — the idle window is
         # minutes, a restart just means one fresh start.
         self.quick_sessions: dict[str, tuple[str, float]] = {}
-        # Messages API conversation store. The CLI backend keeps its own
-        # transcript behind `--resume`; the API is stateless, so continuity
-        # there needs this. Keyed by the same session ids, so everything above
-        # quick.stream works identically whichever backend is live.
-        self.api_history = quick.HistoryStore(
-            max_turns=cfg.budgets.get("quick_history_turns", 6))
         # desktop verbs awaiting a yes/no: confirm_id -> {intent, source,
         # expires}. In-memory like quick_sessions — a restart cancels pending
         # confirmations, which is the safe direction to fail.
@@ -340,7 +334,6 @@ class Service:
                         tools=q_tools, context=q_context,
                         resume_session_id=resume_id,
                         procs=self.procs, task_id=task["id"],
-                        history=self.api_history,
                     ):
                         if kind == "delta":
                             delta_times.append(time.monotonic())
@@ -982,7 +975,6 @@ class Service:
         return True
 
     async def shutdown(self):
-        await quick.close_api_client()
         for task_id, bg in list(self.bg.items()):
             bg.cancel()
         for proc in self.procs.values():

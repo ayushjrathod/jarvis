@@ -30,7 +30,7 @@ by voice · **phone access** over Tailscale + installable PWA · **inbox
 watcher** (drop a file in `vault/inbox/`, it indexes itself) · **degraded
 mode** (answers from local memory when Claude's plan cap is hit).
 
-**439 tests**, all green. Read `context/STATE.md` for exactly where things
+**415 tests**, all green. Read `context/STATE.md` for exactly where things
 stand; `CLAUDE.md` has the operational notes for every subsystem.
 
 ## One-time setup
@@ -40,9 +40,9 @@ cd ~/Documents/code/jarvis
 
 # 1. Python venv (already created; recreate with:)
 python -m venv .venv
-.venv/bin/pip install fastapi uvicorn pyyaml anthropic \
+.venv/bin/pip install fastapi uvicorn pyyaml \
   sounddevice evdev httpx numpy faster-whisper onnxruntime \
-  openwakeword piper-tts
+  openwakeword piper-tts sqlite-vec fastembed pymupdf rapidocr-onnxruntime jeepney
 
 # 2. Voice models (~90MB total; idempotent)
 ./scripts/setup_voice.sh
@@ -59,14 +59,11 @@ subscription login (`CLAUDE_CONFIG_DIR=~/.claude-per`, set in `config.yaml`).
 **Costs shown in logs are notional** on that path (you're on subscription): a
 quick answer logs ~$0.04–0.14, an agentic task ~$0.25–1.
 
-**Optional API key.** Put `ANTHROPIC_API_KEY=…` in `.env` (gitignored; the
-dispatcher unit loads it) and set `quick_backend: auto` in `config.yaml` — quick
-answers then use the Messages API: measured **$0.00051 vs $0.14052** per
-question (275×, because every cold `claude -p` pays ~16–18k tokens of Claude
-Code system prompt) and roughly half the time-to-first-word. It needs real API
-credit, which is separate from your Claude subscription. Nothing breaks
-without it: an unusable key falls back to the CLI automatically. Verify with
-`set -a; . ./.env; set +a; .venv/bin/python scripts/smoke_messages_api.py`.
+**There is no API-key path** — an Anthropic Messages API backend existed
+briefly and was removed on 2026-07-27. Don't export `ANTHROPIC_API_KEY`: the
+`claude` CLI *prefers* a key over your claude.ai login, so a stray one replaces
+your subscription rather than supplementing it. The dispatcher strips it from
+every `claude` subprocess for exactly that reason.
 
 ## Running
 
@@ -256,11 +253,10 @@ installs as an app, mic and all.
 ## Tests
 
 ```bash
-.venv/bin/python -m unittest discover tests   # 439 unit tests, no network, ~8s
+.venv/bin/python -m unittest discover tests   # 415 unit tests, no network, ~4s
 ./scripts/smoke_phase_a.sh                    # dispatcher acceptance (server must be up)
 .venv/bin/python scripts/smoke_phase_b.py     # voice acceptance, no mic needed
 ./scripts/smoke_ask_screen.sh                 # ask-about-my-screen acceptance
-.venv/bin/python scripts/smoke_messages_api.py   # API backend (needs a funded key)
 ./scripts/doctor.sh                           # read-only health check
 ```
 
@@ -280,8 +276,8 @@ VAD/barge-in tuning. Engines are swappable one-line (e.g. a future Kokoro TTS:
 | Wake word never fires | Check mic is the default source (`wpctl status`); lower `wake_threshold` in config.yaml |
 | Jarvis interrupts itself while speaking | Echo — headphones or PipeWire echo-cancel |
 | Agentic task status `failed`, error `error_max_budget_usd` | Raise `budgets.max_cost_per_task_usd` (a bare `claude -p` already "costs" ~$0.15–0.25 notional) |
-| Quick answers slow | Normal on the CLI backend (~3s to first word). The API backend halves it — see "One-time setup"; needs API credit |
-| Every quick answer suddenly fails | An API key with no credit. Handled automatically (falls back to the CLI, 15-min cooldown), but check `journalctl --user -u mission-dispatcher \| grep messages_api` |
+| Quick answers slow | ~3s to first word is the floor: every cold `claude -p` re-sends the Claude Code system prompt (~16–18k tokens) |
+| Every quick answer suddenly fails | Check for a stray `ANTHROPIC_API_KEY` in the environment — it makes the CLI abandon your subscription login |
 | Jarvis answers but never speaks scheduled results | By design — routine timer/automation successes are gated (`notify-or-not`) and only interesting ones are announced |
 | A file in `vault/inbox/` isn't searchable | Give it ~60s (the watcher waits for the file to stop changing), then check `journalctl --user -u mission-dispatcher \| grep inbox` |
 | Desktop verb says "I'm not allowed to…" | Its policy is `deny` in `config.yaml`'s `computer.policy` block; `GET /desktop/verbs` shows all of them |

@@ -22,7 +22,6 @@ class Config:
     claude_bin: str = "claude"
     claude_config_dir: str | None = None
     models: dict = field(default_factory=dict)
-    quick_backend: str = "auto"
     quick_session_idle_minutes: float = 0.0
     budgets: dict = field(default_factory=dict)
     default_tools: list = field(default_factory=list)
@@ -61,7 +60,6 @@ class Config:
         cfg.claude_bin = d.get("claude_bin", cfg.claude_bin)
         cfg.claude_config_dir = d.get("claude_config_dir")
         cfg.models = d.get("models", {})
-        cfg.quick_backend = d.get("quick_backend", "auto")
         cfg.quick_session_idle_minutes = d.get("quick_session_idle_minutes", 0.0)
         cfg.budgets = d.get("budgets", {})
         cfg.default_tools = (d.get("task_defaults") or {}).get("allowed_tools", [])

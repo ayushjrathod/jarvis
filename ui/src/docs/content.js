@@ -57,7 +57,7 @@ export const guide = [
           "Memory is a markdown vault plus SQLite: files stay readable and editable by hand.",
           "Life areas are plugins — one directory under areas/ with a SKILL.md; adding one needs zero core changes.",
           "Deterministic where it can be — music, desktop control and schedule phrasing are parsed by plain code, so they cost nothing, answer in well under a second, and never hand the model a privileged action. A model is only consulted when the wording is genuinely ambiguous, and even then it just picks words: the action itself stays on the deterministic path.",
-          "Degrades instead of dying — no embeddings means keyword-only search, no API credit means the CLI backend, and a hit rate limit means an extractive answer from local memory rather than silence.",
+          "Degrades instead of dying — no embeddings means keyword-only search, a missing optional dependency means that format is counted rather than indexed, and hitting the rate limit means an extractive answer quoted from local memory rather than silence.",
         ],
       },
       { p: "Reachable from your phone: Tailscale Serve fronts the dispatcher as tailnet HTTPS, so the service itself stays bound to 127.0.0.1, no port is opened and no password exists — only your own devices can reach it. The dashboard installs to the home screen as a PWA." },
@@ -98,7 +98,7 @@ export const guide = [
       {
         code: ".venv/bin/python -m dispatcher.main           # serves 127.0.0.1:8765\n.venv/bin/python -m jarvis.main --mode wake   # voice assistant\n.venv/bin/python -m jarvis.dictate            # hold-F9 dictation\ncd ui && npm run dev                          # UI with hot reload, API proxied",
       },
-      { p: "No API key is required: the dispatcher drives the claude CLI with the subscription login (CLAUDE_CONFIG_DIR=~/.claude-per). Costs shown in logs and on the dashboard are therefore notional. Exporting ANTHROPIC_API_KEY switches quick answers to the lower-latency Messages API." },
+      { p: "No API key is involved: the dispatcher drives the claude CLI with your subscription login (CLAUDE_CONFIG_DIR=~/.claude-per), so costs shown in logs and on the dashboard are notional rather than billed. Do not export ANTHROPIC_API_KEY — the CLI prefers a key over the claude.ai login, so a stray one replaces your subscription instead of adding to it. The dispatcher strips it from every claude subprocess for that reason." },
       { p: "Tests and acceptance smokes:" },
       {
         code: ".venv/bin/python -m unittest discover tests   # unit tests, no network\n./scripts/smoke_phase_a.sh                    # dispatcher (server must be up)\n.venv/bin/python scripts/smoke_phase_b.py     # voice, no mic needed\n./scripts/smoke_ask_screen.sh                 # ask-about-my-screen",
@@ -217,8 +217,7 @@ export const guide = [
           head: ["Block", "Controls"],
           rows: [
             ["dispatcher.models", "quick / agentic / fallback / classifier model ids and effort, plus meta — the cheap model used for internal classification work (notify gate, schedule and music parsing)"],
-            ["dispatcher.quick_backend", "claude_cli (subscription) or messages_api (needs API credit), or auto to pick by whether a key is present"],
-            ["dispatcher.budgets", "per-task spend caps, wall-clock timeout, quick token cap, replayed history turns on the API backend"],
+            ["dispatcher.budgets", "per-task spend caps, wall-clock timeout, quick token cap"],
             ["dispatcher.task_types", "per-task-type tool allowlists (read-only baseline in task_defaults)"],
             ["dispatcher.security", "privileged_areas — the only areas allowed to declare Bash or unscoped writes"],
             ["dispatcher.quick_session_idle_minutes", "how long a follow-up still resumes the previous conversation"],
@@ -252,8 +251,8 @@ export const guide = [
             ["wake word never fires", "check the default mic (wpctl status) and lower wake_threshold; the journal logs near-miss scores"],
             ["Jarvis interrupts itself while speaking", "echo — use headphones or load module-echo-cancel"],
             ["task failed with error_max_budget_usd", "raise budgets.max_cost_per_task_usd; a bare claude -p already costs ~$0.15–0.25 notional"],
-            ["quick answers feel slow", "normal on the CLI backend (~3s to first word). The Messages API backend roughly halves it and costs far less per question, but needs API credit — put the key in .env and set quick_backend: auto"],
-            ["every quick answer suddenly fails", "usually an API key with no credit. It's handled — the dispatcher falls back to the CLI and stops retrying the API for 15 minutes — but check the journal for “messages_api disabled”"],
+            ["quick answers feel slow", "~3s to the first word is the floor here: every cold claude -p run re-sends the Claude Code system prompt. Jarvis speaks sentence by sentence as the answer streams, so it feels quicker than it measures"],
+            ["every quick answer suddenly fails", "check for a stray ANTHROPIC_API_KEY in the environment: the claude CLI prefers a key over your claude.ai login, so one replaces your subscription. The dispatcher strips it from its own subprocesses, but a hand-run dispatcher inherits your shell"],
             ["ui not built (404 on /ask or /system-docs)", "cd ui && npm run build"],
             ["running tasks stuck after a restart", "they're marked failed as orphans on the next startup; resubmit"],
             ["a desktop command refuses", "its policy is deny in the computer.policy block; GET /desktop/verbs lists every verb and its current setting"],

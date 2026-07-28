@@ -111,25 +111,27 @@ else
   warn "missing desktop binaries:$missing (those verbs will refuse politely)"
 fi
 
-hdr "─── quick-path backend ───"
-# The CLI path needs no key. An API key that is present but unfunded is the
-# trap that cost session 21 an evening: `auto` routes to it, every question
-# 400s, and the CLI would ALSO break because the CLI prefers the key over the
-# claude.ai login (the dispatcher strips it from subprocesses to prevent that).
-backend=$(sed -n 's/^ *quick_backend: *\([a-z_]*\).*/\1/p' config.yaml | head -1)
-[ -n "$backend" ] && ok "quick_backend: $backend" || warn "quick_backend not set in config.yaml"
-if [ -f .env ] && grep -q '^[[:space:]]*ANTHROPIC_API_KEY=' .env 2>/dev/null; then
-  ok "ANTHROPIC_API_KEY present in .env"
-  if git check-ignore -q .env 2>/dev/null; then
-    ok ".env is gitignored"
-  else
-    bad ".env is NOT gitignored — it holds a secret"
-  fi
-  if [ "$backend" = "claude_cli" ]; then
-    warn "key present but backend pinned to claude_cli (set quick_backend: auto once the account has API credit)"
-  fi
+hdr "─── claude auth ───"
+# The quick and agentic paths both run `claude -p` on the SUBSCRIPTION login.
+# An ANTHROPIC_API_KEY in the environment makes the CLI abandon that login for
+# the key, so a stray one is a hazard, not a bonus. runner.cli_env strips it
+# from every subprocess, but flag it so the surprise is visible.
+if [ -n "${ANTHROPIC_API_KEY:-}${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+  warn "an API key is exported in this shell — harmless (stripped from claude subprocesses) but unused"
 else
-  ok "no API key — running on the subscription CLI path (that is fine)"
+  ok "no API key in the environment"
+fi
+if [ -f .env ] && grep -q '^[[:space:]]*ANTHROPIC_' .env 2>/dev/null; then
+  if git check-ignore -q .env 2>/dev/null; then
+    warn ".env holds an API credential but nothing loads it (unused since 2026-07-27); it is gitignored"
+  else
+    bad ".env holds an API credential and is NOT gitignored"
+  fi
+fi
+if [ -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude-per}" ]; then
+  ok "claude config dir present (${CLAUDE_CONFIG_DIR:-$HOME/.claude-per})"
+else
+  bad "claude config dir missing — the dispatcher cannot authenticate"
 fi
 
 hdr "─── phone access (tailscale) ───"
