@@ -36,6 +36,29 @@ green** (411 → 439). Commit `ce93ea0`.
   path too): real agentic run at 01:40 → `done`, correct output, $0.2587 =
   the subscription path. The 02:30/03:30/07:30 timers are safe.
 
+**Docs audit (`35cf466`) — every doc now matches the code.** README was badly
+stale (dashboard "not built yet", "31 unit tests", **F9 documented as
+push-to-talk** when it's been dictation since session 15); the in-app
+`/system-docs` page had the same wrong trigger layout plus a notify-gate
+paragraph describing the resume removed the day before; `vault/inbox/README.md`
+predated the watcher; the feature-gap doc's open decisions are resolved.
+**All 32 dispatcher routes verified documented** (diffed mechanically).
+`scripts/doctor.sh` gained checks for desktop binaries, the quick-path backend
+(unfunded key, `.env` gitignored) and Tailscale.
+
+- **That last check immediately found a real bug**: `mission-tailscale-serve`
+  had been **dead for a day** — at boot it ran while tailscaled was still in
+  `NoState` and exited 1, and a `oneshot` with no restart stays down.
+  `After=tailscaled.service` orders against the unit *starting*, not the daemon
+  being *ready* (same shape as the session-8 boot race). Fixed with an
+  `ExecStartPre` readiness wait. Phone access never actually broke — `serve
+  --bg` persists the mapping in tailscaled's own state — so the exposure was a
+  fresh boot after a state reset.
+- **Overnight timers verified on the new haiku routing** (fired as catch-up at
+  12:59 when the box woke): brief written, consolidation updated MEMORY.md, and
+  the **notify gate ran on haiku at $0.0493** vs $0.126–0.189 before. Session
+  20's cost fix is confirmed working unattended.
+
 ## Session 20 (2026-07-26): cost fix · computer-use T1 · degraded mode · inbox watcher
 
 User asked "what's next" and chose **all four** offered directions. All four
