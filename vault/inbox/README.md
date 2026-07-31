@@ -1,8 +1,13 @@
 # Inbox — drop exports here to make them searchable
 
-Anything dropped in this directory gets indexed into `/memory/search` on the
-next dispatcher start or `POST /memory/reindex` (ask Jarvis to "reindex the
-vault").
+Anything dropped in this directory is **indexed automatically, within about a
+minute** — the dispatcher watches this folder and reacts when a file lands
+(you'll get a "Indexed … — searchable now" notification). It waits for the
+file to stop changing first, so a large PDF still downloading isn't indexed
+half-written.
+
+You can still force a pass with `POST /memory/reindex` (or ask Jarvis to
+"reindex the vault"), and everything here is re-checked on dispatcher start.
 
 Supported:
 
@@ -18,5 +23,11 @@ Supported:
 Still unsupported: `.docx` / `.doc` / `.gif` — counted as `dep_gated` in the
 reindex stats.
 
-Files are indexed in place — nothing is moved or renamed. Delete a file and
-its entries disappear on the next reindex.
+Files are indexed in place — nothing is moved or renamed. Delete one and its
+entries disappear on the next pass (the watcher notices removals too, it just
+doesn't announce them).
+
+Config lives under `dispatcher.inbox` in `config.yaml`: `check_interval_s`
+(60), `notify`, and `summarize` — the last is **off** by default, since
+summarising each new file costs one model call; turn it on and Jarvis will
+also tell you what the file *is*.

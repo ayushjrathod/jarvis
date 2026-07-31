@@ -2,8 +2,8 @@
 
 Local-first personal "life OS" on Arch Linux: a dispatcher service that owns
 every Claude invocation, with **Jarvis** (fully local voice assistant) and a
-React dashboard (Phase D, not built yet) as front-ends. Everything runs on
-this machine — models on CPU, no cloud scheduling.
+React dashboard as front-ends. Everything runs on this machine — models on
+CPU, no cloud scheduling.
 
 > Dir is named `jarvis/` but it's the monorepo root; the voice code lives in
 > the `jarvis/` subdirectory. Project spec + phase tracker: `CLAUDE.md`.
@@ -18,6 +18,20 @@ this machine — models on CPU, no cloud scheduling.
 | C | Tasks area + daily brief + weekly review timers | ✅ |
 | D | React dashboard (served by the dispatcher) | ✅ |
 | E | systemd services + install script + nightly backup | ✅ — **reboot test pending** |
+| F | Memory: episode capture, core blocks, vault index, nightly consolidation | ✅ |
+| G | Learning loop: reflection on complex runs, skill telemetry, `/learn` | ✅ |
+| H | Observability: run-step timeline, TTFT/latency, `/stats`, dashboard X-ray | ✅ |
+| I | Personal OS: pdf/image/html ingest, NL→automations, notify-or-not gate | ✅ |
+| J | Semantic + graph memory: vector search, bi-temporal fact graph | ✅ |
+| K1 | Desktop control: volume/lock/launch/open/clipboard + confirm gate | ✅ |
+
+Also shipped: **ask about my screen** (`<Super><Alt>a`) · **Spotify control**
+by voice · **phone access** over Tailscale + installable PWA · **inbox
+watcher** (drop a file in `vault/inbox/`, it indexes itself) · **degraded
+mode** (answers from local memory when Claude's plan cap is hit).
+
+**439 tests**, all green. Read `context/STATE.md` for exactly where things
+stand; `CLAUDE.md` has the operational notes for every subsystem.
 
 ## One-time setup
 
@@ -42,9 +56,17 @@ sudo chmod g+rw /dev/uinput && sudo modprobe -r uinput && sudo modprobe uinput
 
 No API key needed — the dispatcher drives the `claude` CLI with your
 subscription login (`CLAUDE_CONFIG_DIR=~/.claude-per`, set in `config.yaml`).
-If you ever export `ANTHROPIC_API_KEY`, quick answers automatically switch to
-the lower-latency Messages API. **Costs shown in logs are notional** (you're
-on subscription): a quick answer logs ~$0.04–0.10, an agentic task ~$0.40–1.
+**Costs shown in logs are notional** on that path (you're on subscription): a
+quick answer logs ~$0.04–0.14, an agentic task ~$0.25–1.
+
+**Optional API key.** Put `ANTHROPIC_API_KEY=…` in `.env` (gitignored; the
+dispatcher unit loads it) and set `quick_backend: auto` in `config.yaml` — quick
+answers then use the Messages API: measured **$0.00051 vs $0.14052** per
+question (275×, because every cold `claude -p` pays ~16–18k tokens of Claude
+Code system prompt) and roughly half the time-to-first-word. It needs real API
+credit, which is separate from your Claude subscription. Nothing breaks
+without it: an unusable key falls back to the CLI automatically. Verify with
+`set -a; . ./.env; set +a; .venv/bin/python scripts/smoke_messages_api.py`.
 
 ## Running
 
@@ -151,6 +173,38 @@ new task for me" works. Task files live in `vault/tasks/`, briefs in
 in Claude Code (`claude-per mcp add gmail …` + OAuth). The brief agent uses it
 automatically when present and silently skips email when not.
 
+### Memory
+
+Jarvis remembers. Say "remember that …" or just talk to it: every settled
+interaction becomes an episode, and a **nightly agent (02:30)** distils the
+durable facts into `vault/memory/USER.md` and `MEMORY.md`, which are injected
+into every prompt afterwards. Ask "what do you remember about …" to check.
+Search is hybrid — keyword **and** meaning (`GET /memory/search?q=…`), over the
+whole vault plus a bi-temporal fact graph that supersedes old facts instead of
+deleting them. Edit the two block files by hand whenever you like.
+
+### Automations
+
+Say or type a schedule and it becomes a standing job: *"every morning at 8,
+tell me the weather"*. One cheap parse, then an in-dispatcher scheduler runs
+it. Manage them from the dashboard widget or `GET /automations`. Results are
+**gated** — a "notify-or-not" check decides whether a run is worth
+interrupting you for, so routine successes stay quiet.
+
+### Ask about my screen
+
+Press **`<Super><Alt>a`**, drag a box, and a small popup opens where you can
+type or speak a question about what you just captured; the answer streams back
+and follow-ups keep the image in context. One-time: `./scripts/setup_ask_screen.sh`.
+
+### From your phone
+
+`./scripts/setup_tailscale.sh` (after `sudo pacman -S tailscale`) puts the
+dashboard on your tailnet over HTTPS — no public port, no password, only your
+own devices. Paste the `public_hosts` line it prints into `config.yaml`,
+restart, then open the URL on your phone and **Add to Home Screen**: it
+installs as an app, mic and all.
+
 ### Jarvis by hand (voice, dev)
 
 ```bash
@@ -162,16 +216,34 @@ automatically when present and silently skips email when not.
 **What to expect:**
 
 - Startup loads all models warm — ~3–5s, then "jarvis is up".
-- **PTT:** hold **F9**, speak, release. **Wake:** say **"hey jarvis"**, pause,
-  speak; it stops listening after ~0.9s of silence.
+- **Two triggers, both reach the assistant.** **Wake:** say **"hey jarvis"**,
+  pause, speak; it stops listening after ~0.9s of silence. **Push-to-talk:**
+  hold **Right Ctrl**, speak, release (a beep marks each edge; no silence
+  detection needed — the key release *is* the endpoint).
+- **F9 is dictation, not the assistant** — hold it and your speech is typed at
+  the cursor (`mission-dictate`). The two keys must differ: both services read
+  the raw evdev stream, so sharing one would fire both at once.
 - Quick questions: answer is spoken sentence-by-sentence as it streams.
   First audio ~4–6s after you finish speaking (CLI backend; ~1s transcription
-  + ~3–5s to first model output). An API key would roughly halve this.
+  + ~3–5s to first model output). The API backend roughly halves the model
+  part — see "One-time setup".
 - Long/agentic asks ("summarize my notes…"): you hear **"On it — …"**
   immediately, then a spoken **"Done: …"** when it finishes minutes later.
-- **Barge-in:** talk over Jarvis and it shuts up within ~200ms and aborts the
-  request. ⚠️ With speakers the mic hears Jarvis itself — use headphones, or:
-  `pactl load-module module-echo-cancel` and select the echo-cancel source.
+- **Barge-in:** talk over Jarvis (or press Right Ctrl) and it shuts up within
+  ~200ms and aborts the request. ⚠️ With speakers the mic hears Jarvis itself —
+  use headphones, or: `pactl load-module module-echo-cancel` and select the
+  echo-cancel source.
+- **Music:** "play <song>", "pause", "skip", "what's playing", "volume 40" go
+  straight to the local Spotify client — no model, no cost, under a second.
+  Song lookup by name needs `./scripts/setup_spotify.sh` once (free app
+  registration; **no Premium required**); transport works without it.
+- **The desktop:** "lock the screen", "open firefox", "system volume 40",
+  "what's on my clipboard" — also deterministic. Reading the clipboard and
+  opening a URL ask first ("Shall I …?"); answer by saying **yes/no**, or click
+  the banner at the top of the dashboard.
+- **Rate limited?** If Claude's plan-wide session cap is hit, Jarvis says so
+  *and* answers from its own indexed memory where it can — quoting the vault
+  verbatim with the source named, rather than going silent until the reset.
 
 ### Dictation mode (your original workflow)
 
@@ -184,9 +256,12 @@ automatically when present and silently skips email when not.
 ## Tests
 
 ```bash
-.venv/bin/python -m unittest discover tests   # 31 unit tests, no network
+.venv/bin/python -m unittest discover tests   # 439 unit tests, no network, ~8s
 ./scripts/smoke_phase_a.sh                    # dispatcher acceptance (server must be up)
 .venv/bin/python scripts/smoke_phase_b.py     # voice acceptance, no mic needed
+./scripts/smoke_ask_screen.sh                 # ask-about-my-screen acceptance
+.venv/bin/python scripts/smoke_messages_api.py   # API backend (needs a funded key)
+./scripts/doctor.sh                           # read-only health check
 ```
 
 ## Configuration — `config.yaml`
@@ -205,17 +280,25 @@ VAD/barge-in tuning. Engines are swappable one-line (e.g. a future Kokoro TTS:
 | Wake word never fires | Check mic is the default source (`wpctl status`); lower `wake_threshold` in config.yaml |
 | Jarvis interrupts itself while speaking | Echo — headphones or PipeWire echo-cancel |
 | Agentic task status `failed`, error `error_max_budget_usd` | Raise `budgets.max_cost_per_task_usd` (a bare `claude -p` already "costs" ~$0.15–0.25 notional) |
-| Quick answers slow | Normal on the CLI backend; export `ANTHROPIC_API_KEY` for the fast path |
+| Quick answers slow | Normal on the CLI backend (~3s to first word). The API backend halves it — see "One-time setup"; needs API credit |
+| Every quick answer suddenly fails | An API key with no credit. Handled automatically (falls back to the CLI, 15-min cooldown), but check `journalctl --user -u mission-dispatcher \| grep messages_api` |
+| Jarvis answers but never speaks scheduled results | By design — routine timer/automation successes are gated (`notify-or-not`) and only interesting ones are announced |
+| A file in `vault/inbox/` isn't searchable | Give it ~60s (the watcher waits for the file to stop changing), then check `journalctl --user -u mission-dispatcher \| grep inbox` |
+| Desktop verb says "I'm not allowed to…" | Its policy is `deny` in `config.yaml`'s `computer.policy` block; `GET /desktop/verbs` shows all of them |
 
 ## Layout
 
 ```
 dispatcher/   FastAPI service — the ONLY thing that calls Claude
-jarvis/       voice: plugins/ (ABCs), engines/, main.py, dictate.py
-vault/        markdown memory (notes/, tasks/, briefs/)
+jarvis/       voice: plugins/ (ABCs), engines/, main.py, dictate.py, ask_screen.py
+areas/        life areas as skills (tasks/, memory/, learn/) — one dir each
+ui/           React SPA + PWA (src/, public/, dist/ is committed and served)
+vault/        markdown memory (notes/, tasks/, briefs/, memory/, inbox/)
 queue/        drop-a-.md-file task queue
-data/         SQLite (mission.db) + voice models
-scripts/      setup_voice.sh, smoke tests
+data/         SQLite (mission.db), backups, voice + embedding models
+systemd/      user units and timers + install.sh
+scripts/      setup_*.sh, smoke tests, doctor.sh
 context/      STATE.md + session logs (read STATE.md first, always)
+future/       researched-but-unbuilt proposals (computer use, feature gaps)
 references/   cloned reference repos (gitignored)
 ```

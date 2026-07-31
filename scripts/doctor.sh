@@ -98,6 +98,61 @@ else
   warn "spotify client not running (it's launched on demand by a play command)"
 fi
 
+hdr "─── desktop control (computer-use T1) ───"
+# every verb shells out to one of these; all ship with the base system, so a
+# missing one means something was removed rather than never installed
+missing=""
+for b in wpctl loginctl gtk-launch xdg-open wl-copy wl-paste gdbus; do
+  command -v "$b" >/dev/null 2>&1 || missing="$missing $b"
+done
+if [ -z "$missing" ]; then
+  ok "all desktop-control binaries present"
+else
+  warn "missing desktop binaries:$missing (those verbs will refuse politely)"
+fi
+
+hdr "─── quick-path backend ───"
+# The CLI path needs no key. An API key that is present but unfunded is the
+# trap that cost session 21 an evening: `auto` routes to it, every question
+# 400s, and the CLI would ALSO break because the CLI prefers the key over the
+# claude.ai login (the dispatcher strips it from subprocesses to prevent that).
+backend=$(sed -n 's/^ *quick_backend: *\([a-z_]*\).*/\1/p' config.yaml | head -1)
+[ -n "$backend" ] && ok "quick_backend: $backend" || warn "quick_backend not set in config.yaml"
+if [ -f .env ] && grep -q '^[[:space:]]*ANTHROPIC_API_KEY=' .env 2>/dev/null; then
+  ok "ANTHROPIC_API_KEY present in .env"
+  if git check-ignore -q .env 2>/dev/null; then
+    ok ".env is gitignored"
+  else
+    bad ".env is NOT gitignored — it holds a secret"
+  fi
+  if [ "$backend" = "claude_cli" ]; then
+    warn "key present but backend pinned to claude_cli (set quick_backend: auto once the account has API credit)"
+  fi
+else
+  ok "no API key — running on the subscription CLI path (that is fine)"
+fi
+
+hdr "─── phone access (tailscale) ───"
+if command -v tailscale >/dev/null 2>&1; then
+  if tailscale status >/dev/null 2>&1; then
+    ok "tailscale up"
+    if systemctl --user is-active --quiet mission-tailscale-serve 2>/dev/null; then
+      ok "mission-tailscale-serve active"
+    else
+      warn "mission-tailscale-serve not active (dashboard not reachable from the phone)"
+    fi
+    if grep -q 'public_hosts' config.yaml && ! grep -q 'public_hosts: *\[\] *$' config.yaml; then
+      ok "security.public_hosts set (the origin guard trusts your tailnet name)"
+    else
+      warn "security.public_hosts empty — phone POSTs would be rejected by the origin guard"
+    fi
+  else
+    warn "tailscale installed but not up (run scripts/setup_tailscale.sh)"
+  fi
+else
+  ok "tailscale not installed (phone access optional)"
+fi
+
 hdr "─── systemd timers ───"
 # derive the list from the shipped unit files so a new timer can't be silently
 # missed by a stale hardcoded list

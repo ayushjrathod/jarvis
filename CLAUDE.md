@@ -33,7 +33,14 @@ Every working session MUST:
 | — | Ask-about-my-screen (`<Super><Alt>a` → portal shot → popup → streamed answer) | **implemented, smoke passing — user E2E pending** (run scripts/setup_ask_screen.sh) |
 | — | Spotify media control ("hey jarvis, play …" → MPRIS, deterministic) | **implemented, 332 tests green — user E2E pending** (run scripts/setup_spotify.sh) |
 | — | Phone access via Tailscale + installable PWA dashboard | **implemented, 334 tests green — user setup pending** (run scripts/setup_tailscale.sh) |
-| K1 | Desktop control (computer-use T1: volume/mute/lock/launch/open/clipboard + allow-confirm-deny safety plane) | **implemented, 382 tests green, live-verified** — window mgmt + brightness deferred (need deps, see notes) |
+| K1 | Desktop control (computer-use T1: volume/mute/lock/launch/open/clipboard + allow-confirm-deny safety plane) | **implemented, live-verified** — window mgmt + brightness deferred (need deps, see notes) |
+| — | Meta-task cost fix (`models.meta` → haiku for gate/parse tasks; notify gate no longer resumes) | **implemented, live-verified** — $0.141 → $0.0405 per gate run |
+| — | Degraded mode (plan-cap failures answered extractively from the local hybrid index) | **implemented, live-verified** |
+| — | Inbox watcher (first *event*-driven trigger: file lands in `vault/inbox/` → indexed + announced) | **implemented, live-verified** |
+| — | Messages API backend made production-ready (memory blocks, continuity, barge-in, pooled client) | **implemented, live-verified 8/8 — pinned off pending account credit** |
+| K2 | Computer-use T2 (AT-SPI) / T3 (browser over CDP) | **not started** — T3 needs no new deps; offered and deferred twice |
+
+_Test count as of 2026-07-27: **439**, `.venv/bin/python -m unittest discover tests`._
 
 v2 (phases F–J: memory, learning loop, observability, personal OS, graph) is
 planned in `context/v2-plan.md` (user approved the direction 2026-07-18);

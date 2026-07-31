@@ -9,10 +9,22 @@ Requires=mission-dispatcher.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# `After=tailscaled.service` only orders against the unit STARTING, not against
+# the daemon being ready to answer — at boot on 2026-07-26 this unit ran while
+# the backend was still in NoState, `tailscale serve` exited 1, and the oneshot
+# stayed dead for a day. Same shape as the session-8 boot race where a timer
+# fired before the dispatcher had bound its port, and the same fix: wait for
+# readiness rather than assume it. Up to 60s, then give up so a genuinely
+# broken tailscaled still surfaces as a failure.
+ExecStartPre=/usr/bin/bash -c 'for i in $(seq 1 30); do \
+  tailscale status --json 2>/dev/null | grep -q "\\"BackendState\\": *\\"Running\\"" && exit 0; \
+  sleep 2; done; echo "tailscaled not Running after 60s" >&2; exit 1'
 # Publish the loopback dispatcher on the tailnet as HTTPS:443. Prerequisites
 # (done by scripts/setup_tailscale.sh): tailscaled up, HTTPS/MagicDNS enabled in
 # the admin console, and this user set as a Tailscale operator so `serve` runs
 # without sudo. --bg persists the mapping in the daemon; the oneshot then exits.
+# That persistence is why phone access kept working even while this unit was
+# dead — the mapping lives in tailscaled's own state, not in this service.
 ExecStart=/usr/bin/tailscale serve --bg --https=443 http://127.0.0.1:8765
 ExecStop=/usr/bin/tailscale serve --https=443 off
 

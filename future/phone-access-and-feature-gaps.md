@@ -39,12 +39,15 @@ which is precisely the part this repo already has.
 | Ingest/RAG over own files | Phase I | done |
 | Scheduled automations + notify gate | Phase I | done |
 | Email/calendar awareness | Gmail MCP unstarted (OAuth pending), no calendar | **gap** (user dropped for now) |
-| **Reach from phone** | 127.0.0.1 only | **gap — this doc's subject** |
-| Event-driven proactivity | time-triggered only | gap |
-| Approval queue for outbound actions | read-only scopes, no HITL surface | gap |
-| Model fallback when the plan cap hits | dead until reset (hit twice, sessions 7/10) | gap |
-| Browser / computer use | none | optional |
+| **Reach from phone** | ~~127.0.0.1 only~~ → Tailscale + PWA, live | **closed** (session 18) |
+| Event-driven proactivity | ~~time-triggered only~~ → inbox watcher | **closed** (session 20) |
+| Approval queue for outbound actions | confirm plane built (SSE + banner + voice); nothing outbound to gate yet | surface ready, **deliberately unbuilt** |
+| Model fallback when the plan cap hits | ~~dead until reset~~ → extractive answers from the local index; API backend ready | **closed** (session 20/21) |
+| Browser / computer use | T1 desktop control live; T2/T3 unbuilt | partly done |
 | Planner / complexity tiers | H4, deliberately unbuilt | optional |
+
+_Status column updated 2026-07-27; the original verdicts are struck through
+rather than removed, since the rest of this doc argues from them._
 
 **Explicitly not worth building** for a single-maintainer local system, despite being
 field trends: browser automation, multi-channel fan-out (Discord/Slack/WhatsApp),
@@ -169,8 +172,33 @@ Researched, then dropped by the user mid-session. Preserved for revival:
 2. ~~Whether the PWA manifest rides along~~ — **yes, shipped** (session 18):
    manifest + service worker + icons in `ui/public/`, dashboard installs to the
    phone home screen.
-3. Whether any of the other gaps above (event-driven proactivity, approval queue,
-   local-model fallback) get promoted into a v3 phase plan. **Still open.**
+3. ~~Whether the other gaps get promoted into a v3 phase plan~~ — **resolved
+   2026-07-26/27; two of the three built, one deliberately not.**
+   - **Event-driven proactivity — BUILT.** `dispatcher/inbox.py` watches
+     `vault/inbox/` and reacts to a file arriving (two-phase settle, seeded
+     first pass, removals reindex without notifying). This is the system's
+     first non-clock trigger. The same shape extends to any other observable
+     source later.
+   - **Model fallback when the plan cap hits — BUILT, differently than
+     imagined.** Not a *local model* (that needs a dependency and a decision);
+     instead `dispatcher/offline.py` answers **extractively from the Phase F/J
+     hybrid index** — verbatim vault quotes with the source named, gated on a
+     BM25 relevance anchor so an unrelated question gets "nothing relevant"
+     rather than three plausible-looking irrelevant chunks. A local model can
+     later slot into exactly this seam. Separately, the **Messages API backend
+     is now production-ready**, so a funded API key is a genuine second
+     provider path rather than a downgrade (see CLAUDE.md).
+   - **Approval queue — deliberately NOT built.** The *surface* now exists and
+     is reusable: SSE `confirm` event, dashboard `ConfirmBar`, voice yes/no,
+     single-use ids, timeout — built for desktop verbs (computer-use T1). But
+     **there is nothing outbound to gate**: Gmail is read-only and not even
+     OAuthed, and nothing in the system can send or publish. Wire the existing
+     confirm plane to the first real outbound action when one lands; building
+     a queue for hypothetical actions would be speculative.
+
+   Remaining from the gap table: **calendar awareness** (dropped by the user,
+   revival notes above) and **browser/computer use** beyond T1 — see
+   `future/computer-use.md`, where T3 (browser over CDP) needs no new deps.
 
 ## Sources
 
