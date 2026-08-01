@@ -20,6 +20,8 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from dispatcher import brief as brief_mod  # noqa: E402
 
 # Persistent= timers fire right at boot, often before the dispatcher has bound
 # its port (this lost the 2026-07-09/11/12 briefs). Connection-level failures
@@ -53,6 +55,18 @@ def main():
     )
 
     cfg = yaml.safe_load((ROOT / "config.yaml").read_text())["dispatcher"]
+
+    # Deterministic pre-check: a brief for a vault with no open tasks and no
+    # fresh notes says "clean slate" for ~$0.40 and 8-11 turns. Write it here
+    # for nothing instead. Any material at all and we fall through to the agent.
+    bcfg = cfg.get("brief") or {}
+    if agent == "daily-brief" and bcfg.get("skip_model_when_quiet", True):
+        days = int(bcfg.get("quiet_notes_days", brief_mod.DEFAULT_NOTES_DAYS))
+        if brief_mod.is_quiet(ROOT, days):
+            path = brief_mod.write_quiet(ROOT, today, days)
+            print(f"vault is quiet — wrote {path.relative_to(ROOT)} without a model call")
+            return
+
     url = f"http://{cfg.get('host', '127.0.0.1')}:{cfg.get('port', 8765)}/task"
     body = {
         "text": text,

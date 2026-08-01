@@ -40,7 +40,7 @@ Every working session MUST:
 | — | Messages API backend | **built, then REMOVED 2026-07-27** — user is not funding an API key; subscription CLI only (recoverable at `ce93ea0`) |
 | K2 | Computer-use T2 (AT-SPI) / T3 (browser over CDP) | **not started** — T3 needs no new deps; offered and deferred twice |
 
-_Test count as of 2026-08-01: **439**, `.venv/bin/python -m unittest discover tests`.
+_Test count as of 2026-08-02: **450**, `.venv/bin/python -m unittest discover tests`.
 Acceptance: `scripts/smoke_phase_a.sh` 7/7._
 
 v2 (phases F–J: memory, learning loop, observability, personal OS, graph) is
@@ -401,6 +401,30 @@ before writing from scratch.
   `trusted=True`. Areas strip Bash/unscoped Edit-Write from SKILL.md
   frontmatter at load unless listed in `security.privileged_areas` (empty by
   default) — a reflection/learn run editing `areas/**` can't grant itself Bash.
+- **The memory system was feeding on its own housekeeping** (found + fixed
+  2026-08-02). `should_capture` excluded the consolidator, reflections and the
+  gate/parse tasks — but **not `daily-brief`/`weekly-review`**, whose episode is
+  "I wrote a file". So the nightly `graph-extract` kept reading those back as
+  knowledge: **every fact in the knowledge graph** was a self-observation
+  ("the daily-brief automation continued writing successfully through 07-31"),
+  each night invalidating the previous night's copy of itself — 6 facts, 4 of
+  them already superseded, zero about the user. Both task types are now
+  excluded. Nothing is lost: a brief's *content* reaches memory through the
+  vault index, which ingests `vault/briefs/` already. The 6 facts were purged
+  and the pre-fix episodes marked consolidated (DB backed up first, every row
+  asserted to match a self-observation/test-artifact guard).
+- **The daily brief skips the model on a quiet day** (2026-08-02).
+  `dispatcher/brief.py` is a deterministic pre-check in the same family as
+  `spotify.detect`/`desktop.detect`: no open tasks in `vault/tasks/` and no
+  note touched in `brief.quiet_notes_days` (3) → `scripts/run_agent.py` writes
+  the brief itself and never submits a task. It had been spending ~$0.40 and
+  8-11 turns every morning to write "clean slate", every day from 07-24 to
+  08-01, because the vault holds one *done* task from 07-06 and two notes from
+  07-05. Costs are notional on the subscription, but the **quota** is real and
+  the plan cap has killed the assistant twice. Any material at all falls
+  through to the real agent; an unreadable task file also falls through (fail
+  toward doing the work). `brief.skip_model_when_quiet: false` restores the old
+  behavior.
 - **The daily brief is email-free on purpose.** A Gmail MCP server *is*
   connected in `~/.claude-per` (so `mcp__claude_ai_Gmail__*` shows up in every
   agent's tool list), but the user declined to feed mail into the brief

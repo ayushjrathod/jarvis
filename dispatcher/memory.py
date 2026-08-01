@@ -88,10 +88,19 @@ def should_capture(cfg: Config, task: dict, status: str) -> bool:
         meta = {}
     # meta-work must not feed back into memory: the consolidator's own run
     # would become next night's input, reflections are private review passes,
-    # and the Phase I gate/parse runs are plumbing around real interactions
+    # and the Phase I gate/parse runs are plumbing around real interactions.
+    #
+    # daily-brief/weekly-review belong here for exactly the same reason, and
+    # were missed until 2026-08-01. Their episode says "I wrote a file", so the
+    # nightly graph extractor kept turning the system's own housekeeping into
+    # "knowledge": every fact in the graph was a self-observation like "the
+    # daily-brief automation continued writing successfully through 07-31",
+    # each night invalidating the previous night's copy of itself. Nothing is
+    # lost by excluding them — a brief's *content* reaches memory the right
+    # way, through the vault index that ingests vault/briefs/ already.
     return meta.get("task_type") not in (
         "memory-consolidate", "reflection", "notify-gate", "automation-parse",
-        "graph-extract", "graph-reconcile")
+        "graph-extract", "graph-reconcile", "daily-brief", "weekly-review")
 
 
 def build_consolidation(cfg: Config, db: Database) -> dict | None:

@@ -95,6 +95,14 @@ dispatcher:
       # denial detection is what finally surfaced it.
       allowed_tools: [Read, Glob, Grep, "Edit(vault/**)", "Write(vault/**)"]
 
+  # Daily brief: on a day with no open tasks and no notes touched in the last
+  # quiet_notes_days, scripts/run_agent.py writes the brief itself and never
+  # calls a model (it would spend ~$0.40 and 8-11 turns to say "clean slate").
+  # Set skip_model_when_quiet: false to always run the agent.
+  brief:
+    skip_model_when_quiet: true
+    quiet_notes_days: 3
+
   # Memory (Phase F): raw episode capture + always-in-context blocks + vault
   # search index. Blocks are plain markdown in blocks_dir — edit them freely;
   # budgets are chars (~4 per token), enforced at prompt-build time.

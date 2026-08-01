@@ -56,8 +56,40 @@ the committed dist hashes exactly, `smoke_phase_b` **12/12**. Three fixes:
   doesn't exist, and `smoke_phase_b.py` printed "Messages API path will be
   faster" on every run. Both now state the subscription CLI's ~3s TTFT floor.
 
-Noted only: `references/` is **1.3G** of gitignored clones (deliberate, but the
-biggest thing on disk); barge-in measures **193ms against a 200ms budget**.
+Noted only: `references/` is **1.3G** of gitignored clones (**user says keep
+them**); barge-in measures **193ms against a 200ms budget**.
+
+**Third pass — the memory system was feeding on its own housekeeping.** Backup
+verified restorable (41/41 tables), meta routing still on haiku, security clean
+(`privileged_areas: []`, no Bash in any area), no unbounded tables, /stats
+success 96.4%. Then the real find:
+
+- **Every fact in the knowledge graph was a self-observation** ("the daily-brief
+  automation continued writing successfully through 07-31"), 4 of 6 already
+  invalidated by the next night's restatement, **zero about the user**.
+  `should_capture` excluded the consolidator/reflection/gate tasks — its comment
+  says why: *"the consolidator's own run would become next night's input"* — but
+  **not `daily-brief`/`weekly-review`**, whose episode is "I wrote a file", so
+  `graph-extract` read them back as knowledge nightly. Both now excluded (+2
+  tests, incl. one pinning that ordinary `source=timer` tasks are still
+  captured). Nothing lost: brief *content* reaches memory via the vault index.
+- **Purged (user approved), DB backed up first**: 6 facts + 18 fact-entity links
+  + 4 orphan entities, every row asserted against a self-observation guard; and
+  the 6 episodes queued for 02:30 (2 brief runs + **4 artifacts of my own
+  acceptance tests**) marked consolidated so they can't reach MEMORY.md.
+- **The brief now skips the model on a quiet day (user approved)** —
+  `dispatcher/brief.py`, deterministic like `spotify.detect`/`desktop.detect`:
+  no open tasks + no note touched in 3 days → `run_agent.py` writes the file
+  itself, no task submitted. It had written "clean slate" daily 07-24..08-01 for
+  ~$0.40 and 8-11 turns each time (vault holds one *done* task from 07-06, two
+  notes from 07-05). Fails toward doing the work — an unreadable task file
+  counts as material. `brief.skip_model_when_quiet: false` reverts.
+  Live: wrote 2026-08-02.md with **0 tasks created**.
+- Noted, not acted on: the **learning loop is dormant** — 2 reflections ever
+  (last 07-19). Trigger is `num_turns >= 12`; the brief runs 8-11, so normal
+  operation never reaches it.
+
+**450 tests green.**
 
 ## Session 24 (2026-07-28): computer-use research — what else we can add
 

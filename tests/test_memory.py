@@ -251,6 +251,23 @@ class TestCapturePolicy(unittest.TestCase):
         t = self._task(source="timer", metadata={"task_type": "memory-consolidate"})
         self.assertFalse(memory.should_capture(cfg, t, "done"))
 
+    def test_timer_agents_do_not_feed_their_own_housekeeping_back(self):
+        """Live 2026-08-01: every fact in the knowledge graph was a
+        self-observation ("the daily-brief automation continued writing
+        successfully through 07-31"), because the brief's own run was captured
+        as an episode and the nightly extractor read it back as knowledge."""
+        cfg = make_cfg(Path("."))
+        for tt in ("daily-brief", "weekly-review"):
+            with self.subTest(task_type=tt):
+                t = self._task(source="timer", metadata={"task_type": tt})
+                self.assertFalse(memory.should_capture(cfg, t, "done"))
+
+    def test_a_real_timer_task_is_still_captured(self):
+        """The exclusion is per task_type, not a blanket ban on source=timer."""
+        cfg = make_cfg(Path("."))
+        t = self._task(source="timer", metadata={"task_type": "summarize"})
+        self.assertTrue(memory.should_capture(cfg, t, "done"))
+
 
 class TestConsolidation(unittest.TestCase):
     def setUp(self):
