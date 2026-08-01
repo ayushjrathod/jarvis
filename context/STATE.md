@@ -37,6 +37,28 @@ one long-standing waste. Full detail: `context/sessions/2026-08-01-1.md`.
 - **Committed** the two-session backlog in batches on the user's word (sessions
   23 + 24 + this fix + the vault briefs).
 
+**Second pass, repo-wide** (user asked for another run): SQLite
+`integrity_check` + all three FTS indexes ok, **0 orphan vectors** (82/82
+entries embedded), no indexed-but-missing files, no tracked secrets, 31 routes
+all documented, zero TODO/FIXME, openwakeword still pinned 0.4.0, **no systemd
+unit drift** (all 16 byte-identical to installed), `npm run build` reproduces
+the committed dist hashes exactly, `smoke_phase_b` **12/12**. Three fixes:
+
+- **`mission-tailscale-serve` had NOT failed at boot** despite a scary journal
+  line — `--list-boots` shows that entry is the *previous* boot's teardown. The
+  session-21 readiness wait worked (waited ~9s); tailnet `/health` is 200.
+- **Dead config key removed**: `budgets.quick_max_tokens` was the Messages API's
+  `max_tokens`, unread since that backend was removed — it would have silently
+  ignored anyone trying to cap quick answers (`budgets` loads as a plain dict,
+  which is why it survived).
+- **Two stale "Messages API" references in code** (session 23 found two in
+  docs): `runner.py` told readers to "use the messages_api backend", which
+  doesn't exist, and `smoke_phase_b.py` printed "Messages API path will be
+  faster" on every run. Both now state the subscription CLI's ~3s TTFT floor.
+
+Noted only: `references/` is **1.3G** of gitignored clones (deliberate, but the
+biggest thing on disk); barge-in measures **193ms against a 200ms budget**.
+
 ## Session 24 (2026-07-28): computer-use research — what else we can add
 
 User asked for internet research + a `references/` pass on further computer-use

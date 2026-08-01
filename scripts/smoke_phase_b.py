@@ -173,7 +173,8 @@ def main():
         joined = " ".join(sentences)
         check("brain quick answer mentions Paris", "paris" in joined.lower(), joined[:80])
         check("first delta timing recorded", first_delta_s is not None,
-              f"{first_delta_s:.1f}s (CLI path; Messages API path will be faster)")
+              f"{first_delta_s:.1f}s (subscription CLI — ~3s is the floor here: "
+              f"every cold `claude -p` re-sends the Claude Code system prompt)")
         if sentences:
             spoken = tts_say(tts, sentences[0])
             check("answer synthesizes to audio", len(spoken) > 0,

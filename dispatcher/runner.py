@@ -122,7 +122,9 @@ class _Timeout(Exception):
 # — and with an unfunded key every `claude -p` fails outright (observed
 # 2026-07-27). Even with a funded one it would silently bill CLI runs, at ~18k
 # system-prompt tokens each, to API credit instead of the subscription.
-# Strip it: code that wants the API should use the messages_api backend.
+# Strip it. There is no API path left to fall back to — the Messages API
+# backend was removed 2026-07-27 (recoverable at ce93ea0); the subscription CLI
+# is the only backend, which is exactly why a stray key must never shadow it.
 _STRIPPED_CLI_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 
 

@@ -57,7 +57,6 @@ dispatcher:
     max_cost_per_task_usd: 3.00   # passed to claude -p --max-budget-usd
     quick_max_cost_usd: 1.00
     timeout_s: 600                # wall-clock kill for agentic runs
-    quick_max_tokens: 1024
     transient_retry_delay_s: 2    # backoff before the one retry on spawn/timeout error
 
   # Trust boundary (mechanical, not conventional). Only server-internal spawns
