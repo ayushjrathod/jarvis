@@ -199,6 +199,27 @@ def is_permission_denial(text: str) -> bool:
     return any(m in low for m in _DENIAL_MARKERS)
 
 
+# ...but only a denial of a tool that could have written the file explains a
+# missing output. Gmail MCP cannot: the daily brief is *designed* to omit its
+# email section silently when that grant is absent, and it has never been
+# granted (the agent asks for `mcp__gmail`, the server is
+# `mcp__claude_ai_Gmail__*`), so that denial fires on every single run. On
+# 2026-07-23 and 2026-07-30 it turned a run that legitimately made no edit
+# — yesterday's catch-up had already written the file — into a hard `failed`.
+# An unparseable denial stays fatal: silently reporting success while writing
+# nothing is the failure mode session 17 exists to prevent.
+_WRITE_CAPABLE_TOOLS = {"write", "edit", "multiedit", "notebookedit", "bash"}
+_DENIED_TOOL_RE = re.compile(r"to use ([A-Za-z_][\w.-]*)")
+
+
+def denial_could_block_output(summary: str) -> bool:
+    """Could this denied tool have been what stopped the output file appearing?"""
+    m = _DENIED_TOOL_RE.search(summary or "")
+    if not m:
+        return True
+    return m.group(1).split("(")[0].strip().lower() in _WRITE_CAPABLE_TOOLS
+
+
 def _tool_result_text(content) -> str:
     if isinstance(content, list):
         content = " ".join(b.get("text", "") for b in content
@@ -328,12 +349,13 @@ async def _attempt(text: str, cfg: Config, model: str | None, tools: list[str],
         # regardless. What's fatal is a denial that stopped the run producing
         # the file its prompt names — the 2026-07-21..23 briefs, which reported
         # success having written nothing.
-        if wrote_declared_output(text, cfg.root, wall_t0) is False:
+        blocking = [s for s in denied if denial_could_block_output(s["summary"])]
+        if blocking and wrote_declared_output(text, cfg.root, wall_t0) is False:
             out["status"] = "failed"
             out["error"] = (
                 "blocked by tool permissions — declared output file never "
-                "written; allowedTools is missing a grant: {}".format(denied[0]["summary"]))
+                "written; allowedTools is missing a grant: {}".format(blocking[0]["summary"]))
         else:
-            log.warning("task %s: %d tool denial(s) but output was produced; "
+            log.warning("task %s: %d tool denial(s), none fatal; "
                         "first: %s", task_id, len(denied), denied[0]["summary"])
     return out

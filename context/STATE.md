@@ -1,6 +1,118 @@
 # STATE — read me first each session
 
-_Last updated: 2026-07-27 (session 22, end)_
+_Last updated: 2026-08-01 (session 25, end)_
+
+## Session 25 (2026-08-01): maintenance sweep — the brief's false failure
+
+User asked for cleanup + maintenance. Health sweep clean (**439 tests**,
+smoke_phase_a **7/7**, doctor all ✓ bar two known `!`, all units active, backup
+prune working at 14/14 days, no orphan task rows). It surfaced one real bug and
+one long-standing waste. Full detail: `context/sessions/2026-08-01-1.md`.
+
+- **The 07-30 daily brief settled `failed` for $0.51 and shouldn't have.**
+  Three things lined up: (1) the agent's `mcp__gmail` grant **never matched
+  anything** — the server is `mcp__claude_ai_Gmail__*` — so every brief since
+  Phase C requested Gmail and ate a denial; (2) the box was off at 07:30 on
+  07-29, so the `Persistent=true` catch-up fired at **00:42 on the 30th** and
+  wrote *2026-07-30*.md (hence **no 07-29 brief**); (3) the real 07-30 run
+  therefore correctly made no edit — and session 17's mtime guard can't tell
+  "denial blocked the write" from "no edit needed", so a tolerable denial became
+  a hard failure. Also hit **07-23**. No notify-gate ran either day, so the
+  silence looked normal.
+- **Fix**: `runner.denial_could_block_output()` only lets
+  `Write/Edit/MultiEdit/NotebookEdit/Bash` explain a missing output file — an
+  MCP/read tool can't write it. **Unparseable denials stay fatal**: the
+  dangerous direction is session 17's silent false success. +7 tests pinning
+  both directions, incl. the CLI's real `Write`-denial wording.
+- **Gmail MCP has been connected all along** (`claude mcp list` in
+  `~/.claude-per`: Gmail ✔, plus Notion/Drive/Calendar/Spotify). The "left to
+  user OAuth" item open since Phase C **was already done**; only the wrong grant
+  name stood between the brief and the inbox. **User's call: keep the brief
+  email-free** — dead grant and the whole Email section removed, and the prompt
+  now says not to call the Gmail tools it can still see.
+- Live-verified: fresh brief run → `done`, 8 turns, $0.2803, **zero denials**,
+  file rewritten. First brief in the project's history with no denial.
+- `vault/briefs/test.md` + `refusal-test.md` are **smoke_phase_a artifacts**,
+  not debris — tracked on purpose, left alone.
+- **Committed** the two-session backlog in batches on the user's word (sessions
+  23 + 24 + this fix + the vault briefs).
+
+## Session 24 (2026-07-28): computer-use research — what else we can add
+
+User asked for internet research + a `references/` pass on further computer-use
+capability. No code changed. Findings in
+`context/research/2026-07-28-computer-use-expansion.md`.
+
+- **The session-20 spike was too pessimistic.** It tested two D-Bus surfaces
+  (`Shell.Eval`, `Shell.Introspect`) and declared window management unreachable
+  without a shell extension. **AT-SPI2 was never tried, and it works here** —
+  measured: 9 apps on the a11y bus, window titles readable, and app windows
+  expose `Component` (geometry + `grabFocus`) **and `Action` (`doAction` =
+  click-a-widget-by-name, no coordinates)**. That is the deferred capability
+  plus the semantic clicking the Hermes audit called the sweet spot.
+- **The seam question is settled by session 22.** Anthropic's native computer
+  tool is a Messages API tool; the subscription CLI can't reach it. So the only
+  channel is a **local MCP server** granted via `--allowedTools mcp__…` — which
+  is exactly what the existing least-privilege + trust-boundary machinery wants.
+- **`cua-driver`: recommend dropping.** Its Linux backend is X11/XTEST; native
+  Wayland is preview-only behind an opt-in flag, with native-Wayland apps
+  potentially invisible. This box is GNOME 50.2/Wayland.
+- **Reachable, unnoticed until now**: portal `RemoteDesktop` **v2** (persist +
+  restore token — the sanctioned Wayland input channel, jeepney-reachable),
+  `libei` 1.6.0 installed, `GlobalShortcuts` portal v1, and node 22 with a
+  built-in `WebSocket` (CDP with zero deps, already proven twice in-repo).
+- **Ranked**: browser control (T3, zero deps — or one npm dep for Google's
+  official `chrome-devtools-mcp`, ~29 tools) > AT-SPI window/semantic control
+  (T2) > a self-service screenshot (precondition for any pixel work) >
+  RemoteDesktop input (correctness upgrade; ydotool already works).
+- Four open questions for the user at the foot of the research doc — including
+  the one dep decision AT-SPI needs (`pygobject` in the venv vs raw jeepney).
+
+## Session 23 (2026-07-27): "open firefox" actually opens firefox
+
+User: "when i say open firefox or any other installed app it should open it."
+It had **never** worked, while answering "Opening firefox." every time — three
+bugs in series, each hidden by the next. **432 tests** (415 → 432). Full detail:
+`context/sessions/2026-07-27-3.md`. **Uncommitted.**
+
+1. **No display in the service environment.** A systemd *user* service only
+   carries `DISPLAY`/`WAYLAND_DISPLAY` if it started after GNOME ran
+   `systemctl --user import-environment`; at boot it doesn't, and the
+   dispatcher's env had neither. firefox died with "no DISPLAY environment
+   variable specified" while **gtk-launch exited 0**. `desktop.session_env()`
+   now borrows the missing vars from the systemd user manager (survives a
+   reboot; a unit-file EnvironmentFile would not). The clipboard verbs had
+   worked only by luck — `wl-paste` falls back to the `wayland-0` socket.
+2. **A successful launch then hung.** `_run`'s `capture_output` waits for EOF
+   and the app holds those pipes for its whole life, so a *working* launch
+   blocked 10s ("gtk-launch didn't respond") and a *failed* one returned at
+   once. GUI spawns now go through `desktop.spawn_app()` (DEVNULL).
+3. **The app would die with the dispatcher.** Children inherit our cgroup, so a
+   routine `systemctl --user restart mission-dispatcher` would kill everything
+   it had opened. `spawn_app` wraps the launcher in `systemd-run --user --scope
+   --collect --slice=app.slice` (GNOME's own `app-*.scope` mechanism).
+   Verified: firefox survived a restart.
+
+**No more false success**: `_launch` checks the process itself (`Exec=`
+basename, or the desktop id for `flatpak`-style wrappers) and says "<app>
+didn't start" otherwise. Matching is on **argv[0]** — the first live test of the
+check passed for the wrong reason, having matched my own shell command line that
+merely contained the word "firefox". `spotify.ensure_running` shared bugs 1 and
+3 and now shares `spawn_app`. `doctor.sh` gained the display check that would
+have caught all of this.
+
+Live: `POST /desktop` and the `POST /task` mode=auto divert both open real apps
+(firefox, calculator, text editor); an unknown app still fails honestly.
+
+**Docs pass** (same session): README (desktop bullet, new troubleshooting row,
+test count), the in-app `/system-docs` page (`ui/src/docs/content.js`, rebuilt →
+`index-CrUrEtAU.js`, CSS unchanged, served live), `future/computer-use.md`
+(what T1 got wrong + the lesson for T2/T3), and `future/phone-access-and-feature-
+gaps.md`. Two **session-22 leftovers** caught doing it: README still credited the
+removed API backend with halving voice latency, and the feature-gap doc still
+called that backend "production-ready" as a second provider path.
+**Reminder for commit time**: `ui/dist` is gitignored + force-added, so
+`git add -f` the two new hashed assets.
 
 ## Session 22 (2026-07-27): API key dropped — subscription only
 
@@ -822,10 +934,15 @@ do not build without explicit request.
 2. Reboot test (Phase E acceptance): after reboot,
    `journalctl --user -u mission-* -b` should show clean startups. Consider
    `loginctl enable-linger ayra` for boot-without-login.
-3. Optional: Gmail MCP (`claude-per mcp add gmail …`) → email section appears
-   in daily briefs automatically.
-4. Optional: `ANTHROPIC_API_KEY` → quick path switches to low-latency
-   Messages API (set it in mission-dispatcher.service env or shell).
+3. ~~Gmail MCP~~ — **done, and then deliberately unused.** The server is
+   connected in `~/.claude-per`; the user chose (2026-08-01) to keep the daily
+   brief email-free, so the grant and the Email section were removed. Re-enable
+   by granting `mcp__claude_ai_Gmail__search_threads` + `…__get_thread` in
+   `areas/tasks/agents/daily-brief.md` and restoring the section — no code
+   change needed.
+4. ~~`ANTHROPIC_API_KEY`~~ — **obsolete.** The Messages API backend was removed
+   2026-07-27; a stray key now actively *replaces* the subscription and is
+   stripped from every `claude` subprocess (`runner.cli_env`).
 
 ## Known caveats (details in CLAUDE.md + session logs)
 

@@ -22,7 +22,7 @@ Every working session MUST:
 |---|---|---|
 | A | Dispatcher core (API, queue watcher, classifier, headless runner, refusal fallback, SQLite logging, hooks) | **implemented, acceptance passing — awaiting user review** |
 | B | Jarvis voice pipeline on the dispatcher | **done — user-verified on hardware 2026-07-06** |
-| C | Tasks/work vertical slice + daily brief + weekly review | **implemented, acceptance passing — Gmail MCP left to user OAuth** |
+| C | Tasks/work vertical slice + daily brief + weekly review | **implemented, acceptance passing** — the brief is deliberately **email-free** (user's call 2026-08-01); Gmail MCP is connected but not granted |
 | D | React dashboard | **implemented — served by dispatcher at :8765, headless-render verified** |
 | E | systemd wrap-up | **implemented — units live, auto-restart verified; reboot test = user** |
 | F | v2 memory foundation (episode capture, core blocks, vault FTS index, /memory API, nightly consolidation) | **implemented, acceptance passing** (user waived review) |
@@ -33,14 +33,14 @@ Every working session MUST:
 | — | Ask-about-my-screen (`<Super><Alt>a` → portal shot → popup → streamed answer) | **implemented, smoke passing — user E2E pending** (run scripts/setup_ask_screen.sh) |
 | — | Spotify media control ("hey jarvis, play …" → MPRIS, deterministic) | **implemented — user E2E pending** (run scripts/setup_spotify.sh) |
 | — | Phone access via Tailscale + installable PWA dashboard | **implemented, live — user add-to-home-screen pending** |
-| K1 | Desktop control (computer-use T1: volume/mute/lock/launch/open/clipboard + allow-confirm-deny safety plane) | **implemented, live-verified** — window mgmt + brightness deferred (need deps, see notes) |
+| K1 | Desktop control (computer-use T1: volume/mute/lock/launch/open/clipboard + allow-confirm-deny safety plane) | **implemented, live-verified** — `launch`/`open` were broken until 2026-07-27 (no display in the service env); window mgmt + brightness deferred (need deps, see notes) |
 | — | Meta-task cost fix (`models.meta` → haiku for gate/parse tasks; notify gate no longer resumes) | **implemented, live-verified** — $0.141 → $0.0405 per gate run |
 | — | Degraded mode (plan-cap failures answered extractively from the local hybrid index) | **implemented, live-verified** |
 | — | Inbox watcher (first *event*-driven trigger: file lands in `vault/inbox/` → indexed + announced) | **implemented, live-verified** |
 | — | Messages API backend | **built, then REMOVED 2026-07-27** — user is not funding an API key; subscription CLI only (recoverable at `ce93ea0`) |
 | K2 | Computer-use T2 (AT-SPI) / T3 (browser over CDP) | **not started** — T3 needs no new deps; offered and deferred twice |
 
-_Test count as of 2026-07-27: **415**, `.venv/bin/python -m unittest discover tests`.
+_Test count as of 2026-08-01: **439**, `.venv/bin/python -m unittest discover tests`.
 Acceptance: `scripts/smoke_phase_a.sh` 7/7._
 
 v2 (phases F–J: memory, learning loop, observability, personal OS, graph) is
@@ -401,6 +401,20 @@ before writing from scratch.
   `trusted=True`. Areas strip Bash/unscoped Edit-Write from SKILL.md
   frontmatter at load unless listed in `security.privileged_areas` (empty by
   default) — a reflection/learn run editing `areas/**` can't grant itself Bash.
+- **The daily brief is email-free on purpose.** A Gmail MCP server *is*
+  connected in `~/.claude-per` (so `mcp__claude_ai_Gmail__*` shows up in every
+  agent's tool list), but the user declined to feed mail into the brief
+  (2026-08-01). The agent's old `mcp__gmail` grant matched nothing, so it
+  requested Gmail, got denied, and burned a turn on **every single run** since
+  Phase C. Both the dead grant and the prompt's Email section are gone, and the
+  prompt now says explicitly not to call the tools it can see. To re-enable:
+  grant `mcp__claude_ai_Gmail__search_threads` + `…__get_thread` and restore the
+  section — no code change needed.
+- **A `Persistent=true` catch-up can write tomorrow's brief.** The box was off
+  at 07:30 on 07-29; the timer caught up at 00:42 *on the 30th*, so the agent's
+  `{{DATE}}` was already 07-30 — there is no 07-29 brief, and the 30th's real
+  run then found its file already written. Harmless once the denial fix above
+  is in, but that's why brief dates can skip a day.
 - **Timer agents get their tools from disk, not the wire** (learned the hard
   way 2026-07-24): `scripts/run_agent.py` sends `metadata.agent = <name>`, and
   the dispatcher resolves `areas/<area>/agents/<name>.md`'s `allowed_tools`
@@ -413,9 +427,18 @@ before writing from scratch.
   the model continue, so a run that was denied every write still ended
   subtype=success. `runner.py` now flags denials; a denial that stopped the run
   producing the output file its prompt names (mtime vs a pre-spawn timestamp) →
-  `failed`; a tolerable denial (e.g. Gmail MCP absent, the brief writes anyway
-  and skips its email section by design) → `done` with the denial recorded in
+  `failed`; a tolerable denial → `done` with the denial recorded in
   `denied_tools` and logged as a warning.
+- **…but only a denial of a tool that could have written the file counts**
+  (fixed 2026-08-01). The mtime test can't tell "a denial blocked the write"
+  from "the agent correctly decided no edit was needed", and the daily brief hit
+  the second case twice (07-23, 07-30 — a post-midnight catch-up run had already
+  written the file, so the real run made no edit and a harmless Gmail denial
+  promoted it to `failed`, $0.51 wasted and no notification). `runner.
+  denial_could_block_output` parses the tool name out of the denial and only
+  treats `Write/Edit/MultiEdit/NotebookEdit/Bash` as capable of explaining a
+  missing file; an **unparseable** denial stays fatal, because a silent false
+  success is the failure mode session 17 exists to prevent.
 - Other review fixes now live: `/stt` body-size cap + origin guard, real
   quick-path cancel (proc registration + cancelled-guard), SQLite
   `busy_timeout=15s`, memory block-file write allowlist + scoped summarize
@@ -567,6 +590,38 @@ before writing from scratch.
   returns None for "couldn't tell" so it never reads as "definitely unlocked".
   `loginctl lock-session` (no ID) **does** work from that context — verified,
   accidentally, by locking the screen for real 2026-07-26.
+- **Launching an app needed three fixes, not one** (2026-07-27 — `open firefox`
+  had never once worked, while answering "Opening firefox." every time):
+  1. **No display.** A user service only carries `DISPLAY`/`WAYLAND_DISPLAY` if
+     it started *after* GNOME ran `systemctl --user import-environment`; at boot
+     it doesn't, so the dispatcher's environment had neither. firefox printed
+     "no DISPLAY environment variable specified" into a pipe nobody read and
+     died. `desktop.session_env()` now takes the missing `SESSION_VARS` from the
+     **systemd user manager**, which always has the real values — that also
+     survives a reboot, which putting them in the unit file would not. Clipboard
+     verbs worked all along only by luck: `wl-paste` falls back to the
+     `wayland-0` socket when the variable is unset.
+  2. **A successful launch used to hang.** `_run`'s `capture_output` waits for
+     EOF, the app inherits those pipes and holds them open for its whole life —
+     so a working launch blocked until the 10s timeout ("gtk-launch didn't
+     respond") while a *failed* one returned instantly. GUI spawns go through
+     `desktop.spawn_app()` with DEVNULL instead.
+  3. **The app would die with the dispatcher.** A child inherits our cgroup, so
+     `systemctl --user restart mission-dispatcher` (routine here) killed every
+     app it had opened. `spawn_app` wraps the launcher in `systemd-run --user
+     --scope --collect --slice=app.slice`, the same mechanism behind GNOME's
+     `app-*.scope` units. Verified: firefox survives a restart.
+- **`gtk-launch` exits 0 whether or not the app lived**, which is what let this
+  hide. `_launch` therefore checks the process itself (`process_token()` → the
+  Exec basename, or the desktop id for wrapper Execs like `flatpak run`) and
+  reports "<app> didn't start" if nothing appears within `LAUNCH_SETTLE_S`. The
+  match is against **argv[0] only** — matching the whole command line found a
+  terminal that merely *mentioned* firefox and called it running (it fooled the
+  first live test of the check). Verification is skipped when something matching
+  was already running, since a second launch only raises the existing window.
+- `dispatcher/spotify.py`'s client launch had bugs 1 and 3 too and now shares
+  `spawn_app` (`wait_s=0` — `flatpak run` stays alive as the client's parent, so
+  the MPRIS poll is what confirms startup).
 
 ## Operational notes (Claude auth — subscription only)
 

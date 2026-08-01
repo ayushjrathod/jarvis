@@ -16,6 +16,7 @@ from dispatcher.classifier import classify
 from dispatcher.config import Config
 from dispatcher.db import Database
 from dispatcher.queue_watcher import _ingest_one, parse_task_file
+from dispatcher import runner
 from dispatcher.runner import is_refusal, run_once
 from dispatcher.service import make_ack
 
@@ -337,10 +338,11 @@ class TestDeniedToolSurfacing(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _proc(self, denial=True):
+    def _proc(self, denial=True, content=None):
         proc = _FakeProc()
-        content = ("Claude requested permissions to write to vault/briefs/x.md,"
-                   " but you haven't granted it yet." if denial else "wrote it")
+        content = content or (
+            "Claude requested permissions to write to vault/briefs/x.md,"
+            " but you haven't granted it yet." if denial else "wrote it")
         proc._lines.insert(0, json.dumps({"type": "user", "message": {"content": [
             {"type": "tool_result", "is_error": denial, "content": content},
         ]}}).encode() + b"\n")
@@ -398,6 +400,62 @@ class TestDeniedToolSurfacing(unittest.IsolatedAsyncioTestCase):
         result = await self._run(self._proc(denial=False))
         self.assertEqual(result["status"], "done")
         self.assertNotIn("denied_tools", result)
+
+    # A read-only tool cannot be why the file is missing. Live cases
+    # 2026-07-23 and 2026-07-30: the brief agent asks for `mcp__gmail` while
+    # the server is `mcp__claude_ai_Gmail__*`, so that denial fires on every
+    # run; both days the agent then made no edit (the file was already
+    # correct) and a tolerable denial was promoted to a hard failure.
+    _GMAIL_DENIAL = ("ERROR: Claude requested permissions to use "
+                     "mcp__claude_ai_Gmail__search_threads, but you haven't "
+                     "granted it yet.")
+    _WRITE_DENIAL = ("ERROR: Claude requested permissions to use Write, "
+                     "but you haven't granted it yet.")
+
+    async def test_readonly_denial_with_unwritten_output_is_not_fatal(self):
+        result = await self._run(self._proc(content=self._GMAIL_DENIAL))
+        self.assertEqual(result["status"], "done")
+        self.assertTrue(result["denied_tools"])      # recorded, not fatal
+
+    async def test_write_denial_with_unwritten_output_still_fails(self):
+        """The session-17 regression, in the CLI's real wording."""
+        result = await self._run(self._proc(content=self._WRITE_DENIAL))
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("blocked by tool permissions", result["error"])
+
+    async def test_mixed_denials_fail_on_the_write_one(self):
+        proc = self._proc(content=self._GMAIL_DENIAL)
+        proc._lines.insert(0, json.dumps({"type": "user", "message": {"content": [
+            {"type": "tool_result", "is_error": True, "content": self._WRITE_DENIAL},
+        ]}}).encode() + b"\n")
+        result = await self._run(proc)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("Write", result["error"])
+
+
+class TestDenialBlocksOutput(unittest.TestCase):
+    def test_write_capable_tools_block(self):
+        for tool in ("Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"):
+            with self.subTest(tool=tool):
+                self.assertTrue(runner.denial_could_block_output(
+                    f"Claude requested permissions to use {tool}, but ..."))
+
+    def test_read_only_tools_do_not_block(self):
+        for tool in ("Read", "Glob", "Grep", "WebFetch",
+                     "mcp__claude_ai_Gmail__search_threads"):
+            with self.subTest(tool=tool):
+                self.assertFalse(runner.denial_could_block_output(
+                    f"Claude requested permissions to use {tool}, but ..."))
+
+    def test_scoped_grant_is_matched_on_the_tool_name(self):
+        self.assertTrue(runner.denial_could_block_output(
+            "requested permissions to use Edit(vault/briefs/**), but ..."))
+
+    def test_unparseable_denial_stays_fatal(self):
+        """Fail loud, not silent — an unrecognised wording must not become a
+        false success, which is the failure mode session 17 fixed."""
+        self.assertTrue(runner.denial_could_block_output("permission denied"))
+        self.assertTrue(runner.denial_could_block_output(""))
 
 
 
