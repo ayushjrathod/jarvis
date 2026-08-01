@@ -34,6 +34,8 @@ from pathlib import Path
 
 import httpx
 
+from . import desktop
+
 log = logging.getLogger("dispatcher.spotify")
 
 BUS_NAME = "org.mpris.MediaPlayer2.spotify"
@@ -355,9 +357,14 @@ def ensure_running(cfg) -> None:
         cmd = cmd.split()
     log.info("spotify not running; launching %s", " ".join(cmd))
     try:
-        subprocess.Popen(cmd, start_new_session=True,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except OSError as e:
+        # desktop.spawn_app, not a bare Popen: it supplies the session
+        # environment a GUI client needs (a dispatcher started before GNOME
+        # imported it has no DISPLAY at all) and detaches the client into its
+        # own scope, so restarting the dispatcher doesn't kill the music.
+        # wait_s=0 because `flatpak run` stays alive as the client's parent —
+        # the MPRIS poll below is what tells us it came up.
+        desktop.spawn_app(cmd, env=desktop.session_env(), wait_s=0)
+    except (OSError, desktop.DesktopError) as e:
         raise MediaError(f"couldn't launch Spotify: {e}") from e
     deadline = time.monotonic() + LAUNCH_TIMEOUT_S
     while time.monotonic() < deadline:

@@ -110,6 +110,16 @@ if [ -z "$missing" ]; then
 else
   warn "missing desktop binaries:$missing (those verbs will refuse politely)"
 fi
+# A GUI app needs a display, and a systemd *user* service started at boot has
+# none — which made "open firefox" report success over an app that died on
+# startup (2026-07-27). desktop.session_env() borrows the variables from the
+# systemd user manager, so what matters is that the manager has them.
+if systemctl --user show-environment 2>/dev/null \
+   | grep -qE '^(WAYLAND_DISPLAY|DISPLAY)='; then
+  ok "session display reachable (launch/open can reach the desktop)"
+else
+  warn "no DISPLAY/WAYLAND_DISPLAY in the systemd user manager — launching apps will refuse"
+fi
 
 hdr "─── claude auth ───"
 # The quick and agentic paths both run `claude -p` on the SUBSCRIPTION login.

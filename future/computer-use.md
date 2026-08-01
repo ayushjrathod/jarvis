@@ -22,11 +22,38 @@ per the working-style rule in CLAUDE.md._
 >   `/sys/class/backlight/intel_backlight/brightness` is root-owned. Needs
 >   `brightnessctl` + a udev rule. **Deferred.**
 >
-> Still open from §7: the API-key question (Q1), the T2/T3 dep approvals (Q2),
-> and whether anything runs unattended (Q3). Q4 (default posture) is answered
-> in code — see the `computer.policy` block in config.yaml and the reasoning
-> in `dispatcher/desktop.py`'s docstring.
+> Still open from §7: the API-key question (Q1 — **answered 2026-07-27**: there
+> is no API key, the subscription CLI is the only path), the T2/T3 dep approvals
+> (Q2), and whether anything runs unattended (Q3). Q4 (default posture) is
+> answered in code — see the `computer.policy` block in config.yaml and the
+> reasoning in `dispatcher/desktop.py`'s docstring.
 > `grim` was NOT re-tested; ask-screen's portal path already works.
+>
+> **UPDATE 2026-07-28 (session 24): three of this doc's conclusions are wrong.**
+> Research pass in `context/research/2026-07-28-computer-use-expansion.md`.
+> (1) **Window management is NOT out of reach** — the spike tested only
+> `Shell.Eval` and `Shell.Introspect`; **AT-SPI2 works here** (measured: window
+> titles, `Component.grabFocus`, and `Action.doAction` = click-by-name). T2 and
+> the deferred T1 verbs collapse into one reachable capability.
+> (2) **Q1 (§7) is answered** — session 22 removed the API key, and Anthropic's
+> native computer tool is Messages-API-only, so the seam *must* be a local MCP
+> server over the CLI. (3) **cua-driver: recommend dropping** — its Linux
+> backend is X11/XTEST, native Wayland is preview-only behind an opt-in flag.
+> Also newly measured and not in §1's environment check: portal `RemoteDesktop`
+> **v2** (persist + restore token), `libei` 1.6.0, `at-spi2-core` 2.60.4,
+> node 22 with built-in `WebSocket`.
+>
+> **UPDATE 2026-07-27 (session 23): `launch` and `open` had never worked.**
+> This section's cost estimate ("~200 lines, no new deps") held, but the tier
+> was only *half* live: a systemd user service has no `DISPLAY`, `gtk-launch`
+> exits 0 anyway, and `_run`'s piped output inverted success and failure — so
+> every "Opening firefox." was a lie. Fixed with `desktop.session_env()` (take
+> the display from the systemd user manager), `desktop.spawn_app()` (detached,
+> DEVNULL, wrapped in a transient scope so a dispatcher restart doesn't kill
+> the app) and a real post-launch check. Detail in CLAUDE.md and
+> `context/sessions/2026-07-27-3.md`. **The lesson for T2/T3: a verb that
+> reports success is not a verb that was verified** — every tier below should
+> be live-tested through the running service, not just unit-tested.
 
 Goal: let the assistant *act on* the desktop, not just read a screenshot of it.
 Today we can see the screen (ask-about-my-screen) and type at the cursor

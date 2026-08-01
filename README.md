@@ -30,7 +30,7 @@ by voice · **phone access** over Tailscale + installable PWA · **inbox
 watcher** (drop a file in `vault/inbox/`, it indexes itself) · **degraded
 mode** (answers from local memory when Claude's plan cap is hit).
 
-**415 tests**, all green. Read `context/STATE.md` for exactly where things
+**432 tests**, all green. Read `context/STATE.md` for exactly where things
 stand; `CLAUDE.md` has the operational notes for every subsystem.
 
 ## One-time setup
@@ -221,9 +221,8 @@ installs as an app, mic and all.
   the cursor (`mission-dictate`). The two keys must differ: both services read
   the raw evdev stream, so sharing one would fire both at once.
 - Quick questions: answer is spoken sentence-by-sentence as it streams.
-  First audio ~4–6s after you finish speaking (CLI backend; ~1s transcription
-  + ~3–5s to first model output). The API backend roughly halves the model
-  part — see "One-time setup".
+  First audio ~4–6s after you finish speaking (~1s transcription + ~3–5s to
+  first model output — the floor on the subscription CLI path).
 - Long/agentic asks ("summarize my notes…"): you hear **"On it — …"**
   immediately, then a spoken **"Done: …"** when it finishes minutes later.
 - **Barge-in:** talk over Jarvis (or press Right Ctrl) and it shuts up within
@@ -235,7 +234,11 @@ installs as an app, mic and all.
   Song lookup by name needs `./scripts/setup_spotify.sh` once (free app
   registration; **no Premium required**); transport works without it.
 - **The desktop:** "lock the screen", "open firefox", "system volume 40",
-  "what's on my clipboard" — also deterministic. Reading the clipboard and
+  "what's on my clipboard" — also deterministic. **"open \<app>" works for any
+  installed app** — names are matched against your `.desktop` entries ("open
+  text editor", "launch obsidian"), and an app that doesn't start is reported
+  as such rather than claimed as opened. Apps run in their own systemd scope,
+  so restarting the dispatcher never closes them. Reading the clipboard and
   opening a URL ask first ("Shall I …?"); answer by saying **yes/no**, or click
   the banner at the top of the dashboard.
 - **Rate limited?** If Claude's plan-wide session cap is hit, Jarvis says so
@@ -253,7 +256,7 @@ installs as an app, mic and all.
 ## Tests
 
 ```bash
-.venv/bin/python -m unittest discover tests   # 415 unit tests, no network, ~4s
+.venv/bin/python -m unittest discover tests   # 432 unit tests, no network, ~9s
 ./scripts/smoke_phase_a.sh                    # dispatcher acceptance (server must be up)
 .venv/bin/python scripts/smoke_phase_b.py     # voice acceptance, no mic needed
 ./scripts/smoke_ask_screen.sh                 # ask-about-my-screen acceptance
@@ -281,6 +284,7 @@ VAD/barge-in tuning. Engines are swappable one-line (e.g. a future Kokoro TTS:
 | Jarvis answers but never speaks scheduled results | By design — routine timer/automation successes are gated (`notify-or-not`) and only interesting ones are announced |
 | A file in `vault/inbox/` isn't searchable | Give it ~60s (the watcher waits for the file to stop changing), then check `journalctl --user -u mission-dispatcher \| grep inbox` |
 | Desktop verb says "I'm not allowed to…" | Its policy is `deny` in `config.yaml`'s `computer.policy` block; `GET /desktop/verbs` shows all of them |
+| "\<app> didn't start" / "I can't reach your desktop session" | The dispatcher was started before your graphical session, so it has no display to launch into. It borrows one from the systemd user manager — `./scripts/doctor.sh` says whether the manager has one; if not, log into the desktop and `systemctl --user restart mission-dispatcher` |
 
 ## Layout
 

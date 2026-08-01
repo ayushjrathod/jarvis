@@ -125,6 +125,7 @@ export const guide = [
         },
       },
       { p: "A confirmation banner appears above the widgets when something asks permission — currently the desktop verbs whose policy is “confirm” (reading the clipboard, opening a URL). Answer with the Yes/No buttons, or just say “yes”/“no” to Jarvis. Requests expire after two minutes, and each can only be answered once." },
+      { p: "Desktop verbs work from either front-end and reach no model at all: lock the screen, set the system volume, mute, read or set the clipboard, open a URL, and launch any installed app by name — “open firefox”, “launch text editor”, “fire up obsidian”. Names are matched against your .desktop entries, exact match first. A launched app is checked for afterwards rather than assumed, so you are told “<app> didn't start” instead of a cheerful lie, and it runs in its own systemd scope, so restarting the dispatcher never closes it." },
       { p: "The Command box also has a mic button — the browser-side twin of “hey jarvis”: click to record, click to stop, and the reply is spoken back with the browser's own speech synthesis (“mute reply” silences it). It works from the phone too, since the Tailscale URL is HTTPS and the mic needs a secure context." },
       { p: "Jarvis (voice) runs in both modes as installed. Wake word: say “hey jarvis”, pause, then speak. Push-to-talk: hold Right Ctrl, speak, release — a beep marks each edge and the key release ends the turn, so there is no waiting for silence. Quick questions are spoken sentence by sentence as they stream; a long agentic ask answers “On it — …” immediately and speaks “Done: …” when it finishes." },
       {
@@ -256,6 +257,7 @@ export const guide = [
             ["ui not built (404 on /ask or /system-docs)", "cd ui && npm run build"],
             ["running tasks stuck after a restart", "they're marked failed as orphans on the next startup; resubmit"],
             ["a desktop command refuses", "its policy is deny in the computer.policy block; GET /desktop/verbs lists every verb and its current setting"],
+            ["“<app> didn't start” or “I can't reach your desktop session”", "the dispatcher was started before your graphical session and has no display to launch into. It borrows one from the systemd user manager; scripts/doctor.sh reports whether the manager has one, and a restart from inside the desktop session fixes it"],
             ["a file in vault/inbox/ isn't searchable", "give it a minute (the watcher waits for it to stop changing), then check the journal for “inbox”"],
           ],
         },

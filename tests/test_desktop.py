@@ -7,6 +7,7 @@ lock a screen, change a volume, or launch an app.
 """
 
 import asyncio
+import contextlib
 import unittest
 from unittest import mock
 
@@ -117,31 +118,48 @@ class TestOpenSchemeGuard(unittest.TestCase):
     """Scheme restriction is enforced at the executor, so it holds even if an
     operator sets open: allow."""
 
+    @contextlib.contextmanager
+    def opened(self):
+        """Patch the two seams `open` reaches: a stubbed session (so the test
+        never asks the real one) and a stubbed spawn (so nothing launches)."""
+        with mock.patch.object(desktop, "session_env",
+                               return_value={"DISPLAY": ":0"}), \
+             mock.patch.object(desktop, "spawn_app", return_value=0) as spawn:
+            yield spawn
+
     def test_dangerous_schemes_refused_without_running_anything(self):
-        with mock.patch.object(desktop, "_run") as run:
+        with self.opened() as spawn:
             for bad in ("javascript:alert(1)", "data:text/html,<script>",
                         "vscode://x", "ssh://box/x"):
                 out = desktop.run_intent(desktop.Intent("open", arg=bad))
                 self.assertIn("won't open", out, bad)
-            run.assert_not_called()
+            spawn.assert_not_called()
 
     def test_bare_host_gets_https(self):
-        with mock.patch.object(desktop, "_run") as run:
+        with self.opened() as spawn:
             desktop.run_intent(desktop.Intent("open", arg="example.com"))
-            run.assert_called_once()
-            self.assertEqual(run.call_args[0][0][1], "https://example.com")
+            spawn.assert_called_once()
+            self.assertEqual(spawn.call_args[0][0][1], "https://example.com")
 
     def test_allowed_schemes_pass_through_untouched(self):
         for good in ("https://example.org/x", "http://box:8765/health",
                      "file:///home/ayra/notes.md"):
-            with mock.patch.object(desktop, "_run") as run:
+            with self.opened() as spawn:
                 desktop.run_intent(desktop.Intent("open", arg=good))
-                self.assertEqual(run.call_args[0][0][1], good, good)
+                self.assertEqual(spawn.call_args[0][0][1], good, good)
 
     def test_host_port_is_not_read_as_a_scheme(self):
-        with mock.patch.object(desktop, "_run") as run:
+        with self.opened() as spawn:
             desktop.run_intent(desktop.Intent("open", arg="example.com:8080/x"))
-            self.assertEqual(run.call_args[0][0][1], "https://example.com:8080/x")
+            self.assertEqual(spawn.call_args[0][0][1],
+                             "https://example.com:8080/x")
+
+    def test_open_without_a_session_is_refused(self):
+        with mock.patch.object(desktop, "session_env", return_value={}), \
+             mock.patch.object(desktop, "spawn_app") as spawn:
+            out = desktop.run_intent(desktop.Intent("open", arg="example.com"))
+        self.assertIn("desktop session", out)
+        spawn.assert_not_called()
 
     def test_scheme_of(self):
         # the regression this guard exists for: an opaque scheme has no "//"
@@ -236,6 +254,142 @@ class TestResolveApp(unittest.TestCase):
     def test_no_match(self):
         self.assertIsNone(self.resolve("photoshop"))
         self.assertIsNone(self.resolve(""))
+
+
+class TestSessionEnv(unittest.TestCase):
+    """The dispatcher is a systemd user service; started at boot it has no
+    DISPLAY at all, and a GUI app spawned without one dies on startup."""
+
+    MANAGER = {"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0",
+               "XAUTHORITY": "/run/user/1000/.mutter-Xwaylandauth.AAA"}
+
+    def test_missing_vars_come_from_the_manager(self):
+        with mock.patch.dict(desktop.os.environ, {"HOME": "/home/ayra"}, clear=True), \
+             mock.patch.object(desktop, "_manager_environment",
+                               return_value=self.MANAGER) as m:
+            env = desktop.session_env()
+        self.assertEqual(env["WAYLAND_DISPLAY"], "wayland-0")
+        self.assertEqual(env["HOME"], "/home/ayra")     # our own env survives
+        m.assert_called_once()                          # asked once, not per var
+
+    def test_manager_not_asked_when_env_is_complete(self):
+        full = {v: "x" for v in desktop.SESSION_VARS}
+        with mock.patch.dict(desktop.os.environ, full, clear=True), \
+             mock.patch.object(desktop, "_manager_environment") as m:
+            desktop.session_env()
+        m.assert_not_called()
+
+    def test_our_own_value_wins(self):
+        with mock.patch.dict(desktop.os.environ, {"DISPLAY": ":9"}, clear=True), \
+             mock.patch.object(desktop, "_manager_environment",
+                               return_value=self.MANAGER):
+            self.assertEqual(desktop.session_env()["DISPLAY"], ":9")
+
+    def test_manager_parsing_skips_quoted_values(self):
+        out = ("DISPLAY=:0\n"
+               "QT_IM_MODULES=$'wayland;ibus'\n"      # systemd's own escaping
+               "not a variable line\n")
+        with mock.patch.object(desktop, "_run", return_value=out):
+            env = desktop._manager_environment()
+        self.assertEqual(env, {"DISPLAY": ":0"})
+
+    def test_unreadable_manager_is_not_fatal(self):
+        with mock.patch.object(desktop, "_run",
+                               side_effect=desktop.DesktopError("nope")):
+            self.assertEqual(desktop._manager_environment(), {})
+
+
+class TestLaunch(unittest.TestCase):
+    """`gtk-launch` exits 0 whether or not the app lived, so the executor
+    checks for the process itself — the failure that hid this bug was a
+    cheerful "Opening firefox." over an app that never appeared."""
+
+    def launch(self, *, appeared, env=None, spawn_rc=0):
+        with mock.patch.object(desktop, "resolve_app", return_value="firefox"), \
+             mock.patch.object(desktop, "session_env",
+                               return_value=env if env is not None
+                               else {"WAYLAND_DISPLAY": "wayland-0"}), \
+             mock.patch.object(desktop, "process_token", return_value="firefox"), \
+             mock.patch.object(desktop, "spawn_app", return_value=spawn_rc) as spawn, \
+             mock.patch.object(desktop, "_process_running",
+                               side_effect=[False, *appeared]), \
+             mock.patch.object(desktop, "LAUNCH_SETTLE_S", 0), \
+             mock.patch.object(desktop, "time", mock.Mock(monotonic=lambda: 0,
+                                                          sleep=lambda s: None)):
+            return desktop.run_intent(desktop.Intent("launch", arg="firefox")), spawn
+
+    def test_launch_that_starts(self):
+        out, spawn = self.launch(appeared=[True])
+        self.assertEqual(out, "Opening firefox.")
+        self.assertEqual(spawn.call_args[0][0][:1], ["gtk-launch"])
+
+    def test_launch_that_never_appears_is_reported(self):
+        out, _ = self.launch(appeared=[False])
+        self.assertIn("didn't start", out)
+
+    def test_no_display_is_refused_before_spawning(self):
+        out, spawn = self.launch(appeared=[True], env={"HOME": "/home/ayra"})
+        self.assertIn("desktop session", out)
+        spawn.assert_not_called()
+
+    def test_launcher_failure_is_reported(self):
+        out, _ = self.launch(appeared=[True], spawn_rc=1)
+        self.assertIn("couldn't launch", out)
+
+    def test_unknown_app(self):
+        with mock.patch.object(desktop, "resolve_app", return_value=None):
+            out = desktop.run_intent(desktop.Intent("launch", arg="photoshop"))
+        self.assertIn("couldn't find", out)
+
+
+class TestProcessToken(unittest.TestCase):
+    def token(self, exec_line, ident="com.example.App"):
+        with mock.patch.object(desktop, "_exec_line", return_value=exec_line):
+            return desktop.process_token(ident)
+
+    def test_plain_binary(self):
+        self.assertEqual(self.token("/usr/lib/firefox/firefox %u"), "firefox")
+
+    def test_wrapper_falls_back_to_the_desktop_id(self):
+        # "flatpak" identifies nothing; the app id is what shows up in the args
+        self.assertEqual(
+            self.token("/usr/bin/flatpak run --branch=stable com.example.App @@u"),
+            "com.example.App")
+
+    def test_unreadable_entry_falls_back_to_the_desktop_id(self):
+        self.assertEqual(self.token(""), "com.example.App")
+
+
+class TestSpawnApp(unittest.TestCase):
+    def spawn(self, has_systemd_run=True):
+        proc = mock.Mock(wait=mock.Mock(return_value=0))
+        which = (lambda c: f"/usr/bin/{c}") if has_systemd_run else \
+            (lambda c: None if c == "systemd-run" else f"/usr/bin/{c}")
+        with mock.patch.object(desktop.shutil, "which", side_effect=which), \
+             mock.patch.object(desktop.subprocess, "Popen",
+                               return_value=proc) as popen:
+            rc = desktop.spawn_app(["gtk-launch", "firefox"], env={"DISPLAY": ":0"})
+        return rc, popen.call_args
+
+    def test_wrapped_in_a_transient_scope(self):
+        # otherwise `systemctl --user restart mission-dispatcher` kills every
+        # app the dispatcher opened — they'd sit in its cgroup
+        rc, call = self.spawn()
+        argv = call[0][0]
+        self.assertEqual(rc, 0)
+        self.assertIn("--scope", argv)
+        self.assertEqual(argv[-2:], ["gtk-launch", "firefox"])
+
+    def test_falls_back_when_systemd_run_is_absent(self):
+        _, call = self.spawn(has_systemd_run=False)
+        self.assertEqual(call[0][0], ["/usr/bin/gtk-launch", "firefox"])
+
+    def test_output_is_never_piped(self):
+        # a piped app holds the pipe open for its whole life, so capturing it
+        # makes a *successful* launch block until the timeout
+        _, call = self.spawn()
+        self.assertEqual(call[1]["stdout"], desktop.subprocess.DEVNULL)
+        self.assertEqual(call[1]["stderr"], desktop.subprocess.DEVNULL)
 
 
 class _Svc:

@@ -42,8 +42,8 @@ which is precisely the part this repo already has.
 | **Reach from phone** | ~~127.0.0.1 only~~ → Tailscale + PWA, live | **closed** (session 18) |
 | Event-driven proactivity | ~~time-triggered only~~ → inbox watcher | **closed** (session 20) |
 | Approval queue for outbound actions | confirm plane built (SSE + banner + voice); nothing outbound to gate yet | surface ready, **deliberately unbuilt** |
-| Model fallback when the plan cap hits | ~~dead until reset~~ → extractive answers from the local index; API backend ready | **closed** (session 20/21) |
-| Browser / computer use | T1 desktop control live; T2/T3 unbuilt | partly done |
+| Model fallback when the plan cap hits | ~~dead until reset~~ → extractive answers from the local index (the API backend that briefly backed this up was removed 2026-07-27) | **closed** (session 20) |
+| Browser / computer use | T1 desktop control live — `launch`/`open` fixed 2026-07-27; T2/T3 unbuilt | partly done |
 | Planner / complexity tiers | H4, deliberately unbuilt | optional |
 
 _Status column updated 2026-07-27; the original verdicts are struck through
@@ -185,9 +185,10 @@ Researched, then dropped by the user mid-session. Preserved for revival:
      hybrid index** — verbatim vault quotes with the source named, gated on a
      BM25 relevance anchor so an unrelated question gets "nothing relevant"
      rather than three plausible-looking irrelevant chunks. A local model can
-     later slot into exactly this seam. Separately, the **Messages API backend
-     is now production-ready**, so a funded API key is a genuine second
-     provider path rather than a downgrade (see CLAUDE.md).
+     later slot into exactly this seam. (A Messages API backend was built as a
+     second provider path in session 21 and **removed the next day** — the user
+     is not funding an API key, so the subscription CLI is the only path and
+     this local seam is the whole fallback story. Recoverable at `ce93ea0`.)
    - **Approval queue — deliberately NOT built.** The *surface* now exists and
      is reusable: SSE `confirm` event, dashboard `ConfirmBar`, voice yes/no,
      single-use ids, timeout — built for desktop verbs (computer-use T1). But

@@ -51,6 +51,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -61,6 +62,8 @@ RUN_TIMEOUT_S = 10.0
 CLIP_MAX = 4000          # clipboard text we will read back or write
 VOLUME_STEP = 0.10
 MAX_VOLUME = 1.5         # wpctl allows boosting; cap it so a typo can't deafen
+LAUNCH_SETTLE_S = 2.0    # how long we wait to see a launched app show up
+LAUNCH_POLL_S = 0.1
 
 # Verbs that only read state. Everything else changes something.
 READ_VERBS = frozenset({"status", "clipboard_get"})
@@ -263,14 +266,15 @@ def detect(text: str) -> Intent | None:
 
 # -- executors ---------------------------------------------------------------
 
-def _run(cmd: list[str], input_text: str | None = None) -> str:
+def _run(cmd: list[str], input_text: str | None = None,
+         env: dict[str, str] | None = None) -> str:
     """Run a desktop helper, raising DesktopError with something speakable."""
     exe = shutil.which(cmd[0])
     if not exe:
         raise DesktopError(f"{cmd[0]} isn't installed on this machine")
     try:
         p = subprocess.run([exe, *cmd[1:]], capture_output=True, text=True,
-                           input=input_text, timeout=RUN_TIMEOUT_S)
+                           input=input_text, timeout=RUN_TIMEOUT_S, env=env)
     except subprocess.TimeoutExpired:
         raise DesktopError(f"{cmd[0]} didn't respond") from None
     except OSError as e:
@@ -280,6 +284,100 @@ def _run(cmd: list[str], input_text: str | None = None) -> str:
         raise DesktopError(detail[0][:160] if detail
                            else f"{cmd[0]} failed ({p.returncode})")
     return p.stdout
+
+
+def spawn_app(cmd: list[str], env: dict[str, str] | None = None,
+              wait_s: float = 5.0) -> int | None:
+    """Start a GUI app detached from this service. Returns the launcher's exit
+    status, or None if it hadn't exited within `wait_s`.
+
+    Not `_run`, for two reasons — both measured on 2026-07-27, and both of
+    which only appear once an app actually *survives* being launched:
+
+    - `capture_output` waits for EOF on the pipes, and the launched app
+      inherits them and holds them open for its whole lifetime. A successful
+      launch therefore blocks until the timeout while a failed one returns at
+      once: the exact inverse of what you want.
+    - A child inherits our cgroup, so everything the dispatcher opened would
+      be killed by `systemctl --user restart mission-dispatcher` — which this
+      project does routinely. A transient scope (the same mechanism behind
+      GNOME's own `app-*.scope` units) moves the app out from under us.
+    """
+    argv = list(cmd)
+    if shutil.which("systemd-run"):
+        argv = ["systemd-run", "--user", "--scope", "--collect", "--quiet",
+                "--slice=app.slice", "--", *argv]
+    exe = shutil.which(argv[0])
+    if not exe:
+        raise DesktopError(f"{argv[0]} isn't installed on this machine")
+    try:
+        p = subprocess.Popen([exe, *argv[1:]], env=env, start_new_session=True,
+                             stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+    except OSError as e:
+        raise DesktopError(f"couldn't run {cmd[0]}: {e}") from None
+    try:
+        return p.wait(timeout=wait_s)
+    except subprocess.TimeoutExpired:
+        return None          # still going: the caller decides what that means
+
+
+# -- session environment -----------------------------------------------------
+
+# What a GUI process needs to find the display and the session bus.
+#
+# The dispatcher is a systemd *user* service, and a user service only carries
+# these if it was started **after** GNOME ran `systemctl --user
+# import-environment` — at boot it isn't, so its environment has no DISPLAY and
+# no WAYLAND_DISPLAY at all. That failed silently and expensively (2026-07-27):
+# `gtk-launch firefox` exits **0** regardless, firefox printed "no DISPLAY
+# environment variable specified" to a pipe nobody read and died, and the verb
+# happily answered "Opening firefox." over an app that never appeared.
+#
+# The systemd user manager itself always holds the real values, so ask it
+# rather than trusting our own snapshot — that also survives a reboot, which
+# putting the variables in the unit file would not.
+SESSION_VARS = (
+    "WAYLAND_DISPLAY", "DISPLAY", "XAUTHORITY", "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_TYPE", "XDG_SESSION_DESKTOP", "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_RUNTIME_DIR",
+)
+
+
+def _manager_environment() -> dict[str, str]:
+    """The systemd user manager's environment block, {} if it can't be read."""
+    try:
+        out = _run(["systemctl", "--user", "show-environment"])
+    except DesktopError:
+        return {}
+    env: dict[str, str] = {}
+    for line in out.splitlines():
+        key, sep, value = line.partition("=")
+        # `$'…'` is systemd's escaping for values that need quoting. Nothing we
+        # want is ever quoted, so skipping those beats mis-unescaping them.
+        if sep and key.isidentifier() and not value.startswith("$'"):
+            env[key] = value
+    return env
+
+
+def session_env() -> dict[str, str]:
+    """Our environment, plus any session variables it is missing.
+
+    Costs nothing when the dispatcher was started inside a graphical session
+    (every variable is already present, so the manager is never asked).
+    """
+    env = dict(os.environ)
+    manager: dict[str, str] | None = None
+    for var in SESSION_VARS:
+        if env.get(var):
+            continue
+        if manager is None:
+            manager = _manager_environment()
+        if manager.get(var):
+            env[var] = manager[var]
+            log.info("desktop: took %s from the systemd user manager", var)
+    return env
 
 
 _VOL_RE = re.compile(r"Volume:\s*([0-9.]+)(\s*\[MUTED\])?")
@@ -317,16 +415,20 @@ def _lock() -> str:
     return "Locking the screen."
 
 
-def _desktop_entries() -> dict[str, str]:
-    """{lowercased app name: desktop id}. Cheap enough to do per call (~190
-    files here) and always current, which beats caching a stale menu."""
-    dirs = [Path(p) / "applications" for p in (
+def _app_dirs() -> list[Path]:
+    """Every directory that can hold a .desktop file, in XDG precedence."""
+    return [Path(p) / "applications" for p in (
         os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local/share"),
         *(os.environ.get("XDG_DATA_DIRS")
           or "/usr/local/share:/usr/share").split(":"),
     ) if p]
+
+
+def _desktop_entries() -> dict[str, str]:
+    """{lowercased app name: desktop id}. Cheap enough to do per call (~190
+    files here) and always current, which beats caching a stale menu."""
     out: dict[str, str] = {}
-    for d in dirs:
+    for d in _app_dirs():
         if not d.is_dir():
             continue
         for f in sorted(d.glob("*.desktop")):
@@ -368,11 +470,92 @@ def resolve_app(query: str) -> str | None:
     return None
 
 
+# Wrappers whose own name says nothing about what is running: for these the
+# desktop id (`com.spotify.Client`) identifies the process, not the binary.
+_WRAPPER_BINARIES = frozenset({"flatpak", "snap", "env", "sh", "bash", "gio"})
+
+
+def _exec_line(ident: str) -> str:
+    """The entry's `Exec=` line, or "" when the file can't be read."""
+    for d in _app_dirs():
+        f = d / f"{ident}.desktop"
+        if not f.is_file():
+            continue
+        try:
+            for line in f.read_text(errors="replace").splitlines():
+                if line.startswith("[Desktop Entry]"):
+                    continue
+                if line.startswith("["):
+                    break                    # only the main group interests us
+                if line.startswith("Exec="):
+                    return line[5:].strip()
+        except OSError:
+            return ""
+    return ""
+
+
+def process_token(ident: str) -> str:
+    """A substring that identifies this app in a process command line."""
+    parts = _exec_line(ident).split()
+    binary = os.path.basename(parts[0]) if parts else ""
+    if not binary or binary in _WRAPPER_BINARIES:
+        return ident
+    return binary
+
+
+def _process_running(token: str, argv0_only: bool = True) -> bool:
+    """Whether a running process looks like this app.
+
+    `argv0_only` matches the executable path alone, because matching the whole
+    command line finds far too much — a terminal running `xdg-open firefox` or
+    a script with the word in it both count as "firefox is up" otherwise (which
+    is exactly what fooled the first live test of this check). Wrapper-launched
+    apps are the exception: `flatpak run … com.spotify.Client` only carries its
+    identity in the later arguments.
+
+    Errs toward True: a false positive just means we go back to trusting
+    gtk-launch, which is what we did before this check existed.
+    """
+    needle = token.encode()
+    for p in Path("/proc").iterdir():
+        if not p.name.isdigit():
+            continue
+        try:
+            raw = (p / "cmdline").read_bytes()
+        except OSError:
+            continue                          # the process exited under us
+        if needle in (raw.split(b"\0", 1)[0] if argv0_only else raw):
+            return True
+    return False
+
+
 def _launch(intent: Intent) -> str:
     ident = resolve_app(intent.arg)
     if not ident:
         raise DesktopError(f"I couldn't find an app called {intent.arg}")
-    _run(["gtk-launch", ident])
+    env = session_env()
+    if not (env.get("WAYLAND_DISPLAY") or env.get("DISPLAY")):
+        raise DesktopError("I can't reach your desktop session")
+
+    # gtk-launch's exit code says only that it forked, so check the app is
+    # actually there afterwards — unless something matching it already was, in
+    # which case launching only raises an existing window and there is nothing
+    # new to see.
+    token = process_token(ident)
+    whole_cmdline = token == ident            # wrapper: identity is in the args
+
+    def running() -> bool:
+        return _process_running(token, argv0_only=not whole_cmdline)
+
+    verify = not running()
+    if spawn_app(["gtk-launch", ident], env):
+        raise DesktopError(f"couldn't launch {intent.arg}")
+    if verify:
+        deadline = time.monotonic() + LAUNCH_SETTLE_S
+        while not running():
+            if time.monotonic() >= deadline:
+                raise DesktopError(f"{intent.arg} didn't start")
+            time.sleep(LAUNCH_POLL_S)
     return f"Opening {intent.arg}."
 
 
@@ -402,12 +585,21 @@ def _open(intent: Intent) -> str:
     if scheme not in OPEN_SCHEMES:
         # hard stop regardless of policy — see the module docstring
         raise DesktopError(f"I won't open a {scheme}: link")
-    _run(["xdg-open", target if scheme else f"https://{target}"])
+    env = session_env()
+    if not (env.get("WAYLAND_DISPLAY") or env.get("DISPLAY")):
+        raise DesktopError("I can't reach your desktop session")
+    # spawn_app, not _run: xdg-open hands off to a browser that inherits our
+    # pipes and cgroup, so the same two traps apply as for `launch`.
+    if spawn_app(["xdg-open", target if scheme else f"https://{target}"], env):
+        raise DesktopError(f"couldn't open {target}")
     return f"Opened {target}."
 
 
 def _clipboard_get() -> str:
-    text = _run(["wl-paste", "-n"]).strip()
+    # wl-paste falls back to the "wayland-0" socket when WAYLAND_DISPLAY is
+    # unset, which is why the clipboard worked while launching didn't — luck,
+    # not design. Hand it the real value.
+    text = _run(["wl-paste", "-n"], env=session_env()).strip()
     if not text:
         return "The clipboard is empty."
     if len(text) > CLIP_MAX:
@@ -419,7 +611,7 @@ def _clipboard_set(intent: Intent) -> str:
     text = (intent.arg or "")[:CLIP_MAX]
     if not text:
         raise DesktopError("nothing to copy")
-    _run(["wl-copy", "--"], input_text=text)
+    _run(["wl-copy", "--"], input_text=text, env=session_env())
     return f"Copied {text[:60]}{'…' if len(text) > 60 else ''}."
 
 
