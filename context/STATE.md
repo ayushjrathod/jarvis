@@ -426,13 +426,12 @@ exists to gate yet).
 
 ## What the user still needs to do
 
-0. **Decide whether `vault/` belongs in a public repo — this one is time-sensitive**
-   (session 30). `github.com/ayushjrathod/jarvis` is public and 42 vault files
-   are tracked and pushed, including `memory/USER.md`, which the nightly
-   consolidation agent rewrites from every episode. `vault/inbox/` is not
-   ignored. Either gitignore the personal subtrees (keeping the READMEs) or make
-   the repo private; adding a gitignore does not unpublish what is already there.
-   Same call needed on `queue/`.
+0. **Vault on a public repo — half fixed 2026-08-03.** Personal subtrees
+   (`briefs/`, `memory/`, `tasks/`, `inbox/*`, live `queue/*.md`) are now
+   ignored and untracked (READMEs + dev notes stay); `git add -A` can no longer
+   sweep in a bank statement. Still open: the 39 files are **already published**
+   in history — either purge them (`filter-repo`) or make the repo private.
+   Same class, still live: `data/` has no vault rule yet for future subtrees.
 0b. **Around 2026-08-17, `backup_db.sh` will delete
    `mission-pre-purge-20260802T000402.db`** — the recovery point taken before
    the knowledge-graph purge. Move it out of `data/backups/` or fix the
