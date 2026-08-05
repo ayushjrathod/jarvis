@@ -6,17 +6,13 @@ and anything requiring judgment stays on the dispatch path).
 from __future__ import annotations
 
 import logging
-import re
 from datetime import date
 from pathlib import Path
 
 from .queue_watcher import parse_task_file
+from .task_status import current_status, set_status
 
 log = logging.getLogger("dispatcher.vault")
-
-# A status line inside the YAML frontmatter — case/space tolerant, and
-# anchored so prose mentioning "status: open" in the body can never flip it.
-_STATUS_LINE = re.compile(r"(?m)^(?P<indent>\s*)status\s*:\s*(?P<value>\S+)\s*$")
 
 
 def _task_files(vault: Path):
@@ -55,19 +51,11 @@ def toggle_task(vault: Path, filename: str) -> dict:
         raise FileNotFoundError(filename)
     text = path.read_text()
     meta, _ = parse_task_file(text)
-    current = str(meta.get("status", "open")).strip().lower()
-    new = "done" if current == "open" else "open"
-    m = _STATUS_LINE.search(text)
-    if text.startswith("---"):
-        end = text.find("---", 3)
-        if end == -1:
-            raise ValueError(f"{filename} has unterminated frontmatter")
-        if m and m.start() < end:
-            text = text[:m.start()] + f"{m.group('indent')}status: {new}" + text[m.end():]
-        else:
-            text = text[:end] + f"status: {new}\n" + text[end:]
-    else:
-        text = f"---\nstatus: {new}\n---\n{text}"
+    new = "done" if current_status(meta) == "open" else "open"
+    try:
+        text = set_status(text, new)
+    except ValueError:
+        raise ValueError(f"{filename} has unterminated frontmatter")
     path.write_text(text)
     return {"file": filename, "status": new}
 

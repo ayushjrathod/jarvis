@@ -18,15 +18,11 @@ it defers; if there isn't, there is nothing to summarise.
 
 from __future__ import annotations
 
-import re
 import time
 from datetime import date
 from pathlib import Path
 
-# `status: open` in a task file's YAML frontmatter. Matched with a regex rather
-# than a YAML parse because one malformed task file must not take out the
-# timer — the same reasoning as the /vault/tasks endpoint's per-file guard.
-_STATUS_OPEN = re.compile(r"^\s*status\s*:\s*open\s*$", re.I | re.M)
+from .task_status import is_open_text
 
 DEFAULT_NOTES_DAYS = 3
 
@@ -35,7 +31,7 @@ def open_tasks(root: Path) -> list[Path]:
     out = []
     for p in sorted((Path(root) / "vault" / "tasks").glob("*.md")):
         try:
-            if _STATUS_OPEN.search(p.read_text(errors="replace")):
+            if is_open_text(p.read_text(errors="replace")):
                 out.append(p)
         except OSError:
             out.append(p)      # unreadable: assume it matters, let the agent look
