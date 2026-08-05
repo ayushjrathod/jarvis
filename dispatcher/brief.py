@@ -18,6 +18,8 @@ it defers; if there isn't, there is nothing to summarise.
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 import time
 from datetime import date
 from pathlib import Path
@@ -77,3 +79,30 @@ def write_quiet(root: Path, day: date, days: int = DEFAULT_NOTES_DAYS) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render_quiet(day, days))
     return path
+
+
+def announce_quiet(day: date, days: int = DEFAULT_NOTES_DAYS) -> str:
+    """The morning ping for a quiet-day brief.
+
+    Since the quiet path skips the model it submits no task, so it never
+    reaches the notify gate — which is why the morning notification silently
+    disappeared. The summary goes out over notify-send instead: zero model
+    cost, same ping the user used to get.
+    """
+    return (
+        f"Morning brief ready ({day.isoformat()}): quiet day — no open tasks, "
+        f"no notes touched in the last {days} days."
+    )
+
+
+def send_quiet_notice(summary: str) -> bool:
+    """Best-effort desktop ping; never raises (a notification must not fail
+    the timer that wrote the brief)."""
+    try:
+        exe = shutil.which("notify-send")
+        if not exe:
+            return False
+        proc = subprocess.run([exe, "Jarvis", summary[:400]], timeout=10)
+        return proc.returncode == 0
+    except Exception:
+        return False

@@ -134,7 +134,12 @@ def main():
         days = int(bcfg.get("quiet_notes_days", brief_mod.DEFAULT_NOTES_DAYS))
         if brief_mod.is_quiet(ROOT, days):
             out_path = brief_mod.write_quiet(ROOT, today, days)
+            summary = brief_mod.announce_quiet(today, days)
+            # No task is submitted on this path, so the notify gate never sees
+            # it — ping the desktop directly instead (best-effort, free).
+            brief_mod.send_quiet_notice(summary)
             print(f"vault is quiet — wrote {out_path.relative_to(ROOT)} without a model call")
+            print(f"NOTIFY: {summary}")
             return
 
     url = f"http://{cfg.host}:{cfg.port}/task"

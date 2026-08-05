@@ -96,5 +96,26 @@ class TestQuietBrief(unittest.TestCase):
         self.assertIn("No open tasks.", p.read_text())
 
 
+class TestQuietAnnounce(unittest.TestCase):
+    def test_summary_names_the_day_and_the_reason(self):
+        s = brief.announce_quiet(date(2026, 8, 5))
+        self.assertIn("2026-08-05", s)
+        self.assertIn("quiet day", s)
+        self.assertIn("no open tasks", s)
+
+    def test_send_never_raises_and_reports_honestly(self):
+        # No notify-send in CI (or a hostile PATH) still returns a bool.
+        self.assertIsInstance(brief.send_quiet_notice("test"), bool)
+
+    def test_send_without_binary_is_false(self):
+        import dispatcher.brief as b
+        real_which = b.shutil.which
+        b.shutil.which = lambda *_: None
+        try:
+            self.assertFalse(b.send_quiet_notice("test"))
+        finally:
+            b.shutil.which = real_which
+
+
 if __name__ == "__main__":
     unittest.main()
