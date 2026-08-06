@@ -359,6 +359,10 @@ class Database:
                 "SELECT metadata FROM tasks"
                 " WHERE json_extract(metadata,'$.task_type')='memory-consolidate'"
                 "   AND status!='done'"
+                # source lives in its own column, outside caller-settable
+                # metadata: only the timer's own consolidation may hold
+                # episodes hostage (added 2026-08-06, finding 2.4).
+                "   AND source='timer'"
             ).fetchall()
         ids: list[int] = []
         for r in rows:

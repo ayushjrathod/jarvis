@@ -870,6 +870,69 @@ class TestTrustBoundaryMetadata(unittest.TestCase):
         self.assertNotIn("resume_session_id", out)
         self.assertEqual(out["max_cost_usd"], 3.0)
 
+    def test_untrusted_cannot_name_episodes(self):
+        # Finding 2.4: episode_ids names the batch a failed consolidation
+        # returns to the pool. Anyone reaching POST /task could previously
+        # hand any failing task a set of ids to resurrect.
+        from dispatcher.service import sanitize_untrusted_metadata
+        out = sanitize_untrusted_metadata(
+            {"task_type": "memory-consolidate", "episode_ids": [1, 2, 3],
+             "automation_id": "kept", "notify": False},
+            cost_cap=3.0)
+        self.assertNotIn("episode_ids", out)
+        # ...while the keys the divert path legitimately carries survive.
+        self.assertEqual(out["automation_id"], "kept")
+        self.assertIs(out["notify"], False)
+        self.assertEqual(out["task_type"], "memory-consolidate")
+
+
+class TestForgedConsolidation(unittest.IsolatedAsyncioTestCase):
+    """Finding 2.4, second half: even past the sanitizer (or predating it),
+    a task that merely CLAIMS task_type memory-consolidate must not move
+    episodes. Only the timer's own consolidation holds a batch hostage."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        cfg = Config(root=Path(self.tmp.name))
+        cfg.db_path = Path(self.tmp.name) / "t.db"
+        from dispatcher.service import Service
+        self.svc = Service(cfg)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    async def test_forged_consolidation_from_api_resurrects_nothing(self):
+        eids = [self.svc.db.add_episode(None, "voice", "quick", None, "done",
+                                        f"q{i}", f"a{i}") for i in range(2)]
+        self.svc.db.mark_episodes_consolidated(eids)
+        task = self.svc.db.create_task(
+            "consolidate", "api", "agentic", None,
+            {"task_type": "memory-consolidate", "episode_ids": eids})
+
+        async def boom(_task):
+            raise RuntimeError("kaboom")
+
+        from unittest.mock import patch
+        with patch.object(self.svc, "_run_agentic_inner", boom):
+            await self.svc._run_agentic(task)
+        remaining = {e["id"] for e in self.svc.db.unconsolidated_episodes(50)}
+        self.assertEqual(remaining, set())
+
+    def test_startup_sweep_ignores_non_timer_rows(self):
+        eids = [self.svc.db.add_episode(None, "voice", "quick", None, "done",
+                                        "q", "a")]
+        self.svc.db.mark_episodes_consolidated(eids)
+        task = self.svc.db.create_task(
+            "consolidate", "api", "agentic", None,
+            {"task_type": "memory-consolidate", "episode_ids": eids})
+        self.svc.db.set_task_status(task["id"], "running")
+        from dispatcher.service import Service
+        cfg2 = Config(root=Path(self.tmp.name))
+        cfg2.db_path = self.svc.cfg.db_path
+        svc2 = Service(cfg2)  # next boot: forged row must not resurrect
+        remaining = {e["id"] for e in svc2.db.unconsolidated_episodes(50)}
+        self.assertEqual(remaining, set())
+
     def test_config_defaults_simulate_refusal_off(self):
         from pathlib import Path
         from dispatcher.config import Config

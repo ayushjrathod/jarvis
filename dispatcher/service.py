@@ -91,10 +91,14 @@ def make_ack(text: str) -> str:
 
 
 # Metadata keys an UNtrusted caller must never be able to widen with: granting
-# tools or injecting a resume session. max_cost_usd is clamped (not dropped) so
-# an external caller can still narrow the budget. Internal server spawns pass
-# trusted=True and keep all three (they legitimately set them).
-_TRUSTED_ONLY_META_KEYS = ("allowed_tools", "resume_session_id")
+# tools, injecting a resume session, or naming episodes. max_cost_usd is
+# clamped (not dropped) so an external caller can still narrow the budget.
+# Internal server spawns pass trusted=True and keep all four (they
+# legitimately set them). `episode_ids` joined this list 2026-08-06: the key
+# names the batch a FAILED consolidation returns to the pool, and anyone
+# reaching POST /task could previously hand any failing task a set of ids to
+# resurrect — persisting across restarts via the startup sweep.
+_TRUSTED_ONLY_META_KEYS = ("allowed_tools", "resume_session_id", "episode_ids")
 
 # `simulate_refusal` forces the refusal fallback, i.e. a SECOND run of the same
 # task on models.fallback (an Opus). It is a test seam, but it sat outside the
@@ -369,10 +373,16 @@ class Service:
         final = "done" if divert.get("ok") else "failed"
         # Caller metadata (automations.fire passes automation_id/notify) is
         # kept: dropping it silently broke the task->automation link on the row.
+        # But it crosses UNsanitized no longer: queue-file frontmatter used to
+        # reach create_task marked trusted, the one place an untrusted dict
+        # crossed the boundary as trusted. trusted=False still keeps
+        # automation_id/notify (not in the drop list) while stripping anything
+        # a caller must never set; task_type/divert are assigned after the
+        # merge below, so a forged task_type cannot survive either.
         meta = {**(metadata or {}),
                 "task_type": "divert", "divert": divert["kind"]}
         task = await self.create_task(text, source, "quick", None, meta,
-                                      trusted=True)
+                                      trusted=False)
         self.db.set_task_status(task["id"], final)
         await self.fire(final, task, speech=divert["speech"],
                         divert=divert["kind"], cost_usd=0.0)
@@ -690,6 +700,20 @@ class Service:
         except (TypeError, ValueError):
             meta = {}
         if (meta or {}).get("task_type") != "memory-consolidate":
+            return
+        # Only the timer's own consolidation may return episodes. task_type and
+        # episode_ids are caller-settable on the wire (episode_ids is stripped
+        # for untrusted callers now, but rows predate the fix and defense
+        # belongs at the use site too): without the source gate, any failing
+        # task claiming to be a consolidation resurrected arbitrary episodes.
+        source = task.get("source")
+        if source is None:
+            try:
+                row = self.db.get_task(task["id"]) or {}
+                source = row.get("source")
+            except Exception:
+                source = None
+        if source != "timer":
             return
         ids = (meta or {}).get("episode_ids")
         if not ids:
