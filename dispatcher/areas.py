@@ -19,16 +19,53 @@ import yaml
 log = logging.getLogger("dispatcher.areas")
 
 
+# Tools that read nothing writable: allowed bare or scoped — a scope on one
+# of these can only narrow what is already read-only.
+_READ_ONLY = frozenset({"Read", "Glob", "Grep"})
+
+# The only roots a scoped write grant may cover. vault/ holds memory, tasks
+# and briefs (the three on-disk grants areas actually hold); areas/ lets the
+# learn/reflection loop author skills; data/ covers the SQLite/index files.
+_SCOPE_ROOTS = ("vault/", "areas/", "data/")
+
+
+def _scope_is_safe(scope: str) -> bool:
+    """A permission scope like `vault/tasks/**` that cannot escape its root:
+    non-empty, relative, with no `..` segment, under an allowlisted root.
+    `**`, `/abs/path`, `../../etc` and `~/x` all fail — positively, not by
+    matching known-bad shapes."""
+    s = scope.strip()
+    if not s or s.startswith(("/", "~")):
+        return False
+    if ".." in s.split("/"):
+        return False
+    return s.startswith(_SCOPE_ROOTS)
+
+
 def _is_privileged_tool(tool: str) -> bool:
-    """A tool grant that must not appear in an untrusted area's frontmatter:
-    Bash (any form) or an UNSCOPED Edit/Write (no path filter). "Edit(areas/**)"
-    is scoped and fine; a bare "Edit"/"Write" grants repo-wide writes."""
-    base = tool.split("(", 1)[0].strip()
+    """A tool grant that must not appear in an untrusted area's frontmatter.
+
+    Positive test, fail-closed: Bash in any form; the whole Edit/Write family
+    (Edit, Write, MultiEdit, NotebookEdit — a bare name or an unsafe scope);
+    and anything else that isn't a known read-only tool (MCP tools, Task,
+    WebFetch, future names). The old test read "contains a parenthesis" as
+    "is scoped", so `Edit(**)` sailed through and a reflection run could
+    escalate to repo-wide write — then to config.yaml, then to real Bash."""
+    base, _, arg = tool.partition("(")
+    base = base.strip()
     if base == "Bash":
         return True
-    if base in ("Edit", "Write"):
-        return "(" not in tool
-    return False
+    if base in _READ_ONLY:
+        return False
+    if base.endswith("Edit") or base.endswith("Write"):
+        # Write(path) rules are silently ignored by the CLI, so stripping one
+        # changes nothing at runtime — and keeping the family uniform means
+        # the next *Edit-shaped tool is closed by default, not open.
+        arg = arg.strip()
+        if not arg or not arg.endswith(")"):
+            return True
+        return not _scope_is_safe(arg[:-1])
+    return True
 
 
 def _sanitize_tools(tools: list, dir_name: str, privileged: set) -> list:

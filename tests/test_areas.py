@@ -310,5 +310,49 @@ class TestAgentToolResolution(unittest.TestCase):
         self.assertIn("Edit(vault/briefs/**)", tools)
 
 
+class TestScopeEscalationHole(unittest.TestCase):
+    """Finding 0.2: the old sanitizer read 'contains a parenthesis' as 'is
+    scoped', so Edit(**) survived load and a reflection run holding
+    Edit(areas/**) could grant itself repo-wide write — then config.yaml,
+    then real Bash. Proved end to end before fixing."""
+
+    PROBES = [
+        "Edit(**)", "Edit(/**)", "Edit(../../**)",
+        "Edit(/home/ayra/**)", "Edit(areas/../../.claude-per/**)",
+        "Edit", "Write", "MultiEdit", "NotebookEdit",
+        "mcp__claude_ai_Gmail__search_threads",
+        "mcp__claude_ai_Google_Drive__create_file",
+        "Task", "WebFetch", "Bash", "Bash(ls:*)",
+    ]
+    KEPT = [
+        "Read", "Glob", "Grep",
+        "Edit(areas/**)", "Edit(vault/memory/**)", "Edit(vault/tasks/**)",
+        "Edit(vault/briefs/**)", "Edit(data/**)",
+        # Write(path) rules are ignored by the CLI, so a scoped one is inert
+        # kept or stripped — the uniform scope rule keeps it.
+        "Write(vault/tasks/**)",
+    ]
+
+    def _load(self, *tools):
+        import tempfile
+        from pathlib import Path as P
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        area = P(tmp.name) / "probe"
+        area.mkdir()
+        lines = "".join(f"  - '{t}'\n" for t in tools)
+        (area / "SKILL.md").write_text(
+            f"---\nname: probe\nallowed_tools:\n{lines}---\nbody\n")
+        return AreaRegistry(P(tmp.name)).load()["probe"].allowed_tools
+
+    def test_escalation_probes_are_stripped(self):
+        kept = self._load(*self.PROBES)
+        self.assertEqual(kept, [], f"survived the sanitizer: {kept}")
+
+    def test_legitimate_grants_survive(self):
+        kept = self._load(*self.KEPT)
+        self.assertEqual(kept, list(self.KEPT))
+
+
 if __name__ == "__main__":
     unittest.main()
