@@ -248,6 +248,17 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def local_today() -> str:
+    """Local YYYY-MM-DD for anything a human reads as "today".
+
+    `now()` is UTC; the timers fire on local wall-clock (02:30 local is 21:00
+    UTC the previous day at +5:30), so stamping a prompt with `now()[:10]`
+    told every nightly agent today was yesterday. Naive `datetime.now()` is
+    the same clock systemd OnCalendar and scripts/run_agent.py use, so the
+    brief and the memory blocks finally agree on what day it is."""
+    return datetime.now().date().isoformat()
+
+
 class Database:
     def __init__(self, path: str | Path):
         self.path = Path(path)

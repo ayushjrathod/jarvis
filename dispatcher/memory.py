@@ -18,7 +18,7 @@ import yaml
 
 from .areas import AreaRegistry
 from .config import Config
-from .db import Database, now
+from .db import Database, local_today, now
 
 log = logging.getLogger("dispatcher.memory")
 
@@ -209,7 +209,7 @@ def build_consolidation(cfg: Config, db: Database) -> dict | None:
             meta = yaml.safe_load(parts[1]) or {}
             text = parts[2].strip()
     rel = str(export.relative_to(cfg.root))
-    text = text.replace("{{EPISODES_FILE}}", rel).replace("{{DATE}}", now()[:10])
+    text = text.replace("{{EPISODES_FILE}}", rel).replace("{{DATE}}", local_today())
 
     # Grants come through AreaRegistry, NOT from the frontmatter we just parsed
     # for the body (H2). This task is submitted trusted=True, so an unsanitized
