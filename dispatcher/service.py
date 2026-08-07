@@ -1103,9 +1103,12 @@ class Service:
             log.info("desktop: %s awaiting confirmation (%s)", intent.verb, cid)
             return {"status": "needs_confirmation", "confirm_id": cid,
                     "speech": speech}
-        speech = await asyncio.to_thread(desktop.run_intent, intent)
+        # run_intent_ok, not run_intent: the executor never raises, so the
+        # sentence alone cannot tell success from failure — and a failed
+        # launch ("open tasks" parsed as launch 'tasks') used to settle done.
+        ok, speech = await asyncio.to_thread(desktop.run_intent_ok, intent)
         log.info("desktop: ran %s -> %s", intent.verb, speech[:80])
-        return {"status": "done", "speech": speech}
+        return {"status": "done" if ok else "failed", "speech": speech}
 
     async def confirm_desktop(self, confirm_id: str, approve: bool) -> dict:
         """Answer a parked desktop confirmation. Unknown/expired ids are
@@ -1118,9 +1121,9 @@ class Service:
         if not approve:
             log.info("desktop: user declined %s", entry["intent"].verb)
             return {"status": "declined", "speech": "Okay, skipping it."}
-        speech = await asyncio.to_thread(desktop.run_intent, entry["intent"])
+        ok, speech = await asyncio.to_thread(desktop.run_intent_ok, entry["intent"])
         log.info("desktop: confirmed %s -> %s", entry["intent"].verb, speech[:80])
-        return {"status": "done", "speech": speech}
+        return {"status": "done" if ok else "failed", "speech": speech}
 
     def _expire_desktop_confirms(self):
         now = time.monotonic()

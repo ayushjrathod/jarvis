@@ -930,6 +930,24 @@ _EXECUTORS = {
 }
 
 
+def run_intent_ok(intent: Intent) -> tuple[bool, str]:
+    """(acted, speakable sentence). run_intent() never raises, so a failed
+    launch used to come back as a sorry-sentence the service filed 'done' —
+    every parser miss ("open tasks", "run migrations") looked like success
+    and was never seen by a model. The bool is what the service settles on;
+    the sentence is what Jarvis speaks."""
+    fn = _EXECUTORS.get(intent.verb)
+    if fn is None:
+        return False, "I don't know how to do that yet."
+    try:
+        return True, fn(intent)
+    except DesktopError as e:
+        return False, f"Sorry — {e}."
+    except Exception:
+        log.exception("desktop verb %s crashed", intent.verb)
+        return False, "Sorry, that didn't work."
+
+
 def run_intent(intent: Intent) -> str:
     """Execute and return a speakable sentence. Never raises — every failure
     becomes something Jarvis can say, exactly like spotify.run_intent.
@@ -938,13 +956,4 @@ def run_intent(intent: Intent) -> str:
     Policy is checked by the *caller* — this function assumes the verb was
     already allowed, so tests can exercise executors directly.
     """
-    fn = _EXECUTORS.get(intent.verb)
-    if fn is None:
-        return "I don't know how to do that yet."
-    try:
-        return fn(intent)
-    except DesktopError as e:
-        return f"Sorry — {e}."
-    except Exception:
-        log.exception("desktop verb %s crashed", intent.verb)
-        return "Sorry, that didn't work."
+    return run_intent_ok(intent)[1]
