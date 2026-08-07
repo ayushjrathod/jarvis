@@ -91,6 +91,10 @@ VETO = (
     "foul play", "play on youtube", "play the video", "play a video",
     "play on netflix", "play tennis", "play football", "play cricket",
     "play chess", "play a game", "play games",
+    # finding 1.3: "play it by ear" is an idiom, and nobody's kettle is a
+    # track — "put on the kettle" resolved as play 'the kettle'. The object
+    # is vetoed, never the verb, so "put on some jazz" still plays.
+    "by ear", "kettle",
 )
 
 # Matched on word boundaries, not as bare substrings (fixed 2026-08-08). An

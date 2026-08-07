@@ -117,7 +117,8 @@ class TestDetectNegatives(unittest.TestCase):
     def test_idioms_vetoed(self):
         for t in ("play devil's advocate for a second",
                   "let me play devils advocate", "play it safe here",
-                  "play a video of the talk", "play chess with me"):
+                  "play a video of the talk", "play chess with me",
+                  "play it by ear on the demo", "put on the kettle"):
             self.assertIsNone(spotify.detect(t), t)
 
     def test_questions_go_to_claude(self):
@@ -165,6 +166,8 @@ VETO_SENTENCES = {
     "play cricket": "play cricket this weekend",
     "play chess": "play chess with me",
     "play a game": "play a game with me",
+    "by ear": "play it by ear on the demo",
+    "kettle": "put on the kettle",
 }
 
 
