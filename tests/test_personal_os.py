@@ -420,6 +420,21 @@ class TestAutomationsDb(unittest.TestCase):
         self.assertEqual(self.db.get_automation(row2["id"])["next_run_at"],
                          "2027-06-01T00:00:00+00:00")
 
+    def test_reenabling_a_spent_once_does_not_resurrect_it(self):
+        # The toggle recomputes next_run_at on enable; for a lapsed `once`
+        # next_run_iso returns None — and the old code then KEPT the stale
+        # past-due timestamp, firing within 30s of clicking resume.
+        row = self.db.create_automation("once", "api",
+                                        {**self.spec, "kind": "once",
+                                         "time": None,
+                                         "once_at": "2026-07-19T07:30"},
+                                        "2026-07-19T02:00:00+00:00")
+        self.db.set_automation_enabled(row["id"], False)
+        self.db.set_automation_enabled(row["id"], True, None)  # toggle path
+        got = self.db.get_automation(row["id"])
+        self.assertIsNone(got["next_run_at"])
+        self.assertFalse(self.db.due_automations("2027-01-01T00:00:00+00:00"))
+
     def test_delete(self):
         row = self.db.create_automation("r", "api", self.spec, None)
         self.assertTrue(self.db.delete_automation(row["id"]))

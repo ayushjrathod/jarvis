@@ -674,9 +674,14 @@ class Database:
     def set_automation_enabled(self, automation_id: int, enabled: bool,
                                next_run_at: str | None = None) -> bool:
         """Re-enabling passes a freshly computed next_run_at so a long-disabled
-        daily doesn't instantly fire on a stale past-due timestamp."""
+        daily doesn't instantly fire on a stale past-due timestamp. And when
+        the recompute is None — a spent `once` whose time has passed — the
+        NULL is WRITTEN, not skipped: the old code kept the stale timestamp
+        and the automation fired within 30s of clicking resume. NULL is the
+        spent state everywhere (the scheduler only selects non-NULL rows), so
+        a spent once stays spent instead of resurrecting."""
         with self._conn() as c:
-            if enabled and next_run_at is not None:
+            if enabled:
                 cur = c.execute(
                     "UPDATE automations SET enabled=1, next_run_at=? WHERE id=?",
                     (next_run_at, automation_id))
