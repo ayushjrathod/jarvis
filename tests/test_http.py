@@ -725,15 +725,15 @@ class TestDesktopRoutes(HTTPTestCase):
         self.assertEqual(r.json()["status"], "unrecognized")
 
     def test_an_allowed_verb_runs_and_speaks(self):
-        with patch("dispatcher.service.desktop.run_intent",
-                   return_value="Locked.") as run:
+        with patch("dispatcher.service.desktop.run_intent_ok",
+                   return_value=(True, "Locked.")) as run:
             r = self.client.post("/desktop", json={"command": "lock the screen"})
         self.assertEqual(r.json(), {"status": "done", "speech": "Locked."})
         self.assertEqual(run.call_args[0][0].verb, "lock")
 
     def test_a_denied_verb_never_reaches_the_executor(self):
         self.cfg.computer = {"enabled": True, "policy": {"lock": "deny"}}
-        with patch("dispatcher.service.desktop.run_intent") as run:
+        with patch("dispatcher.service.desktop.run_intent_ok") as run:
             r = self.client.post("/desktop", json={"command": "lock the screen"})
         run.assert_not_called()
         self.assertEqual(r.json()["status"], "denied")
@@ -741,7 +741,7 @@ class TestDesktopRoutes(HTTPTestCase):
     def test_a_confirm_verb_parks_instead_of_acting(self):
         # `open` is confirm-by-default: an arbitrary URL is an exfiltration
         # channel and the obvious prompt-injection payload.
-        with patch("dispatcher.service.desktop.run_intent") as run:
+        with patch("dispatcher.service.desktop.run_intent_ok") as run:
             r = self.client.post("/desktop", json={"command": "open github.com"})
         run.assert_not_called()
         body = r.json()
@@ -753,8 +753,8 @@ class TestDesktopRoutes(HTTPTestCase):
     def test_confirming_runs_the_parked_intent_exactly_once(self):
         cid = self.client.post("/desktop",
                                json={"command": "open github.com"}).json()["confirm_id"]
-        with patch("dispatcher.service.desktop.run_intent",
-                   return_value="Opening github.com.") as run:
+        with patch("dispatcher.service.desktop.run_intent_ok",
+                   return_value=(True, "Opening github.com.")) as run:
             first = self.client.post("/desktop/confirm",
                                      json={"confirm_id": cid, "approve": True})
             replay = self.client.post("/desktop/confirm",
@@ -767,7 +767,7 @@ class TestDesktopRoutes(HTTPTestCase):
     def test_declining_drops_the_intent_without_running_it(self):
         cid = self.client.post("/desktop",
                                json={"command": "open github.com"}).json()["confirm_id"]
-        with patch("dispatcher.service.desktop.run_intent") as run:
+        with patch("dispatcher.service.desktop.run_intent_ok") as run:
             r = self.client.post("/desktop/confirm",
                                  json={"confirm_id": cid, "approve": False})
         run.assert_not_called()
@@ -778,14 +778,14 @@ class TestDesktopRoutes(HTTPTestCase):
         cid = self.client.post("/desktop",
                                json={"command": "open github.com"}).json()["confirm_id"]
         self.svc.pending_desktop[cid]["expires"] = time.monotonic() - 1
-        with patch("dispatcher.service.desktop.run_intent") as run:
+        with patch("dispatcher.service.desktop.run_intent_ok") as run:
             r = self.client.post("/desktop/confirm",
                                  json={"confirm_id": cid, "approve": True})
         run.assert_not_called()
         self.assertEqual(r.json()["status"], "expired")
 
     def test_an_unknown_confirm_id_is_reported_not_executed(self):
-        with patch("dispatcher.service.desktop.run_intent") as run:
+        with patch("dispatcher.service.desktop.run_intent_ok") as run:
             r = self.client.post("/desktop/confirm",
                                  json={"confirm_id": "nope", "approve": True})
         run.assert_not_called()
