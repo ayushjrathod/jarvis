@@ -12,6 +12,19 @@ queue/.processed/
 # file is arbitrary user text; leaving .failed/ tracked put it in `git status`,
 # where `git add -A` sweeps it into a commit.
 queue/.failed/
+# Live queue drops are the same class of arbitrary user text (added 2026-08-03).
+queue/*.md
+!queue/README.md
+
+# Personal vault subtrees — this repo is public (added 2026-08-03, see
+# context/STATE.md). Briefs, memory blocks rewritten nightly from episodes,
+# voice-written tasks, and anything dropped in the inbox stay on this box.
+# Keep the READMEs and the benign dev notes tracked.
+vault/briefs/
+vault/memory/
+vault/tasks/
+vault/inbox/*
+!vault/inbox/README.md
 
 # python
 .venv/
