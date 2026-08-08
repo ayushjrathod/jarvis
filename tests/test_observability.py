@@ -170,6 +170,24 @@ class TestRunStepsAndStats(unittest.TestCase):
         self.assertEqual(s["recent_reflections"][0]["output_text"],
                          "Patched tasks skill.")
 
+    def test_by_source_counts_tasks_not_runs(self):
+        """A refusal-fallback gives one task two runs; the LEFT JOIN to runs
+        then fanned that task out and `n` silently meant "runs", disagreeing
+        with tasks_by_status on the very same response."""
+        t1 = self.db.create_task("refused then retried", "voice", "quick")
+        for attempt, model in ((1, "sonnet"), (2, "opus")):
+            rid = self.db.create_run(t1["id"], attempt, model)
+            self.db.finish_run(rid, "done", cost_usd=0.10)
+        self.db.set_task_status(t1["id"], "done")
+        t2 = self.db.create_task("one shot", "voice", "quick")
+        self.db.finish_run(self.db.create_run(t2["id"], 1, "sonnet"),
+                           "done", cost_usd=0.05)
+        self.db.set_task_status(t2["id"], "done")
+
+        by_source = {r["source"]: r for r in self.db.stats_summary(7)["by_source"]}
+        self.assertEqual(by_source["voice"]["n"], 2)          # tasks, not 3 runs
+        self.assertAlmostEqual(by_source["voice"]["cost_usd"], 0.25)  # all runs
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,7 +26,6 @@ class Config:
     budgets: dict = field(default_factory=dict)
     default_tools: list = field(default_factory=list)
     task_types: dict = field(default_factory=dict)
-    prices: dict = field(default_factory=dict)
     memory: dict = field(default_factory=dict)
     learning: dict = field(default_factory=dict)
     automations: dict = field(default_factory=dict)
@@ -64,7 +63,6 @@ class Config:
         cfg.budgets = d.get("budgets", {})
         cfg.default_tools = (d.get("task_defaults") or {}).get("allowed_tools", [])
         cfg.task_types = d.get("task_types", {})
-        cfg.prices = d.get("prices", {})
         cfg.memory = d.get("memory", {})
         cfg.learning = d.get("learning", {})
         cfg.automations = d.get("automations", {})
@@ -96,12 +94,20 @@ class Config:
         area has those grants stripped at load time (areas.py)."""
         return self.security.get("privileged_areas") or []
 
+    @property
+    def allow_simulate_refusal(self) -> bool:
+        """Whether an EXTERNAL caller may set `metadata.simulate_refusal` and so
+        force a second run on the fallback model. False by default — it is a
+        test seam, and leaving it open let anything reaching POST /task double
+        the cost of every agentic run (found 2026-08-08). Turn it on only while
+        running scripts/smoke_phase_a.sh."""
+        return bool(self.security.get("allow_simulate_refusal"))
+
     def tools_for(self, task_type: str | None) -> list[str]:
         tt = self.task_types.get(task_type or "", {})
         return tt.get("allowed_tools", self.default_tools)
 
-    def quick_cost(self, model: str, input_tokens: int, output_tokens: int) -> float | None:
-        p = self.prices.get(model)
-        if not p:
-            return None
-        return input_tokens * p["input"] / 1e6 + output_tokens * p["output"] / 1e6
+    # `quick_cost()` and the `prices:` block it read lived here to price the
+    # Messages API's token counts by hand. That backend was removed 2026-07-27
+    # and `claude -p` reports `total_cost_usd` itself, so both were dead —
+    # removed 2026-08-02, same clean-up as `budgets.quick_max_tokens`.

@@ -154,6 +154,20 @@ class TestEndpoints(unittest.TestCase):
                         headers={"origin": "https://evil.example"})
         self.assertEqual(r.status_code, 403)
 
+    def test_origin_null_is_rejected(self):
+        # what a sandboxed iframe sends. "" was in _LOCAL_HOSTS to allow an
+        # ABSENT Origin — but the guard already handles that separately, so the
+        # only thing "" admitted was urlsplit("null").hostname → None → "".
+        r = self.client.post("/stt", content=b"x" * 500,
+                             headers={"origin": "null"})
+        self.assertEqual(r.status_code, 403)
+
+    def test_absent_origin_still_allowed(self):
+        # curl, the jarvis python client and same-host MediaRecorder send none
+        with patch("dispatcher.stt.get_stt", return_value=_FakeSTT()):
+            r = self.client.post("/stt", content=b"x" * 500)
+        self.assertEqual(r.status_code, 200)
+
 
 class TestScreenshotQuickPath(unittest.IsolatedAsyncioTestCase):
     """Step-4 behavior: first turn wraps the prompt + grants Read; resumed

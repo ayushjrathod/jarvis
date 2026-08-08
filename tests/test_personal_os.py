@@ -2,11 +2,13 @@
 scheduler firing, notify-or-not gate policy. stdlib unittest, no network."""
 
 import asyncio
+import json
 import shutil
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 from dispatcher import automations, notify, service
 from dispatcher.db import Database
@@ -233,6 +235,46 @@ class TestDetect(unittest.TestCase):
                      "save this: standup is every weekday"):
             self.assertFalse(automations.detect(text), text)
 
+    def test_anything_before_the_question_word_used_to_defeat_the_veto(self):
+        # QUESTION_RE/STATEMENT_RE are anchored at ^, so a single word in front
+        # of the question defeated them — and the voice path splices the wake
+        # word onto EVERY transcript (wake_prebuffer_ms), so in practice they
+        # almost never fired. Each of these cost an automation-parse call,
+        # created a standing automation that fires forever, and was never
+        # answered (found 2026-08-08).
+        for text in ("hey jarvis, what do I have every morning?",
+                     "so what happens every day at 9?",
+                     "okay what runs every night",
+                     "please, can you tell me what I do every morning",
+                     "i wonder why the backup runs every night"):
+            self.assertFalse(automations.detect(text), text)
+
+    def test_the_wake_word_does_not_break_a_real_request(self):
+        # ...and stripping it must not cost us the true positives
+        for text in ("hey jarvis, every weekday at 10 post the standup note",
+                     "hey jarvis every morning at 7 play jazz"):
+            self.assertTrue(automations.detect(text), text)
+
+    def test_descriptions_of_the_world_are_not_instructions(self):
+        # a statement of fact carries the schedule words but asks for nothing
+        for text in ("my gym schedule is every monday and thursday",
+                     "the standup is every weekday at 10",
+                     "our release train is every two weeks"):
+            self.assertFalse(automations.detect(text), text)
+
+    def test_retrospective_windows_are_not_recurrences(self):
+        # "every day this week" bounds a report; none of the four supported
+        # kinds can express it anyway
+        for text in ("summarize what I did every day this week",
+                     "how much did I spend every week last month"):
+            self.assertFalse(automations.detect(text), text)
+
+    def test_a_trailing_question_mark_vetoes(self):
+        # the same veto desktop.detect applies, for the same reason: a divert
+        # SWALLOWS the request, so a false positive costs far more than a miss
+        self.assertFalse(automations.detect("every morning at 7 play jazz?"))
+        self.assertTrue(automations.detect("every morning at 7 play jazz"))
+
 
 class TestValidateSpec(unittest.TestCase):
     def test_daily_normalizes_time(self):
@@ -444,6 +486,190 @@ class TestFireAutomation(unittest.TestCase):
         self.assertFalse(self.db.due_automations("2027-01-01T00:00:00+00:00"))
 
 
+class TestSubmitDiverts(unittest.IsolatedAsyncioTestCase):
+    """The deterministic diverts live on Service.submit, not only on the HTTP
+    handler — otherwise "every morning play jazz" became a standing automation
+    that then handed "play jazz" to Claude as an agentic task every morning,
+    because automations.fire and the queue watcher call submit() directly.
+    """
+
+    def setUp(self):
+        from dispatcher.config import Config
+        from dispatcher.service import Service
+        self.tmp = tempfile.TemporaryDirectory()
+        cfg = Config(root=Path(self.tmp.name))
+        cfg.db_path = Path(self.tmp.name) / "t.db"
+        cfg.media = {"enabled": True, "nl_detect": True}
+        cfg.computer = {"enabled": True, "nl_detect": True,
+                        "policy": {"lock": "allow"}}
+        cfg.automations = {"enabled": True, "nl_detect": True}
+        self.svc = Service(cfg)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    async def test_fired_automation_reaches_the_player_not_the_model(self):
+        with mock.patch("dispatcher.service.spotify.run_intent",
+                        return_value="Playing jazz.") as run:
+            task = await self.svc.submit("play jazz", source="automation",
+                                         mode="auto", trusted=True)
+        run.assert_called_once()
+        self.assertEqual(task["divert"]["kind"], "media")
+        self.assertEqual(task["status"], "done")
+        self.assertFalse(self.svc.bg)          # no model run was ever started
+
+    async def test_diverted_command_is_recorded_as_a_settled_task(self):
+        with mock.patch("dispatcher.service.desktop.run_intent",
+                        return_value="Locking the screen."):
+            task = await self.svc.submit("lock the screen", source="queue",
+                                         mode="auto")
+        row = self.svc.db.get_task(task["id"])
+        self.assertEqual(row["status"], "done")
+        self.assertEqual(row["runs"], [])      # no model attempt to log
+        self.assertEqual(json.loads(row["metadata"])["divert"], "desktop")
+
+    async def test_an_automation_never_breeds_another_automation(self):
+        # a task_text the parser left schedule words in would otherwise create
+        # a fresh row on every single fire
+        with mock.patch.object(self.svc, "create_automation_from_nl") as create:
+            with mock.patch("dispatcher.service.spotify.run_intent",
+                            return_value="Playing jazz."):
+                await self.svc.submit("every morning play jazz",
+                                      source="automation", mode="auto")
+            create.assert_not_called()
+        self.assertEqual(self.svc.db.list_automations(), [])
+
+    async def test_explicit_mode_bypasses_every_divert(self):
+        with mock.patch("dispatcher.service.spotify.run_intent") as run:
+            with mock.patch.object(self.svc, "start_agentic"):
+                task = await self.svc.submit("play jazz", source="api",
+                                             mode="agentic")
+        run.assert_not_called()
+        self.assertEqual(task["kind"], "agentic")
+
+    async def test_ordinary_text_is_untouched(self):
+        with mock.patch.object(self.svc, "_drain_quick",
+                               new=mock.AsyncMock()) as drain:
+            task = await self.svc.submit("what is the capital of France",
+                                         source="api", mode="auto")
+        drain.assert_called_once()
+        self.assertEqual(task["kind"], "quick")
+
+    # -- a divert that did not act must not be filed 'done' (2026-08-08) -----
+
+    async def _submit_capturing_notices(self, text, source, patch, meta=None):
+        """submit() while recording every hook event and desktop notification."""
+        events = []
+
+        async def spy(payload):
+            events.append(payload)
+
+        self.svc.hooks.fire = spy
+        sent = []
+        with mock.patch("dispatcher.notify.send_desktop",
+                        new=mock.AsyncMock(side_effect=lambda s: sent.append(s))):
+            with patch:
+                task = await self.svc.submit(text, source=source, mode="auto",
+                                             trusted=True, metadata=meta)
+        return task, events, sent
+
+    async def test_a_parked_confirmation_is_not_success(self):
+        # 'open' policy is confirm; a queue file or an automation has no user
+        # watching, so the intent parks, expires in 120s and NOTHING happens.
+        # Filing that 'done' is the silent-false-success mode the runner's
+        # denial detection exists to prevent.
+        self.svc.cfg.computer["policy"]["open"] = "confirm"
+        task, _, _ = await self._submit_capturing_notices(
+            "open https://example.com", "queue",
+            mock.patch("dispatcher.service.desktop.run_intent",
+                       return_value="Opening."))
+        self.assertEqual(self.svc.db.get_task(task["id"])["status"], "failed")
+
+    async def test_a_denied_verb_is_not_success(self):
+        self.svc.cfg.computer["policy"]["lock"] = "deny"
+        task, _, _ = await self._submit_capturing_notices(
+            "lock the screen", "automation",
+            mock.patch("dispatcher.service.desktop.run_intent",
+                       return_value="Locking."))
+        self.assertEqual(self.svc.db.get_task(task["id"])["status"], "failed")
+
+    async def test_an_unresolvable_play_is_not_success(self):
+        # media_command reports status, so "I couldn't work out what to play."
+        # no longer reads as a completed task.
+        from dispatcher import spotify
+        with mock.patch("dispatcher.service.spotify.detect",
+                        return_value=spotify.MAYBE):
+            task, _, _ = await self._submit_capturing_notices(
+                "put on something chill", "automation", mock.patch.object(
+                    self.svc, "_parse_media", new=mock.AsyncMock(return_value=None)))
+        self.assertEqual(self.svc.db.get_task(task["id"])["status"], "failed")
+
+    # -- ...and a divert that DID act must actually be announced -------------
+
+    async def test_a_fired_divert_is_spoken_and_notified(self):
+        # It fires the plain `done` event with kind="quick", which the voice
+        # client drops (it only speaks `notify` events, or done/failed on
+        # kind="agentic") — so before 2026-08-08 a 07:00 "play jazz" ran in
+        # total silence. Delivery goes through the same `notify` event the
+        # inbox watcher uses.
+        task, events, sent = await self._submit_capturing_notices(
+            "play jazz", "automation",
+            mock.patch("dispatcher.service.spotify.run_intent",
+                       return_value="Playing jazz."),
+            meta={"automation_id": 7, "notify": True})
+        notices = [e for e in events if e.get("event") == "notify"]
+        self.assertEqual([n["speech"] for n in notices], ["Playing jazz."])
+        self.assertEqual(sent, ["Playing jazz."])
+
+    async def test_an_automation_asked_to_stay_quiet_stays_quiet(self):
+        _, events, sent = await self._submit_capturing_notices(
+            "play jazz", "automation",
+            mock.patch("dispatcher.service.spotify.run_intent",
+                       return_value="Playing jazz."),
+            meta={"automation_id": 9, "notify": False})
+        self.assertEqual([e for e in events if e.get("event") == "notify"], [])
+        self.assertEqual(sent, [])
+
+    async def test_caller_metadata_survives_the_divert(self):
+        # automations.fire passes automation_id/notify; _settle_divert used to
+        # build its metadata from scratch and drop them.
+        task, _, _ = await self._submit_capturing_notices(
+            "play jazz", "automation",
+            mock.patch("dispatcher.service.spotify.run_intent",
+                       return_value="Playing jazz."),
+            meta={"automation_id": 7, "notify": True})
+        meta = json.loads(self.svc.db.get_task(task["id"])["metadata"])
+        self.assertEqual(meta["automation_id"], 7)
+        self.assertEqual(meta["task_type"], "divert")
+
+    # -- a divert that can't be completed must not EAT the request ----------
+
+    async def test_a_failed_automation_parse_routes_normally(self):
+        # The parse is itself a quick task, so during a plan-cap window failing
+        # is the normal outcome. Consuming the request there left it neither
+        # scheduled nor run — and filed 'done'.
+        with mock.patch.object(self.svc, "create_automation_from_nl",
+                               new=mock.AsyncMock(return_value=(None, "Sorry."))):
+            with mock.patch.object(self.svc, "_drain_quick",
+                                   new=mock.AsyncMock()) as drain:
+                task = await self.svc.submit("every morning at 7 water the plants",
+                                             source="api", mode="auto")
+        drain.assert_called_once()
+        self.assertNotIn("divert", task)
+
+    async def test_a_crashing_divert_routes_normally(self):
+        # A divert is an optimization, never a requirement: raising here 500s
+        # POST /task and sends a queue file to .failed as a terminal error.
+        with mock.patch("dispatcher.service.spotify.detect",
+                        side_effect=RuntimeError("boom")):
+            with mock.patch.object(self.svc, "_drain_quick",
+                                   new=mock.AsyncMock()) as drain:
+                task = await self.svc.submit("play jazz", source="api",
+                                             mode="auto")
+        drain.assert_called_once()
+        self.assertEqual(task["kind"], "quick")
+
+
 class TestNotifyGatePieces(unittest.TestCase):
     def test_parse_gate(self):
         self.assertEqual(notify.parse_gate("NOTIFY: rain expected at 5pm"),
@@ -506,6 +732,14 @@ class TestMetaModelRouting(unittest.TestCase):
 class TestSurfacingPolicy(unittest.TestCase):
     ACFG = {"enabled": True, "notify_gate": True,
             "notify_sources": ["automation", "timer"]}
+
+    def test_deterministic_diverts_are_announced_but_never_gated(self):
+        # the executor already wrote the one-line summary; paying the gate to
+        # rewrite "Playing Kind of Blue by Miles Davis." would be pure waste
+        task = {"source": "automation", "text": "play jazz"}
+        self.assertEqual(
+            notify.surfacing(self.ACFG, task, {"task_type": "divert"}, "done"),
+            "surface")
 
     def surf(self, acfg=None, source="automation", meta=None, final="done"):
         return notify.surfacing(self.ACFG if acfg is None else acfg,

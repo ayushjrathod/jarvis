@@ -516,6 +516,43 @@ class TestStreamQuickBookkeeping(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(got["runs"][0]["status"], "done")
         self.assertEqual(got["runs"][0]["output_text"], "hi there")
 
+    async def test_a_trusted_spawns_tool_grant_reaches_the_cli(self):
+        # The quick path derived tools from the matched AREA only, so a trusted
+        # internal spawn that asked for tools silently got none (found
+        # 2026-08-08). inbox.summarize ships ["Read","Glob","Grep"] with a
+        # prompt saying "Read it" and was sending no grant at all plus
+        # --disallowedTools Bash: a real call per file, ungroundable.
+        seen = {}
+
+        async def stream(text, cfg, model_override=None, tools=None, context="",
+                         resume_session_id=None, **kwargs):
+            seen["tools"] = tools
+            yield ("meta", {"status": "done", "cost_usd": 0.0})
+
+        task = await self.svc.create_task(
+            "summarize it", "inbox", "quick", None,
+            {"task_type": "inbox-summarize",
+             "allowed_tools": ["Read", "Glob", "Grep"]}, trusted=True)
+        with patch("dispatcher.service.quick.stream", stream):
+            [e async for e in self.svc.stream_quick(task)]
+        self.assertEqual(seen["tools"], ["Read", "Glob", "Grep"])
+
+    async def test_an_untrusted_caller_still_cannot_grant_quick_tools(self):
+        # ...and the reason reading metadata here is safe: H1 strips the key
+        # BEFORE it is stored, so nothing untrusted can ever be on the row.
+        seen = {}
+
+        async def stream(text, cfg, model_override=None, tools=None, context="",
+                         resume_session_id=None, **kwargs):
+            seen["tools"] = tools
+            yield ("meta", {"status": "done", "cost_usd": 0.0})
+
+        task = await self.svc.create_task(
+            "hi", "api", "quick", None, {"allowed_tools": ["Bash"]})
+        with patch("dispatcher.service.quick.stream", stream):
+            [e async for e in self.svc.stream_quick(task)]
+        self.assertIsNone(seen["tools"])
+
     async def test_client_disconnect_settles_rows_as_cancelled(self):
         task = await self.svc.create_task("q", "voice", "quick")
         fake = self._fake_stream(("delta", "hi "), ("delta", "never consumed"))
@@ -544,6 +581,18 @@ class TestStreamQuickBookkeeping(unittest.IsolatedAsyncioTestCase):
             rest = [e async for e in agen]
         self.assertEqual(self.svc.db.get_task(task["id"])["status"], "cancelled")
         self.assertNotIn("done", [e[0] for e in rest])  # no done event emitted
+
+    async def test_dispatcher_error_settles_failed_not_cancelled(self):
+        """A crash in OUR code is not the client hanging up. Both used to land
+        in the same `finally` and be filed 'cancelled', which reads as a user
+        action and keeps a real bug out of the success-rate figures."""
+        task = await self.svc.create_task("q", "voice", "quick")
+        fake = self._fake_stream(("delta", "hi"), ("meta", {"status": "done"}))
+        with patch("dispatcher.service.quick.stream", fake), \
+             patch.object(self.svc.db, "finish_run", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                [e async for e in self.svc.stream_quick(task)]
+        self.assertEqual(self.svc.db.get_task(task["id"])["status"], "failed")
 
 
 class TestTrustBoundaryMetadata(unittest.TestCase):
@@ -578,6 +627,41 @@ class TestTrustBoundaryMetadata(unittest.TestCase):
         from dispatcher.service import sanitize_untrusted_metadata
         self.assertIsNone(sanitize_untrusted_metadata(None, 3.0))
         self.assertEqual(sanitize_untrusted_metadata({}, 3.0), {})
+
+    def test_untrusted_cannot_force_the_refusal_fallback(self):
+        # simulate_refusal makes an agentic task run TWICE, the second time on
+        # models.fallback (an Opus). It sat outside the boundary until
+        # 2026-08-08, so anything reaching POST /task — dashboard, phone over
+        # Tailscale, a queue file — could double the cost of every agentic run.
+        from dispatcher.service import sanitize_untrusted_metadata
+        out = sanitize_untrusted_metadata({"simulate_refusal": True}, 3.0)
+        self.assertNotIn("simulate_refusal", out)
+
+    def test_simulate_refusal_survives_when_explicitly_allowed(self):
+        # scripts/smoke_phase_a.sh drives the refusal fallback over HTTP, so
+        # there is one opt-in: security.allow_simulate_refusal.
+        from dispatcher.service import sanitize_untrusted_metadata
+        out = sanitize_untrusted_metadata({"simulate_refusal": True}, 3.0,
+                                          allow_simulate_refusal=True)
+        self.assertIs(out["simulate_refusal"], True)
+
+    def test_allowing_simulate_refusal_does_not_relax_anything_else(self):
+        from dispatcher.service import sanitize_untrusted_metadata
+        out = sanitize_untrusted_metadata(
+            {"simulate_refusal": True, "allowed_tools": ["Bash"],
+             "resume_session_id": "evil", "max_cost_usd": 100},
+            cost_cap=3.0, allow_simulate_refusal=True)
+        self.assertNotIn("allowed_tools", out)
+        self.assertNotIn("resume_session_id", out)
+        self.assertEqual(out["max_cost_usd"], 3.0)
+
+    def test_config_defaults_simulate_refusal_off(self):
+        from pathlib import Path
+        from dispatcher.config import Config
+        cfg = Config(root=Path("/tmp"))
+        self.assertFalse(cfg.allow_simulate_refusal)
+        cfg.security = {"allow_simulate_refusal": True}
+        self.assertTrue(cfg.allow_simulate_refusal)
 
 
 class TestTrustBoundaryDispatch(unittest.IsolatedAsyncioTestCase):

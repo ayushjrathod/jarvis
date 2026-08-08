@@ -27,13 +27,26 @@ log = logging.getLogger("dispatcher.notify")
 # whenever the voice service was up.)
 NEVER_SURFACE_TASK_TYPES = {"reflection", "memory-consolidate",
                             "notify-gate", "automation-parse", "media-parse",
-                            "graph-extract", "graph-reconcile"}
+                            "graph-extract", "graph-reconcile",
+                            # inbox summaries deliver their own `notify` event
+                            # (the watcher does it explicitly, because this
+                            # source is not in notify_sources and so never
+                            # reaches the gate); the plain done event would be
+                            # a second, silent announcement of the same thing.
+                            "inbox-summarize"}
 
 # ...but a scheduled background job that FAILS must not fail silently — a broken
 # 02:30 consolidation should be visible, not swallowed like a routine success
 # (M6). Kept narrow: the quick plumbing tasks (gate/parse) handle their own
 # errors and would only add noise.
 SURFACE_ON_FAILURE = {"memory-consolidate"}
+
+# Deterministic diverts (media/desktop/automation-created) are announced, but
+# never gated: the gate exists to judge whether a model's prose is worth an
+# interruption, and "Playing Kind of Blue by Miles Davis." is already the final
+# one-line summary. Sending it to the gate would spend ~$0.04 to rewrite a
+# sentence the executor wrote for free.
+NEVER_GATE_TASK_TYPES = {"divert"}
 
 RESULT_CLIP = 1500
 
@@ -90,6 +103,12 @@ def surfacing(acfg: dict, task: dict, meta: dict, final: str) -> str:
         return "surface"    # failures keep their speakable error path
     if meta.get("notify", True) is False:
         return "silent"     # the user asked this automation to stay quiet
+    # Checked HERE, not at the top: "never gate" means exactly that — skip the
+    # LLM judgment — not "always surface". Sitting above the notify:False test
+    # (as it did until 2026-08-08) made a divert override an automation the
+    # user had explicitly asked to stay quiet about.
+    if tt in NEVER_GATE_TASK_TYPES:
+        return "surface"
     if not acfg.get("notify_gate", True):
         return "surface"
     return "gate"

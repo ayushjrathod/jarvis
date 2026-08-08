@@ -29,7 +29,13 @@ TERMINAL = {"done", "failed", "cancelled"}
 # sessions the way a human source's follow-ups do (Phase G lesson: meta-work
 # leaking into conversational machinery causes weird cross-contamination).
 NO_CONTINUITY_SOURCES = {"automation", "automation-parse", "notify-gate",
-                         "media-parse", "graph-extract", "graph-reconcile"}
+                         "media-parse", "graph-extract", "graph-reconcile",
+                         # "inbox": two files landing in one poll are unrelated
+                         # machine tasks, but the second used to resume the
+                         # first's CLI session — so the model still had document
+                         # A in context while summarizing document B, and could
+                         # describe the wrong file (added 2026-08-08).
+                         "inbox"}
 
 # Internal plumbing tasks that ask for a *classification*, not prose: a
 # NOTIFY/SKIP verdict, a schedule spec, a set of search words. Each has
@@ -90,8 +96,20 @@ def make_ack(text: str) -> str:
 # trusted=True and keep all three (they legitimately set them).
 _TRUSTED_ONLY_META_KEYS = ("allowed_tools", "resume_session_id")
 
+# `simulate_refusal` forces the refusal fallback, i.e. a SECOND run of the same
+# task on models.fallback (an Opus). It is a test seam, but it sat outside the
+# trust boundary until 2026-08-08: anything that could reach POST /task — the
+# dashboard, the phone over Tailscale Serve, a queue file — could double the
+# cost of every agentic run and put the second half on the most expensive model.
+# On a subscription whose plan cap has already taken the assistant down twice
+# that is a real quota amplifier, so it is now stripped like the others.
+# `scripts/smoke_phase_a.sh` genuinely needs it over HTTP, hence the opt-in:
+# set `security.allow_simulate_refusal: true`, run the smoke, set it back.
+_SMOKE_ONLY_META_KEYS = ("simulate_refusal",)
 
-def sanitize_untrusted_metadata(metadata: dict | None, cost_cap: float) -> dict | None:
+
+def sanitize_untrusted_metadata(metadata: dict | None, cost_cap: float,
+                                allow_simulate_refusal: bool = False) -> dict | None:
     """Enforce the trust boundary (H1) on metadata supplied by an external
     source (api/queue/voice/ui/screen): drop tool/session grants and clamp the
     budget to the configured cap. The invariant is that an untrusted task can
@@ -101,7 +119,10 @@ def sanitize_untrusted_metadata(metadata: dict | None, cost_cap: float) -> dict 
     if not metadata:
         return metadata
     clean = dict(metadata)
-    stripped = [k for k in _TRUSTED_ONLY_META_KEYS if clean.pop(k, None) is not None]
+    drop = _TRUSTED_ONLY_META_KEYS
+    if not allow_simulate_refusal:
+        drop += _SMOKE_ONLY_META_KEYS
+    stripped = [k for k in drop if clean.pop(k, None) is not None]
     budget = clean.get("max_cost_usd")
     if budget is None:
         pass
@@ -206,7 +227,8 @@ class Service:
         # quick and agentic paths read already-safe metadata off the row.
         if not trusted:
             metadata = sanitize_untrusted_metadata(
-                metadata, self.cfg.budgets.get("max_cost_per_task_usd", 0.50))
+                metadata, self.cfg.budgets.get("max_cost_per_task_usd", 0.50),
+                self.cfg.allow_simulate_refusal)
         task = self.db.create_task(text, source, kind, area, metadata)
         if area:  # skill telemetry (Phase G) — best-effort, never blocks dispatch
             try:
@@ -226,6 +248,15 @@ class Service:
         gate, consolidation, graph, learn, limit-requeue) that legitimately pass
         allowed_tools/max_cost_usd/resume_session_id; external callers leave it
         False so their metadata can only narrow, never widen (H1)."""
+        # Deterministic diverts run here, not only in the HTTP handler, so a
+        # fired automation or a queue file gets the same treatment a typed
+        # command does. Before this, "every morning play jazz" correctly became
+        # a standing automation and then handed "play jazz" to Claude as a task
+        # every morning, because the diverts lived in main.py alone.
+        if mode == "auto":
+            divert = await self.try_divert(text, source)
+            if divert is not None:
+                return await self._settle_divert(text, source, divert, metadata)
         kind, area_name = self.route(text, mode, area, match_area)
         task = await self.create_task(text, source, kind, area_name, metadata,
                                       trusted=trusted)
@@ -234,6 +265,126 @@ class Service:
         else:
             self.bg[task["id"]] = asyncio.create_task(self._drain_quick(task))
         return task
+
+    # -- deterministic diverts ----------------------------------------------
+
+    async def try_divert(self, text: str, source: str) -> dict | None:
+        """The single definition of "this never needs a model": standing
+        automation, then media, then desktop. Returns a dict carrying `kind`,
+        `speech` and any per-kind extras, or None to route normally.
+
+        Order matters and is load-bearing: automation first so "every morning
+        play jazz" is scheduled rather than played once; media before desktop so
+        "play …" stays with Spotify rather than being read as an app launch.
+        Callers must gate on mode == "auto" — an explicit quick/agentic bypasses
+        every divert, which is what keeps all of this reachable.
+        """
+        try:
+            return await self._try_divert_inner(text, source)
+        except Exception:
+            # A divert is an optimization, never a requirement. Letting it raise
+            # here 500s POST /task and files a queue file under .failed as a
+            # TERMINAL error — for text that would have routed perfectly well.
+            log.exception("divert failed for %r; routing normally", text[:80])
+            return None
+
+    async def _try_divert_inner(self, text: str, source: str) -> dict | None:
+        acfg = self.cfg.automations or {}
+        # An automation must never create another automation: a task_text the
+        # parser left schedule words in would otherwise breed a fresh row on
+        # every fire.
+        if (acfg.get("enabled") and acfg.get("nl_detect", True)
+                and source != "automation" and automations.detect(text)):
+            row, speech = await self.create_automation_from_nl(text, source)
+            if row is None:
+                # The parse failed — which during a plan-cap window is the
+                # NORMAL outcome, since the parse is itself a quick task.
+                # Returning a divert here consumed the user's request: it was
+                # neither scheduled nor run, and (over submit()) was filed
+                # 'done'. Fall through and let it route like any other text.
+                log.info("automation parse failed; routing %r normally", text[:80])
+                return None
+            return {"kind": "automation", "speech": speech, "ok": True,
+                    "automation_id": row["id"]}
+
+        mcfg = self.cfg.media or {}
+        if (mcfg.get("enabled") and mcfg.get("nl_detect", True)
+                and spotify.detect(text) is not None):
+            outcome = await self.media_command(text, source)
+            return {"kind": "media", "speech": outcome["speech"],
+                    "ok": outcome["status"] == "done"}
+
+        ccfg = self.cfg.computer or {}
+        if (ccfg.get("enabled") and ccfg.get("nl_detect", True)
+                and (desktop.detect(text) is not None
+                     or (self.pending_desktop_for(source)
+                         and desktop.parse_answer(text) is not None))):
+            outcome = await self.desktop_command(text, source)
+            return {"kind": "desktop", "speech": outcome["speech"],
+                    "ok": outcome["status"] == "done",
+                    "desktop_status": outcome["status"],
+                    "confirm_id": outcome.get("confirm_id")}
+        return None
+
+    async def _settle_divert(self, text: str, source: str, divert: dict,
+                             metadata: dict | None = None) -> dict:
+        """Record a diverted command as a task row that is born settled.
+
+        submit()'s callers (the queue watcher, automations.fire) need a task
+        dict back, and an audit trail for "the 07:00 automation played jazz" is
+        worth having anyway — over HTTP these commands leave no trace at all.
+        No run row: no model ran, so there is no attempt, cost or latency to
+        log, and /stats must not count one. No episode either — see
+        memory.should_capture for why a nightly "play jazz" must not become
+        knowledge.
+
+        Two things this got wrong until 2026-08-08, both of them the failure
+        mode this codebase keeps re-learning:
+
+        - It filed **every** divert 'done', including the ones that did not
+          act: a desktop verb parked for confirmation nobody can answer (the
+          queue and automation sources have no user watching), a denied verb,
+          an unresolved play. `ok` now comes from the executor.
+        - It **announced nothing**. It fires the plain `done` event, but the
+          voice client drops everything with `kind != "agentic"`
+          (jarvis/engines/brain_dispatcher.py) and nothing on this path called
+          send_desktop — so a fired "play jazz" was silent, where before the
+          diverts existed it had gone through the notify gate and been spoken.
+          Delivery now goes through the same `notify` event the inbox watcher
+          uses, which clients actually consume.
+        """
+        final = "done" if divert.get("ok") else "failed"
+        # Caller metadata (automations.fire passes automation_id/notify) is
+        # kept: dropping it silently broke the task->automation link on the row.
+        meta = {**(metadata or {}),
+                "task_type": "divert", "divert": divert["kind"]}
+        task = await self.create_task(text, source, "quick", None, meta,
+                                      trusted=True)
+        self.db.set_task_status(task["id"], final)
+        await self.fire(final, task, speech=divert["speech"],
+                        divert=divert["kind"], cost_usd=0.0)
+        await self._announce_divert(task, meta, final, divert["speech"])
+        return {**task, "status": final, "divert": divert}
+
+    async def _announce_divert(self, task: dict, meta: dict, final: str,
+                               speech: str):
+        """Speak/notify a machine-submitted divert's own sentence.
+
+        Consults the ordinary surfacing policy (so `notify: false` on an
+        automation still means quiet), but never the gate: the executor already
+        wrote the one-line summary, and paying a model to rewrite "Playing Kind
+        of Blue by Miles Davis." would be pure waste — that is what
+        notify.NEVER_GATE_TASK_TYPES encodes, and routing through here is what
+        makes it reachable at all rather than dead code.
+        """
+        try:
+            verdict = notify.surfacing(self.cfg.automations or {},
+                                       task, meta, final)
+            if verdict == "silent":
+                return
+            await self._deliver_notice(task, speech)
+        except Exception:
+            log.exception("divert announcement failed for %s", task["id"])
 
     # -- quick path ---------------------------------------------------------
 
@@ -275,12 +426,23 @@ class Service:
             yield ("task", {"task_id": task["id"], "kind": "quick"})
 
             area = self.areas.get(task["area"]) if task.get("area") else None
-            q_tools = area.quick_allowed_tools if area else None
             q_context = self._with_memory(area.context() if area else "")
             try:
                 task_meta = json.loads(task["metadata"]) if task.get("metadata") else {}
             except (TypeError, ValueError):
                 task_meta = {}
+            # A trusted internal spawn's own grant wins, then the area's. The
+            # metadata half was missing until 2026-08-08, so a quick task that
+            # asked for tools silently got NONE — inbox.summarize ships
+            # ["Read", "Glob", "Grep"] with a prompt that says "Read it", and
+            # was shipping `--disallowedTools Bash` and no grant at all: it
+            # spent a real call per file on an answer the model could not
+            # ground. Safe to read here because sanitize_untrusted_metadata
+            # strips allowed_tools BEFORE it is stored (H1), so anything still
+            # on the row came from a server-internal spawn — exactly the
+            # reasoning the agentic resolver below already relies on.
+            q_tools = (task_meta.get("allowed_tools")
+                       or (area.quick_allowed_tools if area else None))
 
             # ask-screen: a screenshot-question task gets the Read tool and
             # image context; a missing/pruned file degrades to a plain answer
@@ -404,7 +566,15 @@ class Service:
                         yield ("delta", {"text": degraded})
                 self.db.set_task_status(task["id"], final)
                 answer = "".join(collected) or degraded
-                self._capture_episode(task, final, answer)
+                # Capture the MODEL's words only — never the degraded answer.
+                # A degraded answer is text this system composed out of its own
+                # index during an outage; storing it as an episode indexes the
+                # outage message, and the next question during the same outage
+                # can then match it and quote "Claude's session limit is hit
+                # right now…" back under "here's what I already have on it".
+                # That is the self-observation loop 5f200f3 closed for the daily
+                # brief, re-opened on a new path (found 2026-08-08).
+                self._capture_episode(task, final, "".join(collected) or None)
                 finished = True
                 suppress = self._maybe_notify(task, task_meta, final, answer,
                                               meta.get("session_id"))
@@ -425,6 +595,29 @@ class Service:
                     **({"degraded": True} if degraded else {}),
                 })
                 return
+        except (GeneratorExit, asyncio.CancelledError):
+            # the client really did vanish mid-stream (barge-in closed the
+            # connection, browser tab died) — settled as cancelled below
+            raise
+        except Exception:
+            # anything else is OUR failure, not the client's. It used to land in
+            # the same `finally` and be filed as 'cancelled', which reads as a
+            # user action and hides a dispatcher bug from /stats entirely.
+            log.exception("stream_quick crashed for %s", task["id"])
+            finished = True
+            try:
+                # task status first: it is the row everything else reads, and
+                # the DB call that just failed may well be the one we're about
+                # to make again
+                self.db.set_task_status(task["id"], "failed")
+                if open_run is not None:
+                    self.db.finish_run(open_run, "failed",
+                                       error="dispatcher error")
+            except Exception:
+                # the database itself may be what broke — startup orphan
+                # reconciliation is the backstop for whatever we can't close
+                log.exception("could not settle %s after a crash", task["id"])
+            raise
         finally:
             if not finished:
                 if open_run is not None:
@@ -710,26 +903,38 @@ class Service:
 
     # -- media control ------------------------------------------------------
 
-    async def media_command(self, text: str, source: str = "api") -> str:
-        """Run a music command, returning the one sentence to speak.
+    async def media_command(self, text: str, source: str = "api") -> dict:
+        """Run a music command → {speech, status}, mirroring desktop_command.
 
         Deterministic first (no LLM, no tokens, sub-second). Only music-shaped
         text the parser can't resolve — "put on something chill" — costs a
         single `media-parse` quick call, which chooses SEARCH WORDS ONLY; the
         action itself is always executed by the deterministic path. That keeps
         the model out of the privileged loop: no area, no Bash, no D-Bus reach.
+
+        Returns a status rather than a bare sentence because `_settle_divert`
+        has to know whether anything actually happened: a machine-submitted
+        divert used to be filed 'done' even when the answer was "I couldn't
+        work out what to play." (fixed 2026-08-08).
         """
         mcfg = self.cfg.media or {}
+        unresolved = {"status": "unresolved",
+                      "speech": "I couldn't work out what to play."}
         intent = spotify.detect(text)
         if intent is None:
-            return "I couldn't work out what to play."
+            return unresolved
         if intent is spotify.MAYBE:
             if not mcfg.get("llm_fallback", True):
-                return "I couldn't work out what to play."
+                return unresolved
             intent = await self._parse_media(text, source)
             if intent is None:
-                return "I couldn't work out what to play."
-        return await asyncio.to_thread(spotify.run_intent, self.cfg, intent)
+                return unresolved
+        speech = await asyncio.to_thread(spotify.run_intent, self.cfg, intent)
+        # NOTE: spotify.run_intent's contract is "never raises — every failure
+        # becomes a speakable sentence", so a dead player still returns
+        # status=done with "Spotify isn't running." in the text. Distinguishing
+        # that needs run_intent itself to report a status; left as-is.
+        return {"status": "done", "speech": speech}
 
     # -- desktop control (computer-use T1) ----------------------------------
 

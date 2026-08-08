@@ -1,9 +1,15 @@
 """Quick-vs-agentic routing (locked decision #2).
 
 Heuristic first: imperative verbs or file/vault references mean agentic work;
-question-shaped or short inputs are quick Q&A. An LLM tiebreak (Haiku, one
-word) can be plugged in via `llm_tiebreak` once API credentials exist — the
-current rules leave no ambiguous bucket, so Phase A ships heuristic-only.
+question-shaped or short inputs are quick Q&A. The rules leave no ambiguous
+bucket, so nothing here has ever called a model.
+
+`llm_tiebreak` is an injection point kept for the day the heuristic isn't
+enough — a caller passes a callable, it is not wired to any config. (Its old
+docstring said "once API credentials exist"; that was written before the
+Messages API backend was removed in favour of the subscription CLI, and the
+`models.classifier` config key it implied was never read at all. Both went
+2026-08-02.)
 """
 
 from __future__ import annotations

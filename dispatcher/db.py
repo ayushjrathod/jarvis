@@ -402,7 +402,11 @@ class Database:
                 "SELECT status, COUNT(*) n FROM tasks WHERE created_at>=?"
                 " GROUP BY status", (since_iso,))}
             by_source = [dict(r) for r in c.execute(
-                "SELECT t.source, COUNT(*) n, ROUND(SUM(COALESCE(r.cost_usd,0)),4) cost_usd"
+                # COUNT(DISTINCT t.id), not COUNT(*): the LEFT JOIN fans a task
+                # out across its runs, so a refusal-fallback or a resume-retry
+                # counted the same task twice and `n` silently meant "runs"
+                "SELECT t.source, COUNT(DISTINCT t.id) n,"
+                " ROUND(SUM(COALESCE(r.cost_usd,0)),4) cost_usd"
                 " FROM tasks t LEFT JOIN runs r ON r.task_id=t.id"
                 " WHERE t.created_at>=? GROUP BY t.source ORDER BY n DESC",
                 (since_iso,))]

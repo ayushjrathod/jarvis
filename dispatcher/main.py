@@ -49,7 +49,13 @@ MAX_STT_BYTES = 25 * 1024 * 1024
 # host) or a loopback one (the SPA and the ask-screen popup are served from the
 # dispatcher itself). So: reject only a *present, non-local* Origin on
 # state-changing methods. Absent Origin is always allowed.
-_LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1", ""}
+# An ABSENT Origin is allowed by the `if origin` check in the guard below; this
+# set is only about a *present* one, so "" must not be a member. It used to be,
+# which quietly allowed `Origin: null` — what a sandboxed iframe sends —
+# because urlsplit("null").hostname is None. Exploiting it needs a request
+# simple enough to skip preflight, which a JSON body isn't, so this is
+# defence in depth rather than a closed hole.
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _GUARDED_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
@@ -158,62 +164,27 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
     @app.post("/task")
     async def post_task(t: TaskIn):
-        # NL automation divert (Phase I): schedule-phrased requests become
-        # standing automations instead of one-shot tasks. mode=auto only —
-        # an explicit quick/agentic bypasses, so nothing is unreachable.
-        acfg = cfg.automations or {}
-        if (acfg.get("enabled") and acfg.get("nl_detect", True)
-                and t.mode == "auto" and automations.detect(t.text)):
-            row, speech = await svc.create_automation_from_nl(t.text, t.source)
+        # Deterministic diverts (standing automation → media → desktop) live on
+        # the service so the queue watcher and the automations scheduler get
+        # them too; mode=auto only, so an explicit quick/agentic bypasses and
+        # nothing is unreachable. Streamed here rather than recorded as a task:
+        # over HTTP the caller is waiting on the answer, and none of these is a
+        # cancellable task row.
+        if t.mode == "auto":
+            divert = await svc.try_divert(t.text, t.source)
+            if divert is not None:
 
-            async def confirm():
-                # no task_id: an automation row isn't cancellable via /task
-                yield sse("task", {"task_id": None, "kind": "automation"})
-                yield sse("delta", {"text": speech})
-                yield sse("done", {"status": "done",
-                                   "automation_id": row["id"] if row else None})
+                async def diverted():
+                    yield sse("task", {"task_id": None, "kind": divert["kind"]})
+                    yield sse("delta", {"text": divert["speech"]})
+                    yield sse("done", {k: v for k, v in {
+                        "status": "done", "kind": divert["kind"],
+                        "automation_id": divert.get("automation_id"),
+                        "desktop_status": divert.get("desktop_status"),
+                        "confirm_id": divert.get("confirm_id"),
+                    }.items() if v is not None or k == "status"})
 
-            return StreamingResponse(confirm(), media_type="text/event-stream")
-
-        # Media divert: "play …"/"pause"/"skip" drive the local Spotify client
-        # instead of Claude. Deliberately AFTER the automation divert, so
-        # "every morning play jazz" still becomes a standing automation, and
-        # mode=auto only, so an explicit quick/agentic bypasses it.
-        mcfg = cfg.media or {}
-        if (mcfg.get("enabled") and mcfg.get("nl_detect", True)
-                and t.mode == "auto" and spotify.detect(t.text) is not None):
-            speech = await svc.media_command(t.text, t.source)
-
-            async def media_confirm():
-                # no task_id: a media command isn't a cancellable task row
-                yield sse("task", {"task_id": None, "kind": "media"})
-                yield sse("delta", {"text": speech})
-                yield sse("done", {"status": "done", "kind": "media"})
-
-            return StreamingResponse(media_confirm(), media_type="text/event-stream")
-
-        # Desktop divert (computer-use T1): "lock the screen", "open firefox",
-        # "what's on my clipboard". After the media divert so "play …" stays
-        # with Spotify, and mode=auto only, like the others. A verb whose
-        # policy is "confirm" streams the question instead of acting.
-        # A source with a parked confirmation also diverts on a bare yes/no, so
-        # the question can be answered by voice rather than only by button.
-        ccfg = cfg.computer or {}
-        if (ccfg.get("enabled") and ccfg.get("nl_detect", True)
-                and t.mode == "auto"
-                and (desktop.detect(t.text) is not None
-                     or (svc.pending_desktop_for(t.source)
-                         and desktop.parse_answer(t.text) is not None))):
-            outcome = await svc.desktop_command(t.text, t.source)
-
-            async def desktop_reply():
-                yield sse("task", {"task_id": None, "kind": "desktop"})
-                yield sse("delta", {"text": outcome["speech"]})
-                yield sse("done", {"status": "done", "kind": "desktop",
-                                   "desktop_status": outcome["status"],
-                                   "confirm_id": outcome.get("confirm_id")})
-
-            return StreamingResponse(desktop_reply(), media_type="text/event-stream")
+                return StreamingResponse(diverted(), media_type="text/event-stream")
 
         kind, area = svc.route(t.text, t.mode, t.area)
         if kind == "agentic":
@@ -485,7 +456,8 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         _require_media()
         if not m.command.strip():
             raise HTTPException(400, "empty command")
-        return {"speech": await svc.media_command(m.command, m.source)}
+        out = await svc.media_command(m.command, m.source)
+        return {"speech": out["speech"], "status": out["status"]}
 
     @app.get("/media/state")
     async def media_state():

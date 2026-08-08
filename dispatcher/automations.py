@@ -74,7 +74,15 @@ DETECT_RE = re.compile(
     re.IGNORECASE)
 QUESTION_RE = re.compile(
     r"^\s*(what|when|why|how|who|where|which|did|do|does|is|are|was|were|"
-    r"have|has|can|could|should|would|show|list)\b",
+    r"have|has|can|could|should|would|show|list|"
+    r"i wonder|i wondered|i'?m wondering|i was wondering|tell me)\b",
+    re.IGNORECASE)
+# A schedule phrase bounded to a finite past/present window is retrospective —
+# "summarize what I did every day this week" is a report, not a recurrence, and
+# none of the four supported kinds (daily/weekly/interval/once) can express it
+# anyway. Vetoing it costs nothing: it just routes to Claude like any question.
+RETROSPECTIVE_RE = re.compile(
+    r"\b(this|last|past|previous)\s+(week|month|year|few\s+days)\b",
     re.IGNORECASE)
 # A leading memory/statement verb means "write this down", never "schedule it"
 # — "remember that I run every morning" must stay a memory write, not become an
@@ -82,6 +90,14 @@ QUESTION_RE = re.compile(
 STATEMENT_RE = re.compile(
     r"^\s*(remember|note|save|record|store|log|memoriz|"
     r"don'?t forget|keep in mind|fyi)\b",
+    re.IGNORECASE)
+# ...and neither is a description of the world. "my gym schedule is every monday
+# and thursday" states a fact; it is not an instruction to run anything, but it
+# carries the schedule words and used to become a standing automation that then
+# fired forever (found 2026-08-08). Requires a possessive/definite opener AND a
+# copula, so "the backup should run every night" is still a request.
+DESCRIPTION_RE = re.compile(
+    r"^\s*(my|our|the|his|her|their|its)\b[^.?!]*?\b(is|are|was|were)\b",
     re.IGNORECASE)
 
 PARSE_PROMPT = """\
@@ -105,11 +121,53 @@ evening=19:00, night=21:00. notify is false only if the user asked to stay
 quiet about the results."""
 
 
+def _normalize(text: str) -> str:
+    """Trim the noise the veto patterns are anchored against.
+
+    QUESTION_RE/STATEMENT_RE are anchored at `^`, so ANYTHING in front of the
+    question word defeated them — and the voice path splices the wake word onto
+    every transcript (`wake_prebuffer_ms`), so in practice they almost never
+    fired. Measured 2026-08-08, all four diverted before this existed:
+
+        "hey jarvis, what do I have every morning?"  -> True
+        "so what happens every day at 9?"            -> True
+
+    Each one cost an `automation-parse` call, created a standing automation that
+    fires forever, and was never answered. `spotify.detect`/`desktop.detect`
+    already normalized for exactly this reason; this parser was the odd one out.
+    (Third copy of this pipeline — see the deferred de-duplication note in
+    context/STATE.md. Kept local rather than imported so the three parsers stay
+    independently readable.)
+    """
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    t = re.sub(r"\bhey jarvis\b[,\s]*", "", t, flags=re.I)
+    # Looped, and tolerant of the comma: real speech stacks these
+    # ("please, can you tell me …"), and one pass left the question word
+    # buried where the ^-anchored vetoes still couldn't see it.
+    prefix = re.compile(
+        r"^(?:so|okay|ok|now|and|well|please|can you|could you|would you)"
+        r"[,\s]+", re.I)
+    while True:
+        stripped = prefix.sub("", t, count=1)
+        if stripped == t:
+            return t.strip()
+        t = stripped
+
+
 def detect(text: str) -> bool:
     """Should this task text be diverted to automation creation?"""
-    return (bool(DETECT_RE.search(text))
-            and not QUESTION_RE.match(text)
-            and not STATEMENT_RE.match(text))
+    t = _normalize(text)
+    # A trailing "?" means they're asking about the schedule, not setting one.
+    # Same veto desktop.detect applies, and for the same reason: a divert
+    # SWALLOWS the request (it never reaches Claude), so the cost of a false
+    # positive is far higher than that of a false negative.
+    if t.endswith("?"):
+        return False
+    return (bool(DETECT_RE.search(t))
+            and not QUESTION_RE.match(t)
+            and not STATEMENT_RE.match(t)
+            and not DESCRIPTION_RE.match(t)
+            and not RETROSPECTIVE_RE.search(t))
 
 
 def parse_prompt(request: str) -> str:
