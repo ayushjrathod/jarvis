@@ -100,6 +100,7 @@ def chunk_markdown(file_label: str, text: str) -> list[dict]:
     stack: list[tuple[int, str]] = []   # (level, title)
     buf: list[str] = []
     buf_start = 1
+    in_fence = False
 
     def flush():
         body = "\n".join(buf).strip()
@@ -123,7 +124,17 @@ def chunk_markdown(file_label: str, text: str) -> list[dict]:
             })
 
     for i, line in enumerate(text.splitlines(), start=1):
-        m = HEADING_RE.match(line)
+        stripped = line.strip()
+        # Fenced code is payload, not structure: a ```bash block containing
+        # "# install the thing" used to register as a level-1 heading, evict
+        # the real stack, and brand every later chunk with the comment as its
+        # ancestry — plus spurious hash churn on every reindex. Tildes count:
+        # GFM allows ~~~ fences too.
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            buf.append(line)
+            continue
+        m = None if in_fence else HEADING_RE.match(line)
         if m:
             flush()
             level = len(m.group(1))

@@ -22,6 +22,22 @@ def make_cfg(root: Path, **mem) -> Config:
 
 
 class TestChunking(unittest.TestCase):
+    def test_fenced_code_comments_are_not_headings(self):
+        # A ```bash block containing "# install the thing" used to register
+        # as a level-1 heading, evicting the real stack — every later chunk
+        # carried the comment as ancestry (finding 2.8).
+        text = ("# Real\nbody one\n\n```bash\n# install the thing\n"
+                "sudo pacman -S x\n```\n\nbody two\n")
+        chunks = chunk_markdown("vault/notes/a.md", text)
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]["heading"], "Real")
+        self.assertIn("# install the thing", chunks[0]["compiled"])
+        # unclosed fence: rest of file is code, no phantom headings either
+        text2 = "# Real\nbody\n\n```\n# not a heading\nmore\n"
+        chunks2 = chunk_markdown("f.md", text2)
+        self.assertEqual(len(chunks2), 1)
+        self.assertEqual(chunks2[0]["heading"], "Real")
+
     def test_heading_ancestry(self):
         text = "intro line\n\n# Top\nbody one\n\n## Sub\nbody two\n\n# Other\nbody three\n"
         chunks = chunk_markdown("vault/notes/a.md", text)
