@@ -299,6 +299,46 @@ table.docs-table td.ep code { font-size: 0.85rem; }
 
 /* Desktop-verb confirmations (computer-use T1). Above the grid, warn-toned:
    a blocking question with a timeout, not a status readout. */
+/* Dispatcher unreachable: the SSE stream gave up and api.js is backing off.
+   Without this the dashboard looked perfectly healthy while being frozen. */
+.conn-banner {
+  background: var(--card);
+  border: 1px solid var(--warn);
+  border-left-width: 4px;
+  border-radius: 10px;
+  padding: 0.7rem 1rem;
+  margin-bottom: 1rem;
+  color: var(--warn);
+}
+
+/* Proactive announcements (notify gate, inbox watcher, diverts). These reach
+   the browser as SSE `notify` events and, before 2026-08-08, were rendered
+   nowhere — so on the phone the whole feature was invisible. */
+.notices { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem; }
+.notice-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  background: var(--card);
+  border: 1px solid var(--accent);
+  border-left-width: 4px;
+  border-radius: 10px;
+  padding: 0.7rem 1rem;
+}
+.notice-text { overflow-wrap: anywhere; min-width: 0; }
+.notice-row button {
+  background: transparent;
+  color: var(--dim);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.45rem 1.1rem;
+  font: inherit;
+  cursor: pointer;
+}
+.notice-row button:hover { border-color: var(--accent); color: var(--fg); }
+
 .confirmbar { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem; }
 .confirm-row {
   display: flex;

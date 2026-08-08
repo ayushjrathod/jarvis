@@ -17,6 +17,7 @@ export default function AskScreen() {
   const [recState, setRecState] = useState("idle"); // idle | recording | transcribing
   const inputRef = useRef(null);
   const recRef = useRef(null);
+  const startingRef = useRef(false); // set before the getUserMedia await
   const nextId = useRef(0); // stable exchange ids so streamed deltas patch the
                             // right row even if another exchange is appended
 
@@ -38,8 +39,13 @@ export default function AskScreen() {
         metadata: { screenshot: `${shot}.png` },
         onDelta: (d) => patch((x) => ({ ...x, a: x.a + d })),
       });
-      if (res.status && res.status !== "done") {
-        patch((x) => ({ ...x, err: res.error ?? "failed" }));
+      if (res.degraded) {
+        // rate-limited: the streamed text is a real extractive answer from the
+        // local index, not a failure — label it instead of replacing it with
+        // the raw CLI limit string (2026-08-08)
+        patch((x) => ({ ...x, note: "from local memory — Claude unavailable" }));
+      } else if (res.status && res.status !== "done") {
+        patch((x) => ({ ...x, err: res.speech || res.error || "failed" }));
       }
     } catch (err) {
       patch((x) => ({ ...x, err: err.message }));
@@ -61,6 +67,11 @@ export default function AskScreen() {
       recRef.current.stop(); // onstop below does the rest
       return;
     }
+    // Synchronous guard: recRef is only set after the await, so a double-tap
+    // started two recorders and orphaned the first with its mic tracks still
+    // live (2026-08-08). Same bug, same shape, as CommandBox.
+    if (startingRef.current) return;
+    startingRef.current = true;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const rec = new MediaRecorder(stream);
@@ -92,6 +103,8 @@ export default function AskScreen() {
       setRecState("recording");
     } catch (err) {
       setExchanges((xs) => [...xs, { id: nextId.current++, q: "(mic)", a: "", err: err.message }]);
+    } finally {
+      startingRef.current = false;
     }
   }
 
@@ -104,6 +117,7 @@ export default function AskScreen() {
           <div key={x.id} className="exchange">
             <p className="q">{x.q}</p>
             {x.a && <p className="a">{x.a}</p>}
+            {x.note && <p className="note">{x.note}</p>}
             {x.err && <p className="err">{x.err}</p>}
           </div>
         ))}

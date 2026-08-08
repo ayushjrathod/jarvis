@@ -3,13 +3,13 @@ import { getJSON, postJSON } from "../api.js";
 
 const today = () => new Date().toISOString().slice(0, 10);
 
-export default function Tasks({ lastEvent }) {
+export default function Tasks({ lastEvent, epoch }) {
   const [tasks, setTasks] = useState([]);
   const [note, setNote] = useState(null);
 
   const refresh = useCallback(() => {
     getJSON("/vault/tasks").then(setTasks).catch(() => setTasks([]));
-  }, []);
+  }, [epoch]);
 
   useEffect(refresh, [refresh]);
   useEffect(() => {

@@ -3,13 +3,13 @@ import { getJSON } from "../api.js";
 
 // Observability tiles over /stats (Phase H) + the self-improvement strip:
 // what the reflection passes recently saved ("Jarvis learned").
-export default function Stats({ lastEvent }) {
+export default function Stats({ lastEvent, epoch }) {
   const [stats, setStats] = useState(null);
 
   const refresh = () => getJSON("/stats").then(setStats).catch(() => {});
   useEffect(() => {
     refresh();
-  }, []);
+  }, [epoch]);
   useEffect(() => {
     if (["done", "failed", "cancelled"].includes(lastEvent?.event)) refresh();
   }, [lastEvent]);

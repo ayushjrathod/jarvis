@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { getJSON } from "../api.js";
 
-export default function Brief({ lastEvent }) {
+export default function Brief({ lastEvent, epoch }) {
   const [brief, setBrief] = useState(null);
   const [missing, setMissing] = useState(false);
 
@@ -12,7 +12,7 @@ export default function Brief({ lastEvent }) {
         setMissing(false);
       })
       .catch(() => setMissing(true));
-  }, []);
+  }, [epoch]);
 
   useEffect(refresh, [refresh]);
   useEffect(() => {

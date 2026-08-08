@@ -79,16 +79,60 @@ const EVENT_NAMES = ["queued", "started", "done", "failed", "refused", "cancelle
                      "requeued", "step", "notify", "notify_skipped",
                      "automation", "automation_created", "confirm"];
 
-export function subscribeEvents(onEvent) {
-  const es = new EventSource("/events");
-  for (const name of EVENT_NAMES) {
-    es.addEventListener(name, (e) => {
-      try {
-        onEvent({ ...JSON.parse(e.data), event: name });
-      } catch {
-        onEvent({ event: name });
+// Backoff for re-opening a stream EventSource gave up on. Capped, because the
+// dispatcher restarting is the common case and should recover in a second or
+// two, while a box that is genuinely off shouldn't be hammered.
+const RECONNECT_MS = [1000, 2000, 5000, 10000, 30000];
+
+// onStatus("online" | "offline") is optional and fires on every transition.
+export function subscribeEvents(onEvent, onStatus) {
+  let es = null;
+  let attempt = 0;
+  let timer = null;
+  let stopped = false;
+
+  function connect() {
+    es = new EventSource("/events");
+
+    es.onopen = () => {
+      attempt = 0;
+      onStatus?.("online");
+    };
+
+    for (const name of EVENT_NAMES) {
+      es.addEventListener(name, (e) => {
+        try {
+          onEvent({ ...JSON.parse(e.data), event: name });
+        } catch {
+          onEvent({ event: name });
+        }
+      });
+    }
+
+    // EventSource retries a *dropped* connection on its own, but a non-2xx on
+    // reconnect is terminal: readyState goes CLOSED and nothing ever tries
+    // again. That is exactly what `systemctl --user restart mission-dispatcher`
+    // looks like through Tailscale Serve (502 while it's down), so before this
+    // (2026-08-08) a routine restart left the dashboard — most painfully the
+    // phone, where there is no console to notice it in — looking perfectly
+    // healthy and permanently frozen.
+    es.onerror = () => {
+      if (stopped) return;
+      onStatus?.("offline");
+      if (es.readyState === EventSource.CLOSED) {
+        es.close();
+        const wait = RECONNECT_MS[Math.min(attempt, RECONNECT_MS.length - 1)];
+        attempt += 1;
+        clearTimeout(timer);
+        timer = setTimeout(connect, wait);
       }
-    });
+    };
   }
-  return () => es.close();
+
+  connect();
+  return () => {
+    stopped = true;
+    clearTimeout(timer);
+    es?.close();
+  };
 }

@@ -4,7 +4,7 @@ import { getJSON } from "../api.js";
 const TERMINAL = new Set(["done", "failed", "cancelled"]);
 
 // Live task/agent activity: seeded from /tasks, updated by /events SSE.
-export default function AgentMonitor({ lastEvent }) {
+export default function AgentMonitor({ lastEvent, epoch }) {
   const [rows, setRows] = useState([]);
   const [expanded, setExpanded] = useState(() => new Set());
   const [steps, setSteps] = useState({}); // task_id -> flat step list
@@ -25,7 +25,7 @@ export default function AgentMonitor({ lastEvent }) {
         )
       )
       .catch(() => {});
-  }, []);
+  }, [epoch]);
 
   useEffect(() => {
     if (!lastEvent?.task_id) return;

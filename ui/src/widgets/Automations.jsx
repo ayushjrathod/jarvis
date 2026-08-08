@@ -3,13 +3,13 @@ import { getJSON, postJSON } from "../api.js";
 
 // Standing automations (Phase I): list, pause/resume, delete. Creation goes
 // through the command box ("every morning, tell me …") or POST /automations.
-export default function Automations({ lastEvent }) {
+export default function Automations({ lastEvent, epoch }) {
   const [rows, setRows] = useState([]);
   const [note, setNote] = useState(null);
 
   const refresh = useCallback(() => {
     getJSON("/automations").then(setRows).catch(() => setRows([]));
-  }, []);
+  }, [epoch]);
 
   useEffect(refresh, [refresh]);
   useEffect(() => {
