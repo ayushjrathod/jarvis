@@ -16,6 +16,7 @@ from pathlib import Path
 
 import yaml
 
+from .areas import AreaRegistry
 from .config import Config
 from .db import Database, now
 
@@ -34,6 +35,53 @@ BLOCKS_PREAMBLE = (
     "Persistent memory blocks — personal context distilled from past "
     "interactions, updated nightly. Trust them, but the user's live words "
     "win on conflict."
+)
+
+# Task types that are the system talking to itself. None of them is an
+# interaction with the user, so none may become an episode: an episode is read
+# back by the consolidation agent and the nightly graph extractor as "a day's
+# interaction", and whatever is in it becomes "knowledge".
+#
+#  - memory-consolidate / reflection: the housekeeping passes themselves; the
+#    consolidator's own run would be next night's input.
+#  - notify-gate / automation-parse / media-parse / inbox-summarize: Phase I/
+#    media/inbox plumbing wrapped around a real interaction. Their user_text is
+#    a machine-written prompt, not a question anyone asked.
+#  - graph-extract / graph-reconcile: same, one layer down.
+#  - daily-brief / weekly-review: the episode says "I wrote a file" (missed
+#    until 2026-08-01 — every fact in the graph had become a self-observation
+#    like "the daily-brief automation continued writing successfully through
+#    07-31", each night invalidating the previous night's copy of itself).
+#    Nothing is lost: a brief's *content* reaches memory the right way, through
+#    the vault index, which ingests vault/briefs/ already.
+#  - divert: only machine-submitted diverts (a fired automation, a queue file)
+#    get a task row at all — the HTTP path streams and records nothing — so
+#    capturing them would feed the graph one identical "play jazz / Playing
+#    jazz" episode every morning forever. A human's music command is not lost;
+#    it never produced an episode in the first place.
+#
+# media-parse and inbox-summarize were added 2026-08-08, having drifted off
+# this list while sitting on every other one. Live proof in data/mission.db,
+# episode 62: a media-parse prompt ("Convert the user's music request into a
+# Spotify search… Reply with ONE JSON object") stored as user_text, already
+# consolidated — i.e. the graph extractor has read a JSON format instruction as
+# something the user said. Exactly the bug 5f200f3 fixed for the timer agents.
+#
+# SIBLING LISTS — the same idea, split across modules, and it has drifted twice
+# now. A new internal task type must be added to all of these by hand:
+#   dispatcher/service.py  NO_CONTINUITY_SOURCES     (quick-session chaining;
+#                                                     keyed on source, not type)
+#   dispatcher/service.py  DEFAULT_META_TASK_TYPES   (cheap-model routing)
+#   dispatcher/notify.py   NEVER_SURFACE_TASK_TYPES  (never announced)
+#   dispatcher/notify.py   NEVER_GATE_TASK_TYPES     (never sent to the gate)
+# They are deliberately not one shared set — graph-extract wants a real model,
+# a divert wants announcing — and service.py imports this module, so a shared
+# constant would have to move somewhere neither imports. Keep them in sync by
+# reading this comment.
+INTERNAL_TASK_TYPES = (
+    "memory-consolidate", "reflection", "notify-gate", "automation-parse",
+    "media-parse", "inbox-summarize", "graph-extract", "graph-reconcile",
+    "daily-brief", "weekly-review", "divert",
 )
 
 
@@ -86,21 +134,9 @@ def should_capture(cfg: Config, task: dict, status: str) -> bool:
         meta = json.loads(task["metadata"]) if task.get("metadata") else {}
     except (TypeError, ValueError):
         meta = {}
-    # meta-work must not feed back into memory: the consolidator's own run
-    # would become next night's input, reflections are private review passes,
-    # and the Phase I gate/parse runs are plumbing around real interactions.
-    #
-    # daily-brief/weekly-review belong here for exactly the same reason, and
-    # were missed until 2026-08-01. Their episode says "I wrote a file", so the
-    # nightly graph extractor kept turning the system's own housekeeping into
-    # "knowledge": every fact in the graph was a self-observation like "the
-    # daily-brief automation continued writing successfully through 07-31",
-    # each night invalidating the previous night's copy of itself. Nothing is
-    # lost by excluding them — a brief's *content* reaches memory the right
-    # way, through the vault index that ingests vault/briefs/ already.
-    return meta.get("task_type") not in (
-        "memory-consolidate", "reflection", "notify-gate", "automation-parse",
-        "graph-extract", "graph-reconcile", "daily-brief", "weekly-review")
+    # meta-work must not feed back into memory — see INTERNAL_TASK_TYPES above
+    # for what counts as meta-work and why each entry is on the list.
+    return meta.get("task_type") not in INTERNAL_TASK_TYPES
 
 
 def build_consolidation(cfg: Config, db: Database) -> dict | None:
@@ -138,12 +174,21 @@ def build_consolidation(cfg: Config, db: Database) -> dict | None:
     rel = str(export.relative_to(cfg.root))
     text = text.replace("{{EPISODES_FILE}}", rel).replace("{{DATE}}", now()[:10])
 
+    # Grants come through AreaRegistry, NOT from the frontmatter we just parsed
+    # for the body (H2). This task is submitted trusted=True, so an unsanitized
+    # `allowed_tools:` here would survive the trust boundary intact — and the
+    # agent file lives under areas/**, which reflection and learn runs can edit.
+    # That is precisely the escalation the load-time sanitizer exists to stop:
+    # a prompt-injected reflection writing `- Bash` into consolidate.md would
+    # otherwise hand the nightly run a shell.
+    registry = AreaRegistry(cfg.root / "areas",
+                            privileged_areas=cfg.privileged_areas)
     return {
         "text": text,
         "episode_ids": [e["id"] for e in episodes],
         "export_path": rel,
         "metadata": {
             "task_type": meta.get("task_type", "memory-consolidate"),
-            "allowed_tools": meta.get("allowed_tools"),
+            "allowed_tools": registry.agent_tools("memory", "consolidate"),
         },
     }

@@ -28,13 +28,25 @@ log = logging.getLogger("dispatcher.offline")
 MAX_HITS = 3
 SNIPPET_CHARS = 320
 # Search words are what make this work at all; a query of nothing but stopwords
-# retrieves noise, so we'd rather say we have nothing.
+# retrieves noise, so we'd rather say we have nothing. Since 2026-08-08 the
+# relevance anchor also runs per word, which means anything left in this list
+# can anchor a question on its own — "about" and "did" were added then because
+# both match this index by themselves (3 and 1 entries), and either one would
+# have quietly re-opened the hole the anchor exists to close. Every other
+# preposition and do-form was already here; those two were just missed.
 STOPWORDS = frozenset("""
-a an and are as at be by can could do does for from get give had has have how
-i if in is it me my of on or should so tell that the their them then there
-these this to was were what when where which who why will with would you your
+a about an and are as at be by can could did do does for from get give had has
+have how i if in is it me my of on or should so tell that the their them then
+there these this to was were what when where which who why will with would you
+your
 """.split())
 MIN_CONTENT_WORDS = 1
+# The anchor probes one content word at a time (see search_memory), so a
+# rambling question could mean a lot of FTS round-trips. any() short-circuits on
+# the first match, so the usual cost is one query; this only caps the miss case.
+# A question whose ONLY matching term sits past the cap fails to anchor — that
+# fails toward "I have nothing", which is the safe direction here.
+ANCHOR_TERMS = 8
 
 
 def _content_words(question: str) -> list[str]:
@@ -78,8 +90,28 @@ def search_memory(cfg, db, embeddings, question: str) -> list[dict]:
     # Ranking still uses the hybrid path below, so vectors keep their job of
     # floating the right chunk up — they just can't conjure a topic from
     # nothing.
+    #
+    # Probe the content words ONE AT A TIME, not the whole question (fixed
+    # 2026-08-08). db.fts_query joins terms with a space = FTS5 implicit AND, so
+    # the old whole-question probe demanded that EVERY token — stopwords
+    # included — occur in one chunk, and degraded mode was therefore dead for
+    # anything phrased like a sentence. Measured against the live index:
+    #   'what is my preferred coding tool' -> 0 hits   (so: "didn't find
+    #   'preferred coding tool'            -> 0 hits    anything relevant",
+    #   'Neovim'                           -> 1 hit     with the answer sitting
+    #                                                   right there in USER.md)
+    # CLAUDE.md cites "preferred coding tool" as the proof this feature works,
+    # but that was verified through /memory/search — which never applies this
+    # anchor. One word is one quoted token, so AND-of-one is exactly the
+    # question being asked: did a real term match anything?
+    #
+    # Not db.fts_query_any over the raw question: OR semantics would let "the",
+    # "of" or "a" anchor absolutely anything, which is the noise the anchor
+    # exists to stop. Stopwords are dropped first, so the swallow still gets
+    # nothing — none of airspeed/velocity/laden/swallow is in the index.
     try:
-        if not (db.search_entries(question, 1) or db.search_episodes(question, 1)):
+        if not any(db.search_entries(w, 1) or db.search_episodes(w, 1)
+                   for w in _content_words(question)[:ANCHOR_TERMS]):
             return []
     except Exception:
         log.exception("offline: relevance anchor failed")

@@ -262,6 +262,42 @@ class TestCapturePolicy(unittest.TestCase):
                 t = self._task(source="timer", metadata={"task_type": tt})
                 self.assertFalse(memory.should_capture(cfg, t, "done"))
 
+    def test_machine_prompts_are_not_user_interactions(self):
+        """media-parse/inbox-summarize had drifted off this one list while
+        sitting on every other (2026-08-08). Live proof in data/mission.db,
+        episode 62 — a media-parse *prompt* stored as the user's own words:
+        "Convert the user's music request into a Spotify search… Reply with ONE
+        JSON object", answered with a JSON blob, already consolidated. The
+        nightly graph extractor has therefore read a format instruction as
+        something the user said."""
+        cfg = make_cfg(Path("."))
+        for tt in ("media-parse", "inbox-summarize"):
+            with self.subTest(task_type=tt):
+                t = self._task(source=tt, metadata={"task_type": tt})
+                self.assertFalse(memory.should_capture(cfg, t, "done"))
+
+    def test_every_internal_task_type_is_excluded(self):
+        cfg = make_cfg(Path("."))
+        for tt in memory.INTERNAL_TASK_TYPES:
+            with self.subTest(task_type=tt):
+                self.assertFalse(memory.should_capture(
+                    cfg, self._task(metadata={"task_type": tt}), "done"))
+
+    def test_the_exclusion_list_cannot_silently_shrink(self):
+        """Spelled out rather than derived: this list has now lost entries
+        twice (daily-brief/weekly-review 2026-08-01, media-parse/
+        inbox-summarize 2026-08-08), and each time the loss was invisible
+        because every *remaining* entry still passed its test. Deleting a name
+        from the constant must break a test. Adding one is a deliberate edit
+        here — and a reminder to check the sibling lists in service.py
+        (NO_CONTINUITY_SOURCES, DEFAULT_META_TASK_TYPES) and notify.py
+        (NEVER_SURFACE_TASK_TYPES, NEVER_GATE_TASK_TYPES)."""
+        self.assertEqual(set(memory.INTERNAL_TASK_TYPES), {
+            "memory-consolidate", "reflection", "notify-gate",
+            "automation-parse", "media-parse", "inbox-summarize",
+            "graph-extract", "graph-reconcile", "daily-brief", "weekly-review",
+            "divert"})
+
     def test_a_real_timer_task_is_still_captured(self):
         """The exclusion is per task_type, not a blanket ban on source=timer."""
         cfg = make_cfg(Path("."))
@@ -303,6 +339,25 @@ class TestConsolidation(unittest.TestCase):
         self.assertIn("Edit(vault/memory/**)", job["metadata"]["allowed_tools"])
         # hand-off marking is the caller's job — episodes still pending here
         self.assertEqual(len(self.db.unconsolidated_episodes()), 1)
+
+    def test_privileged_grants_in_the_agent_file_are_stripped(self):
+        """H2 on the consolidation path.
+
+        The consolidation task is submitted trusted=True, so its allowed_tools
+        survive the H1 trust boundary intact — and the agent file lives under
+        areas/**, which reflection and learn runs may edit. build_consolidation
+        parsed that frontmatter itself and skipped the load-time sanitizer, so a
+        prompt-injected reflection writing `- Bash` into consolidate.md handed
+        the nightly run a shell.
+        """
+        agent = self.root / "areas" / "memory" / "agents" / "consolidate.md"
+        agent.write_text(agent.read_text().replace(
+            "allowed_tools:\n", "allowed_tools:\n  - Bash\n  - Write\n"))
+        self.db.add_episode("t1", "voice", "quick", None, "done", "hi", "hello")
+        tools = memory.build_consolidation(self.cfg, self.db)["metadata"]["allowed_tools"]
+        self.assertNotIn("Bash", tools)
+        self.assertNotIn("Write", tools)          # unscoped write, also stripped
+        self.assertIn("Edit(vault/memory/**)", tools)   # the scoped grant stays
 
 
 if __name__ == "__main__":

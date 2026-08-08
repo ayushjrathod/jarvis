@@ -349,10 +349,18 @@ def ingest_vault(db: Database, root: Path, dirs: list[str]) -> dict:
                     stats["dep_gated"] += 1
                     gated_names.append(rel)
                 continue
+            # stat() before anything is counted: a file that vanished between
+            # the rglob and here must fall through to the prune pass below
+            # rather than being marked `seen` and held in the index until the
+            # next restart.
+            try:
+                mtime = p.stat().st_mtime
+            except OSError as e:
+                log.warning("ingest: skipping %s: %s", rel, e)
+                continue
             seen.add(rel)
             stats["files_scanned"] += 1
             try:
-                mtime = p.stat().st_mtime
                 if indexed.get(rel) == mtime:
                     continue
                 chunks = chunker(rel, p)

@@ -1,9 +1,22 @@
 """Degraded (rate-limited) answers from the local index — no LLM anywhere."""
 
+import re
 import unittest
 from unittest import mock
 
 from dispatcher import offline
+
+
+def _tokens(text) -> set:
+    return set(re.findall(r"[a-z0-9']+", (text or "").lower()))
+
+
+def _row_tokens(row: dict) -> set:
+    toks = set()
+    for v in row.values():
+        if isinstance(v, str):
+            toks |= _tokens(v)
+    return toks
 
 
 class _Emb:
@@ -22,23 +35,45 @@ class _Emb:
 
 
 class _Db:
+    """Fake index that actually MATCHES on the query text.
+
+    Until 2026-08-08 the FTS methods here ignored `q` entirely and answered from
+    an `anchored=` flag, which is why this file happily passed while degraded
+    mode was dead in production: the relevance anchor probed with the whole
+    question and db.fts_query joins terms with a space (FTS5 implicit AND), so
+    every token — stopwords included — had to occur in one chunk. `_fts` below
+    reproduces exactly that AND semantics, so a probe that would return nothing
+    against the real index returns nothing here too.
+
+    The *hybrid* methods deliberately do NOT filter: KNN always returns
+    something, and that gap between the two is precisely what the anchor
+    guards.
+    """
+
     vec_ok = True
 
-    def __init__(self, entries=(), episodes=(), fail=None, anchored=True):
+    def __init__(self, entries=(), episodes=(), fail=None):
         self.entries, self.episodes, self.fail = list(entries), list(episodes), fail
-        self.anchored = anchored
         self.qvecs = []
+        self.probes = []        # every query the anchor sent
+
+    def _fts(self, rows, q, limit):
+        self.probes.append(q)
+        terms = _tokens(q)
+        if not terms:
+            return []
+        return [r for r in rows if terms <= _row_tokens(r)][:limit]
 
     # the BM25 anchor: did any real term match anywhere?
     def search_entries(self, q, limit=10):
         if self.fail == "anchor":
             raise RuntimeError("fts exploded")
-        return self.entries[:limit] if self.anchored else []
+        return self._fts(self.entries, q, limit)
 
     def search_episodes(self, q, limit=10):
         if self.fail == "anchor":
             raise RuntimeError("fts exploded")
-        return self.episodes[:limit] if self.anchored else []
+        return self._fts(self.episodes, q, limit)
 
     def search_entries_hybrid(self, q, qvec, limit):
         if self.fail == "entries":
@@ -54,6 +89,8 @@ class _Db:
 
 ENTRY = {"file_path": "vault/notes/neovim.md", "heading": "Editors",
          "raw": "The preferred editor is Neovim, configured with lazy.nvim."}
+EPISODE = {"assistant_text": "You set the editor to Neovim last month.",
+           "valid_at": "2026-07-20T10:00:00+00:00"}
 
 
 class TestSearchMemory(unittest.TestCase):
@@ -87,14 +124,57 @@ class TestSearchMemory(unittest.TestCase):
         self.assertEqual(db.qvecs, [None])      # FTS-only, not a crash
         self.assertEqual(len(hits), 1)
 
+    def test_a_natural_language_question_anchors(self):
+        """The defect that made degraded mode dead (fixed 2026-08-08).
+
+        The anchor used to probe with the whole question, and FTS5 ANDs the
+        terms — so a sentence only anchored if every one of its words, "what"
+        and "is" included, sat in a single chunk. Measured live: 'what is my
+        preferred coding tool' → 0 hits, while 'preferred' alone → 5.
+        """
+        db = _Db([ENTRY])
+        q = "what is my preferred editor"
+        # the old whole-question probe: AND over every token, nothing matches
+        self.assertEqual(db.search_entries(q, 1), [])
+        # …the per-content-word probe finds it
+        hits = offline.search_memory({}, db, _Emb(), q)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("Neovim", hits[0]["text"])
+
     def test_unrelated_question_gets_nothing_rather_than_noise(self):
         # KNN always returns *something*; without the BM25 anchor an index with
         # no matching term still hands back its three least-unrelated chunks,
-        # which compose() would then quote as "what I already have on it"
-        hits = offline.search_memory({}, _Db([ENTRY], [ENTRY], anchored=False),
+        # which compose() would then quote as "what I already have on it".
+        # Per-word anchoring must not weaken this — none of airspeed/velocity/
+        # laden/swallow is in the corpus, so there is nothing to anchor on.
+        hits = offline.search_memory({}, _Db([ENTRY], [EPISODE]),
                                      _Emb(on=True),
                                      "airspeed velocity of a laden swallow")
         self.assertEqual(hits, [])
+
+    def test_stopwords_never_anchor(self):
+        # The corpus is full of "the"/"is"/"a", so an OR probe over the RAW
+        # question (db.fts_query_any) would anchor this and quote Neovim at
+        # someone asking about swallows. Stopwords are dropped before probing,
+        # so only airspeed/swallow are tried — and neither is in the index.
+        db = _Db([ENTRY], [EPISODE])
+        self.assertEqual(
+            offline.search_memory({}, db, _Emb(on=True),
+                                  "is the airspeed of a swallow"), [])
+        self.assertEqual(sorted(db.probes), ["airspeed", "airspeed",
+                                             "swallow", "swallow"])
+        # and a question made of nothing else never reaches the index at all
+        db = _Db([ENTRY], [EPISODE])
+        self.assertEqual(
+            offline.search_memory({}, db, _Emb(on=True), "what is it"), [])
+        self.assertEqual(db.probes, [])
+
+    def test_anchor_probes_are_capped(self):
+        # any() short-circuits on a hit; a total miss must still not fan out
+        # one FTS round-trip per word of a rambling question
+        db = _Db([ENTRY])
+        offline.search_memory({}, db, _Emb(), " ".join(f"zzz{i}" for i in range(40)))
+        self.assertEqual(len(db.probes), offline.ANCHOR_TERMS * 2)  # entries+episodes
 
     def test_anchor_failure_never_raises(self):
         self.assertEqual(
@@ -107,8 +187,8 @@ class TestSearchMemory(unittest.TestCase):
             offline.search_memory({}, _Db([ENTRY], fail="entries"), _Emb(),
                                   "which editor"), [])
         self.assertEqual(
-            offline.search_memory({}, _Db([], [], fail="episodes"), _Emb(),
-                                  "which editor"), [])
+            offline.search_memory({}, _Db([], [EPISODE], fail="episodes"),
+                                  _Emb(), "which editor"), [])
 
     def test_html_comments_are_stripped(self):
         # USER.md/MEMORY.md open with an editor instruction in a comment; it
