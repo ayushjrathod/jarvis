@@ -297,6 +297,14 @@ class TestValidateSpec(unittest.TestCase):
             automations.validate_spec(
                 {"task_text": "x", "kind": "interval", "interval_minutes": 1})
 
+    def test_interval_maximum(self):
+        with self.assertRaises(ValueError):
+            automations.validate_spec(
+                {"task_text": "x", "kind": "interval", "interval_minutes": 10 ** 9})
+        ok = automations.validate_spec(
+            {"task_text": "x", "kind": "interval", "interval_minutes": 60})
+        self.assertEqual(ok["interval_minutes"], 60)
+
     def test_once_must_be_future(self):
         with self.assertRaises(ValueError):
             automations.validate_spec(

@@ -838,6 +838,8 @@ SPEC = {"task_text": "give me the brief", "kind": "daily", "time": "07:30",
 
 
 class TestAutomationRoutes(HTTPTestCase):
+    cfg_overrides = {"automations": {"enabled": True}}
+
     def seed(self, next_run_at="2020-01-01T07:30:00+00:00"):
         return self.svc.db.create_automation("every morning, brief me", "api",
                                              SPEC, next_run_at)
@@ -865,6 +867,16 @@ class TestAutomationRoutes(HTTPTestCase):
         r = self.client.post("/automations", json={"request": "sometime, maybe"})
         self.assertEqual(r.status_code, 422)
         self.assertIn("couldn't", r.json()["detail"])
+
+    def test_a_disabled_block_is_409_before_any_parse(self):
+        # The scheduler only polls when the block is enabled; the old code
+        # returned 201 over a row nothing would ever run.
+        self.cfg.automations = {}
+        with patch.object(type(self.svc), "create_automation_from_nl") as parse:
+            r = self.client.post("/automations",
+                                 json={"request": "every morning, brief me"})
+        parse.assert_not_called()
+        self.assertEqual(r.status_code, 409)
 
     def test_listing_decorates_every_row_with_its_description(self):
         self.seed()

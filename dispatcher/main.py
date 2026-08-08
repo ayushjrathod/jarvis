@@ -462,6 +462,12 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         """NL request → one LLM parse → validated standing automation."""
         if not a.request.strip():
             raise HTTPException(400, "empty request")
+        # The scheduler only polls when the automations block is enabled; the
+        # old code returned 201 "Scheduled" over a row nothing would ever run.
+        if not (svc.cfg.automations or {}).get("enabled"):
+            raise HTTPException(409, "automations are disabled in config.yaml "
+                                     "(add an `automations:` block) — nothing "
+                                     "would run this row")
         row, speech = await svc.create_automation_from_nl(a.request, a.source)
         if not row:
             raise HTTPException(422, speech)

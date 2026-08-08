@@ -62,6 +62,10 @@ KINDS = ("daily", "weekly", "interval", "once")
 WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
             "Saturday", "Sunday")
 MIN_INTERVAL_MINUTES = 5
+# ...and a ceiling: above a day the daily/weekly kinds are the honest shape,
+# and a 10^9-minute typo would otherwise schedule silence until the heat death
+# of the universe while reporting success.
+MAX_INTERVAL_MINUTES = 7 * 24 * 60
 TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
 
 # Conservative on purpose: a false divert turns a question into an unwanted
@@ -224,6 +228,9 @@ def validate_spec(spec: dict) -> dict:
         iv = spec.get("interval_minutes")
         if not isinstance(iv, int) or iv < MIN_INTERVAL_MINUTES:
             raise ValueError(f"interval needs interval_minutes >= {MIN_INTERVAL_MINUTES}")
+        if iv > MAX_INTERVAL_MINUTES:
+            raise ValueError(f"interval over {MAX_INTERVAL_MINUTES} minutes "
+                             "is a daily/weekly schedule, not an interval")
         out["interval_minutes"] = iv
     if kind == "once":
         try:
