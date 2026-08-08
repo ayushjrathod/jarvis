@@ -1,14 +1,36 @@
 #!/usr/bin/env bash
 # Phase A acceptance smoke test. Expects the dispatcher running on :8765.
 #   .venv/bin/python -m dispatcher.main   (in another terminal)
+#
+# PREREQUISITE (since 2026-08-08): the refusal-fallback check drives
+# `metadata.simulate_refusal` over HTTP, and that key is now stripped by the
+# trust boundary — it forces a SECOND run on models.fallback, so leaving it
+# open let anything reaching POST /task double the cost of every agentic run.
+# Set `security.allow_simulate_refusal: true` in config.yaml, restart the
+# dispatcher, run this, then set it back to false.
+#
+# This script WRITES INTO THE VAULT (vault/briefs/test.md, refusal-test.md) —
+# that is the point of the agentic checks, but the vault is indexed for
+# /memory/search, so leaving them behind puts smoke output in your memory. It
+# cleans up after itself at the end; see the trap below.
 set -uo pipefail
 BASE=${1:-http://127.0.0.1:8765}
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
 pass=0; fail=0
 ok()   { echo "PASS: $1"; pass=$((pass+1)); }
 bad()  { echo "FAIL: $1"; fail=$((fail+1)); }
 
+cleanup() {
+  rm -f "$ROOT/vault/briefs/test.md" "$ROOT/vault/briefs/refusal-test.md"
+  # drop their rows from the FTS/vector index too — a reindex prunes files that
+  # no longer exist, so without this they stay searchable until a restart
+  curl -sf -X POST "$BASE/memory/reindex" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
 echo "== health =="
-curl -sf "$BASE/health" && echo || bad "health endpoint"
+# the success branch had no ok(), so the advertised "7/7" was really 7 of 8
+if curl -sf "$BASE/health"; then echo; ok "health endpoint"; else bad "health endpoint"; fi
 
 echo "== quick question (SSE stream) =="
 out=$(curl -sN --max-time 180 -X POST "$BASE/task" \

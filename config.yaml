@@ -29,7 +29,8 @@ dispatcher:
     effort: medium
     # refusal fallback (locked decision #3)
     fallback: claude-opus-4-8
-    classifier: claude-haiku-4-5
+    # (no `classifier:` key — dispatcher/classifier.py is pure heuristic and
+    #  never asked a model; the key was never read. Removed 2026-08-02.)
     # Internal plumbing tasks (a NOTIFY/SKIP verdict, a schedule spec, search
     # words) run here instead of models.quick — each is a classification with
     # mechanical validation downstream, and the rate difference is the whole
@@ -79,6 +80,13 @@ dispatcher:
     # the dispatcher stays on 127.0.0.1 and Serve proxies HTTPS in front, so no
     # public port is opened and no token middleware is needed.
     public_hosts: ["archlinux.tail79c6ce.ts.net"]
+    # Whether an EXTERNAL caller may set metadata.simulate_refusal, which forces
+    # the refusal fallback — i.e. a SECOND run of the same task on
+    # models.fallback (an Opus). It is a test seam; leaving it reachable let
+    # anything that could POST /task (dashboard, phone over Tailscale, a queue
+    # file) double the cost of every agentic run (found 2026-08-08). Turn it on
+    # only while running scripts/smoke_phase_a.sh, then turn it back off.
+    allow_simulate_refusal: false
 
   task_defaults:
     allowed_tools: [Read, Glob, Grep]   # read-only baseline for unattended runs
@@ -204,6 +212,12 @@ dispatcher:
     # Opt-in: also spend one quick call per new file to say what it is.
     # Off by default — arrival + indexing is free, a summary is not.
     summarize: false
+    # ...and cap the fan-out. This directory is one the user SYNCS into, so a
+    # single poll can surface fifty files at once; uncapped that was fifty cold
+    # `claude -p` calls, serialized, at the ~$0.10-0.14 floor (found
+    # 2026-08-08). Overflow is logged and named in the notification, never
+    # dropped silently. 0 = index but never spend a model.
+    summarize_max_per_poll: 5
 
   # Desktop control (computer-use tier T1 — see future/computer-use.md).
   # Deterministic verbs only: no pixels, no coordinates, no synthetic input,
@@ -236,13 +250,10 @@ dispatcher:
       clipboard_get: confirm
       open: confirm
 
-  # USD per million tokens, for quick-path cost computation (agentic cost comes
-  # from the CLI's total_cost_usd). Cached from docs 2026-07-05.
-  prices:
-    claude-fable-5:   { input: 10.0, output: 50.0 }
-    claude-opus-4-8:  { input: 5.0,  output: 25.0 }
-    claude-sonnet-5:  { input: 3.0,  output: 15.0 }
-    claude-haiku-4-5: { input: 1.0,  output: 5.0 }
+  # (no `prices:` block — it fed Config.quick_cost, which priced the Messages
+  #  API's token counts by hand. That backend was removed 2026-07-27 and every
+  #  run now reports its own total_cost_usd, so both were dead. Removed
+  #  2026-08-02.)
 
 jarvis:
   trigger_key: KEY_F9          # dictation (mission-dictate): hold → typed at cursor

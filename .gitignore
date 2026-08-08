@@ -16,7 +16,14 @@ __pycache__/
 
 # node
 node_modules/
-ui/dist/
+# NOT ui/dist/ — the dispatcher serves the built SPA straight out of it
+# (main.py mounts it at "/"), so a fresh clone needs it committed. It was
+# ignored AND tracked, which looks fine right up until you rebuild: git keeps
+# tracking existing files regardless of ignore rules, but Vite emits
+# content-HASHED asset names, so a rebuilt bundle is a NEW path that the rule
+# hides. You would commit an index.html pointing at a file that isn't in the
+# repo. Verified 2026-08-02 by dropping a fake index-<hash>.js in and watching
+# `git status` stay silent.
 
 # local model files
 models/
