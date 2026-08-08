@@ -71,12 +71,60 @@ class TestDetect(unittest.TestCase):
         self.assertEqual(self.parse("is the screen locked").verb, "status")
         self.assertEqual(self.parse("what's the system volume").verb, "status")
 
+    def test_open_url_needs_a_real_scheme_or_tld(self):
+        # "open notes.md" used to become `xdg-open https://notes.md` — a local
+        # filename turned into a web request. Bare dotted names belong to the
+        # app branch, which fails reversibly.
+        for s, arg in (("open notes.md", "notes.md"),
+                       ("open config.yaml", "config.yaml"),
+                       ("open org.gnome.Nautilus", "org.gnome.Nautilus")):
+            i = self.parse(s)
+            self.assertEqual((i.verb, i.arg), ("launch", arg), s)
+
+    def test_real_urls_still_open(self):
+        for s, arg in (("open news.ycombinator.com", "news.ycombinator.com"),
+                       ("visit https://x.com/a/b", "https://x.com/a/b"),
+                       ("go to example.com:8080/path", "example.com:8080/path"),
+                       ("open youtube.com/watch?v=dQw4w9WgXcQ",
+                        "youtube.com/watch?v=dQw4w9WgXcQ")):
+            i = self.parse(s)
+            self.assertEqual((i.verb, i.arg), ("open", arg), s)
+
+    def test_looks_like_url(self):
+        for yes in ("https://x.com/a/b", "file:///home/ayra/notes.md",
+                    "example.com", "example.com:8080/path",
+                    "news.ycombinator.com", "sub.domain.co.uk/x?y=1"):
+            self.assertTrue(desktop.looks_like_url(yes), yes)
+        for no in ("notes.md", "config.yaml", "org.gnome.Nautilus",
+                   "main.py", "index.js", "backup.tar.gz"):
+            self.assertFalse(desktop.looks_like_url(no), no)
+
     def test_veto_and_prose(self):
         for s in ("is this open source", "let's start over", "run by me again",
                   "open a discussion about the roadmap", "lock in the date",
                   "open the door for the delivery guy",
                   "what did you think of the film", ""):
             self.assertIsNone(self.parse(s), s)
+
+    def test_a_short_article_led_phrase_is_prose_not_an_app(self):
+        # The old guard was `len(target.split()) <= 3` and its comment claimed
+        # it stopped "open the door" — it never did, because "the door" is two
+        # words. Verified against HEAD 2026-08-08: it returned
+        # Intent(launch, 'the door'). Only the LONGER phrasing was ever caught,
+        # which is why the existing prose test above didn't notice.
+        for s in ("open the door", "open the window", "open the fridge",
+                  "open the blinds"):
+            self.assertIsNone(self.parse(s), s)
+
+    def test_real_app_names_survive_the_prose_guard(self):
+        for s, arg in (("open firefox", "firefox"),
+                       ("open tor browser", "tor browser"),
+                       ("open toolbox", "toolbox"),
+                       ("open notes.md", "notes.md"),
+                       ("open Visual Studio Code", "Visual Studio Code")):
+            got = self.parse(s)
+            self.assertIsNotNone(got, s)
+            self.assertEqual((got.verb, got.arg), ("launch", arg), s)
 
     def test_question_mark_vetoes_commands_but_not_reads(self):
         self.assertIsNone(self.parse("should I lock the screen?"))
@@ -86,6 +134,83 @@ class TestDetect(unittest.TestCase):
         # main.py gates on detect() then the service re-parses — same answer
         a, b = self.parse("lock the screen"), self.parse("lock the screen")
         self.assertEqual(a, b)
+
+
+class TestWeakLaunchVerbs(unittest.TestCase):
+    """`run` and `start` are ordinary English imperatives, not just launch
+    verbs. Having them in the bare alternation made "run the tests" an
+    Intent(launch, 'the tests') — harmless while the divert lived in the HTTP
+    handler, destructive once it moved onto Service.submit(), where a queue
+    file saying "run the migration" is swallowed and recorded done."""
+
+    def test_ordinary_imperatives_fall_through(self):
+        for s in ("run the tests", "start the deployment", "run the migration",
+                  "start writing the report", "run the backup script",
+                  "start a new branch", "run all of them again",
+                  "start writing", "run it for me"):
+            self.assertIsNone(desktop.detect(s), s)
+
+    def test_unambiguous_launch_verbs_are_untouched(self):
+        for s, arg in (("launch firefox", "firefox"),
+                       ("open up spotify", "spotify"),
+                       ("fire up gimp", "gimp"),
+                       ("launch text editor", "text editor")):
+            i = desktop.detect(s)
+            self.assertEqual((i.verb, i.arg), ("launch", arg), s)
+
+    def test_app_shaped_weak_verbs_still_launch(self):
+        # the whole reason `run`/`start` are kept rather than deleted
+        for s, arg in (("run outlook", "outlook"),
+                       ("start overwatch", "overwatch"),
+                       ("start Visual Studio Code", "Visual Studio Code"),
+                       ("run gimp", "gimp")):
+            i = desktop.detect(s)
+            self.assertEqual((i.verb, i.arg), ("launch", arg), s)
+
+    def test_looks_like_app_name(self):
+        for yes in ("firefox", "tor browser", "Visual Studio Code", "gimp"):
+            self.assertTrue(desktop._looks_like_app_name(yes), yes)
+        for no in ("the tests", "a new branch", "writing the report",
+                   "writing", "some very long thing indeed", ""):
+            self.assertFalse(desktop._looks_like_app_name(no), no)
+
+
+class TestVetoWordBoundaries(unittest.TestCase):
+    """VETO used to match as a bare substring, so every short entry was a
+    prefix of real app names — "open to" ⊂ "open toolbox", "run out" ⊂ "run
+    outlook", "start over" ⊂ "start overwatch". Those commands silently
+    returned None, which is the worst failure shape here: a vetoed command
+    just goes to the model, so nobody sees what was dropped."""
+
+    def test_commands_that_merely_start_with_a_veto_prefix_work(self):
+        for s, arg in (("open toolbox", "toolbox"),
+                       ("open tor browser", "tor browser"),
+                       ("run outlook", "outlook"),
+                       ("start overwatch", "overwatch"),
+                       ("open sourcetree", "sourcetree"),
+                       ("start upwork", "upwork")):
+            i = desktop.detect(s)
+            self.assertIsNotNone(i, s)
+            self.assertEqual((i.verb, i.arg), ("launch", arg), s)
+
+    def test_every_veto_entry_still_vetoes(self):
+        # word boundaries must not have loosened any existing idiom
+        for phrase in desktop.VETO:
+            self.assertTrue(desktop._VETO_RE.search(phrase), phrase)
+            self.assertIsNone(desktop.detect(phrase), phrase)
+
+    def test_the_idioms_in_real_sentences(self):
+        for s in ("is this open source", "that's an open question",
+                  "are you open to a rewrite", "he wouldn't open up about it",
+                  "let's start over", "start with the basics",
+                  "start from scratch", "let's run through the agenda",
+                  "run by me again", "don't run out of coffee",
+                  "we ran into trouble on the run through",
+                  "open a discussion about the roadmap",
+                  "open the floor to questions", "lock in the date",
+                  "the date is locked in", "start a conversation with them",
+                  "open the door for the delivery guy"):
+            self.assertIsNone(desktop.detect(s), s)
 
 
 class TestPolicy(unittest.TestCase):
@@ -112,6 +237,20 @@ class TestPolicy(unittest.TestCase):
         cfg = {"enabled": True, "policy": {"open": "allow", "lock": "deny"}}
         self.assertEqual(desktop.policy(cfg, "open"), "allow")
         self.assertEqual(desktop.policy(cfg, "lock"), "deny")
+
+    def test_malformed_policy_denies_instead_of_raising(self):
+        # `policy:` written as a YAML list raised AttributeError out of .get,
+        # which the callers turn into a 500 — a config typo must fail closed,
+        # not fail loudly and leave the operator guessing what is live.
+        for bad in (["lock"], "allow", 7, []):
+            cfg = {"enabled": True, "policy": bad}
+            for verb in desktop.ALL_VERBS:
+                self.assertEqual(desktop.policy(cfg, verb), "deny", (bad, verb))
+
+    def test_absent_policy_key_still_uses_the_defaults(self):
+        cfg = {"enabled": True, "policy": None}      # `policy:` with no value
+        self.assertEqual(desktop.policy(cfg, "lock"), "allow")
+        self.assertEqual(desktop.policy(cfg, "open"), "confirm")
 
 
 class TestOpenSchemeGuard(unittest.TestCase):
@@ -474,6 +613,18 @@ class TestConfirmFlow(unittest.TestCase):
         self.assertEqual(self.run_cmd(svc, "what's the weather")["status"],
                          "unrecognized")
 
+    def test_ordinary_imperatives_are_not_desktop_commands(self):
+        # try_divert runs on Service.submit() now, so a queue file saying "run
+        # the migration" that parses as a launch is answered by the desktop
+        # tier and recorded done — the work silently never happens.
+        svc = _Svc(self.CFG)
+        for text in ("run the tests", "start the deployment",
+                     "run the migration", "start writing the report"):
+            with mock.patch.object(desktop, "run_intent") as run:
+                out = self.run_cmd(svc, text)
+                run.assert_not_called()
+            self.assertEqual(out["status"], "unrecognized", text)
+
 
 class TestVoiceAnswer(unittest.TestCase):
     """A parked confirmation is answerable by a bare yes/no — without this the
@@ -482,12 +633,45 @@ class TestVoiceAnswer(unittest.TestCase):
     CFG = {"enabled": True, "confirm_timeout_s": 120}
 
     def test_parse_answer(self):
-        for yes in ("yes", "yeah", "yep", "sure", "go ahead", "do it", "Okay."):
+        for yes in ("yes", "yeah", "yep", "yup", "sure", "go ahead", "do it",
+                    "please do", "alright", "that's fine", "confirmed",
+                    "Okay."):
             self.assertIs(desktop.parse_answer(yes), True, yes)
-        for no in ("no", "nope", "don't", "cancel", "never mind", "skip it"):
+        for no in ("no", "nope", "nah", "don't", "cancel", "never mind",
+                   "skip it", "no thanks", "not now", "leave it"):
             self.assertIs(desktop.parse_answer(no), False, no)
         for neither in ("what's the weather", "", "yesterday's brief"):
             self.assertIsNone(desktop.parse_answer(neither), neither)
+
+    def test_an_answer_is_the_WHOLE_utterance(self):
+        """The confirm window is 120s wide and try_divert runs parse_answer on
+        every utterance from that source, so a `\\b` prefix match meant any
+        sentence *beginning* with an affirmation approved the parked verb —
+        and spoken English begins sentences that way constantly. "what's on my
+        clipboard" followed by "okay so what's on my calendar" read the
+        clipboard and swallowed the real question with it."""
+        for s in ("okay so what is the weather today",
+                  "alright I think we are done here",
+                  "sure, that makes sense",
+                  "yes I told him that yesterday",
+                  "fine, but first show me the brief",
+                  "no idea what that means",
+                  "stop the dispatcher and rebuild it",
+                  "cancel the 7am automation",
+                  "don't forget the weekly review"):
+            self.assertIsNone(desktop.parse_answer(s), s)
+
+    def test_a_follow_up_question_does_not_approve_the_parked_verb(self):
+        # the end-to-end shape of the bug above, through the service
+        svc = _Svc(self.CFG)
+        parked = asyncio.run(svc.desktop_command("what's on my clipboard", "voice"))
+        self.assertEqual(parked["status"], "needs_confirmation")
+        with mock.patch.object(desktop, "run_intent") as run:
+            out = asyncio.run(
+                svc.desktop_command("okay so what's on my calendar", "voice"))
+            run.assert_not_called()
+        self.assertEqual(out["status"], "unrecognized")
+        self.assertEqual(len(svc.pending_desktop), 1)   # still parked, unanswered
 
     def test_yes_runs_the_parked_verb(self):
         svc = _Svc(self.CFG)
@@ -528,6 +712,36 @@ class TestVoiceAnswer(unittest.TestCase):
         out = asyncio.run(svc.desktop_command("read my clipboard", "voice"))
         svc.pending_desktop[out["confirm_id"]]["expires"] = 0
         self.assertIsNone(svc.pending_desktop_for("voice"))
+
+
+class TestArgumentsKeepTheirCase(unittest.TestCase):
+    """Matching is case-insensitive; the extracted ARGUMENT is payload and must
+    survive verbatim. Normalizing lowercased both, which silently corrupted
+    clipboard text and rewrote case-sensitive URL paths into other resources."""
+
+    def test_clipboard_text_is_not_folded(self):
+        i = desktop.detect("copy Hello World ASAP to my clipboard")
+        self.assertEqual(i.verb, "clipboard_set")
+        self.assertEqual(i.arg, "Hello World ASAP")
+
+    def test_url_path_case_survives(self):
+        # a YouTube id differing only in case is a different video
+        i = desktop.detect("open youtube.com/watch?v=dQw4w9WgXcQ")
+        self.assertEqual(i.arg, "youtube.com/watch?v=dQw4w9WgXcQ")
+
+    def test_app_name_case_survives_prefix_stripping(self):
+        for phrase, want in (("hey jarvis, open Firefox", "Firefox"),
+                             ("Please launch GIMP", "GIMP"),
+                             ("start Visual Studio Code", "Visual Studio Code")):
+            with self.subTest(phrase=phrase):
+                self.assertEqual(desktop.detect(phrase).arg, want)
+
+    def test_matching_is_still_case_insensitive(self):
+        self.assertEqual(desktop.detect("LOCK THE SCREEN").verb, "lock")
+        self.assertEqual(desktop.detect("System Volume 40").number, 0.4)
+
+    def test_vetoes_still_apply_to_mixed_case(self):
+        self.assertIsNone(desktop.detect("Open Source alternatives to Slack"))
 
 
 if __name__ == "__main__":

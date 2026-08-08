@@ -93,9 +93,24 @@ VETO = (
     "play chess", "play a game", "play games",
 )
 
-# words that make a sentence music-ish for the MAYBE fallback
+# Matched on word boundaries, not as bare substrings (fixed 2026-08-08). An
+# idiom is a phrase, and a phrase ends where a word ends: as a substring
+# "play out" is inside "play Outkast" and "play down" is inside "play
+# downtempo jazz", so both of those real commands returned None and went to
+# Claude as ordinary text. The veto is the one rule that beats every pattern
+# here, so it is exactly the rule that must not overreach.
+_VETO_RE = re.compile("|".join(rf"\b{re.escape(v)}\b" for v in VETO))
+
+# words that make a sentence music-ish for the MAYBE fallback. Word boundaries
+# for the same reason, and with more at stake (fixed 2026-08-08): the old test
+# accepted a bare substring too, so "band" ⊂ "abandoned", "tune" ⊂ "fortune"
+# and "song" ⊂ "songwriter" made ordinary sentences music-shaped. A MAYBE
+# *diverts* — the request is spent on a media-parse call and answered "I
+# couldn't work out what to play." — so a false MAYBE doesn't merely cost a
+# few cents, it loses what the user actually asked for. This side errs strict.
 MUSIC_WORDS = ("music", "song", "songs", "track", "album", "artist", "band",
                "playlist", "spotify", "tune", "tunes")
+_MUSIC_WORD_RE = re.compile("|".join(rf"\b{w}\b" for w in MUSIC_WORDS))
 
 # a play query built only from these can't be searched literally — ask the model
 VAGUE_STARTS = ("something", "anything", "some music", "some tunes", "music",
@@ -149,7 +164,7 @@ def _normalize(text: str) -> str:
 
 
 def _looks_musical(text: str) -> bool:
-    return any(w in text.split() or w in text for w in MUSIC_WORDS)
+    return bool(_MUSIC_WORD_RE.search(text))
 
 
 def _classify_query(q: str) -> tuple[str, str]:
@@ -171,7 +186,7 @@ def detect(text: str):
     """Intent | MAYBE | None. Pure — safe to call twice (main.py gates on it,
     then the service re-parses)."""
     t = _normalize(text)
-    if not t or any(v in t for v in VETO):
+    if not t or _VETO_RE.search(t):
         return None
 
     if _NOW_RE.match(t):

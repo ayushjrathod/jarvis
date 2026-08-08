@@ -143,6 +143,85 @@ class TestDetectMaybe(unittest.TestCase):
         self.assertIs(spotify.detect("i want to listen to some music now"), MAYBE)
 
 
+# one natural sentence per VETO entry; the covers-everything test below keeps
+# this honest when someone adds an idiom to the tuple
+VETO_SENTENCES = {
+    "devil's advocate": "let me play devil's advocate about the rollout",
+    "devils advocate": "let me play devils advocate about the rollout",
+    "play along": "i'll play along with the bit",
+    "play it safe": "play it safe on the deploy",
+    "play a role": "did the cache play a role in the outage",
+    "playing field": "that levels the playing field",
+    "play out": "let the argument play out",
+    "play down": "play down the risk in the report",
+    "play games": "don't play games with the schedule",
+    "foul play": "there was no foul play here",
+    "play on youtube": "play on youtube instead",
+    "play the video": "play the video again",
+    "play a video": "play a video of the talk",
+    "play on netflix": "play on netflix tonight",
+    "play tennis": "play tennis on sunday",
+    "play football": "play football with the kids",
+    "play cricket": "play cricket this weekend",
+    "play chess": "play chess with me",
+    "play a game": "play a game with me",
+}
+
+
+class TestVetoWordBoundaries(unittest.TestCase):
+    """VETO beats every pattern, so it is the one rule that must not overreach.
+    It matched as a bare substring until 2026-08-08, and "play out" is inside
+    "play Outkast" while "play down" is inside "play downtempo jazz" — two
+    perfectly ordinary commands that returned None and went to Claude as text.
+    """
+
+    def test_band_names_containing_a_vetoed_phrase_now_play(self):
+        for text, query in (("play Outkast", "outkast"),
+                            ("play downtempo jazz", "downtempo jazz"),
+                            ("play Outlandish", "outlandish"),
+                            ("play Downstait", "downstait")):
+            with self.subTest(text=text):
+                i = spotify.detect(text)
+                self.assertIsNotNone(i, text)
+                self.assertEqual((i.action, i.query), ("play", query))
+
+    def test_the_sample_map_covers_every_veto_entry(self):
+        self.assertEqual(set(VETO_SENTENCES), set(spotify.VETO))
+
+    def test_every_veto_entry_still_vetoes_its_idiom(self):
+        # narrowing the match is only safe if the list still does its job
+        for entry, sentence in VETO_SENTENCES.items():
+            with self.subTest(entry=entry):
+                self.assertTrue(spotify._VETO_RE.search(sentence))
+                self.assertIsNone(spotify.detect(sentence), sentence)
+
+
+class TestLooksMusicalWordBoundaries(unittest.TestCase):
+    """A false MAYBE is not a rounding error. MAYBE *diverts*, so the request
+    is spent on a media-parse call and answered "I couldn't work out what to
+    play." — it never reaches Claude at all. Until 2026-08-08 the music-word
+    test also accepted bare substrings: "band" ⊂ "abandoned", "tune" ⊂
+    "fortune", "song" ⊂ "songwriter".
+    """
+
+    def test_substrings_of_ordinary_words_no_longer_divert(self):
+        for t in ("listen to my abandoned draft",
+                  "let's hear your take on the fortune 500 list",
+                  "hear me out on the songwriter's contract"):
+            self.assertIsNone(spotify.detect(t), t)
+
+    def test_helper_is_word_level_not_substring_level(self):
+        self.assertFalse(spotify._looks_musical("an abandoned fortune songwriter"))
+        # …but still tolerant of punctuation, which a bare token split is not
+        self.assertTrue(spotify._looks_musical("some music, please"))
+
+    def test_genuine_fuzzy_requests_still_arm_the_fallback(self):
+        for t in ("i want to listen to some music now",
+                  "i'd love to hear that new taylor swift album",
+                  "put on something chill", "play something chill"):
+            self.assertIs(spotify.detect(t), MAYBE, t)
+
+
 class TestAutomationPrecedence(unittest.TestCase):
     """"every morning play jazz" is a standing automation, not a play command —
     the automation divert runs first in POST /task, so it must claim it."""

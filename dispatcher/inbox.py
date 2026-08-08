@@ -21,6 +21,13 @@ Design notes:
   which costs nothing. Summarizing the document needs a model, so it's opt-in
   (`inbox.summarize`) — cheap surprises are still surprises, and this session
   spent its first hour cutting a $0.14 recurring cost nobody had noticed.
+- **Summarizing is capped and additive** (2026-08-08). It costs one cold
+  `claude -p` per file — ~$0.10-0.14 at the documented floor — on a directory
+  the user *syncs* into, so `inbox.summarize_max_per_poll` bounds the fan-out
+  and the overflow is logged and named in the notification rather than dropped
+  silently. And it no longer replaces the free "Indexed X" notice: it used to
+  sit in an `elif`, so switching summaries on switched the one thing that costs
+  nothing off.
 """
 
 from __future__ import annotations
@@ -32,6 +39,8 @@ from pathlib import Path
 log = logging.getLogger("dispatcher.inbox")
 
 DEFAULT_INTERVAL_S = 60
+# how many new files one poll will spend a model on; see `_summarize_cap`
+DEFAULT_SUMMARIZE_MAX = 5
 SUMMARIZE_PROMPT = (
     "A new file just arrived in my inbox at {path}. Read it and reply with ONE "
     "short sentence saying what it is and why I might care. No preamble."
@@ -101,6 +110,16 @@ class InboxWatcher:
         return sorted(fired), sorted(removed)
 
 
+def _summarize_cap(value) -> int:
+    """`inbox.summarize_max_per_poll`, parsed so no config value can throw.
+    Absent/blank/junk falls back to the default; 0 means "index but never
+    spend a model", which is a legitimate thing for an operator to want."""
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return DEFAULT_SUMMARIZE_MAX
+
+
 async def watch(svc):
     """Poll the inbox; on arrival reindex, then notify (and optionally
     summarize). Never dies on one bad iteration — this loop lives for the
@@ -109,7 +128,13 @@ async def watch(svc):
 
     cfg = svc.cfg
     icfg = cfg.inbox or {}
-    interval = max(5, icfg.get("check_interval_s", DEFAULT_INTERVAL_S))
+    # `or DEFAULT`, not `.get(key, DEFAULT)` (fixed 2026-08-08): a bare
+    # "check_interval_s:" in config.yaml parses as None, and max(5, None) is a
+    # TypeError raised out here — *outside* the loop's try, on a fire-and-forget
+    # task nobody awaits — so one blank config line made the watcher silently
+    # never start. Everything read up here has to fail toward a default.
+    interval = max(5, icfg.get("check_interval_s") or DEFAULT_INTERVAL_S)
+    summarize_cap = _summarize_cap(icfg.get("summarize_max_per_poll"))
     directory = (cfg.root / icfg.get("dir", "vault/inbox")).resolve()
     watcher = InboxWatcher()
     log.info("inbox watcher: %s every %ss", directory, interval)
@@ -135,19 +160,42 @@ async def watch(svc):
                 except Exception:
                     log.exception("inbox reindex failed")
 
-                if icfg.get("summarize"):
-                    for name in arrived:
+                # `arrived` only — a removal reindexes but is never announced.
+                # Without this guard a deleted file notified "Indexed 0 files
+                # from your inbox", since the outer branch fires on either list.
+                if arrived:
+                    # Summarizing is now *additive*, not an `elif` (2026-08-08).
+                    # It used to replace this notice, so turning it on traded
+                    # the free announcement for per-file summaries that were
+                    # then delivered nowhere — see _summarize.
+                    todo, skipped = [], []
+                    if icfg.get("summarize"):
+                        todo, skipped = (arrived[:summarize_cap],
+                                         arrived[summarize_cap:])
+                    if skipped:
+                        # No silent caps. This is a synced directory: a 50-file
+                        # sync was 50 serialized cold `claude -p` runs at the
+                        # ~$0.10-0.14 floor, and the plan cap has taken the
+                        # assistant out twice. Bound it, then say what it cost.
+                        log.warning(
+                            "inbox: summarize capped at %d per poll — "
+                            "summarizing %s; skipped %s", summarize_cap,
+                            ", ".join(todo) or "nothing", ", ".join(skipped))
+                    if icfg.get("notify", True):
+                        what = (arrived[0] if len(arrived) == 1
+                                else f"{len(arrived)} files")
+                        summary = f"Indexed {what} from your inbox — searchable now."
+                        if skipped:
+                            summary += (f" Summarizing {len(todo)}; "
+                                        f"{len(skipped)} skipped by the per-poll cap.")
+                        await notify.send_desktop(summary)
+                        await svc.hooks.fire({
+                            "event": "notify", "task_id": None, "kind": "inbox",
+                            "source": "inbox", "text": ", ".join(arrived[:5]),
+                            "speech": summary, "summary": summary,
+                        })
+                    for name in todo:
                         await _summarize(svc, directory / name)
-                elif icfg.get("notify", True):
-                    what = (arrived[0] if len(arrived) == 1
-                            else f"{len(arrived)} files")
-                    summary = f"Indexed {what} from your inbox — searchable now."
-                    await notify.send_desktop(summary)
-                    await svc.hooks.fire({
-                        "event": "notify", "task_id": None, "kind": "inbox",
-                        "source": "inbox", "text": ", ".join(arrived[:5]),
-                        "speech": summary, "summary": summary,
-                    })
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -156,14 +204,40 @@ async def watch(svc):
 
 
 async def _summarize(svc, path: Path):
-    """Opt-in one-liner about a new document. Read-only tools, scoped to the
-    file; the notify gate decides whether it's worth interrupting for."""
+    """Opt-in one-liner about a new document, delivered the same way the
+    deterministic notice above is.
+
+    It used to `_drain_quick` and drop the answer on the floor (fixed
+    2026-08-08), and nothing downstream picked it up either: source "inbox"
+    isn't in `automations.notify_sources`, so `notify.surfacing` returns
+    "surface" rather than "gate"; the resulting `done` event carries
+    kind="quick"; and the voice brain only speaks `kind == "agentic"`. So the
+    feature charged a cold `claude -p` per file and produced silence. Delivery
+    is explicit now — `_collect_quick` (the helper the notify gate and the
+    automation parser use for machine-consumed quick output) plus the same
+    send_desktop + `notify` hook event, which every client already speaks
+    because it keys on event == "notify".
+    """
+    from . import notify
+
     try:
         task = await svc.create_task(
             SUMMARIZE_PROMPT.format(path=path), "inbox", "quick", None,
             {"task_type": "inbox-summarize",
              "allowed_tools": ["Read", "Glob", "Grep"]},
             trusted=True)
-        await svc._drain_quick(task)
+        answer, status = await svc._collect_quick(task)
+        # one spoken sentence: collapse the whitespace a model reply arrives with
+        summary = " ".join((answer or "").split())[:400]
+        if status != "done" or not summary:
+            log.warning("inbox summarize for %s settled %s with no text",
+                        path.name, status)
+            return
+        await notify.send_desktop(summary)
+        await svc.hooks.fire({
+            "event": "notify", "task_id": task["id"], "kind": "inbox",
+            "source": "inbox", "text": path.name,
+            "speech": summary, "summary": summary,
+        })
     except Exception:
         log.exception("inbox summarize failed for %s", path)

@@ -131,7 +131,18 @@ def policy(cfg_block: dict | None, verb: str) -> str:
         return "deny"
     if verb not in ALL_VERBS:
         return "deny"
-    per_verb = cfg_block.get("policy") or {}
+    per_verb = cfg_block.get("policy")
+    if per_verb is None:
+        per_verb = {}                    # key absent → the defaults above
+    if not isinstance(per_verb, dict):
+        # A `policy:` written as a YAML list (or a string) used to raise
+        # AttributeError out of `.get`, which the callers turn into a 500 —
+        # i.e. a config typo failed OPEN of the fail-closed contract, since an
+        # operator seeing a crash rather than a denial learns nothing about
+        # which verbs are live. Malformed means deny (2026-08-08).
+        log.warning("desktop: computer.policy is %s, not a mapping — denying "
+                    "every verb until it is fixed", type(per_verb).__name__)
+        return "deny"
     value = per_verb.get(verb, DEFAULT_POLICY.get(verb, "deny"))
     return value if value in ("allow", "confirm", "deny") else "deny"
 
@@ -157,22 +168,105 @@ _MUTE_RE = re.compile(
 _LOCK_RE = re.compile(
     r"^(?:lock(?: the)?(?: screen| session| computer| laptop| desktop)?"
     r"|lock it)$")
+# The five arg-bearing patterns carry re.IGNORECASE because they are matched
+# against the CASE-PRESERVING normalization, not the folded one — see detect().
+#
+# The launch verbs are split in two (2026-08-08). "launch", "fire up" and
+# "open up" are unambiguous — nobody fires up a deployment — but `run` and
+# `start` are ordinary English imperatives, and having them in the bare
+# alternation meant "run the tests" parsed as Intent(launch, 'the tests'). That
+# was merely wrong while the divert lived in the HTTP handler; once it moved
+# onto Service.submit() it became destructive, because a *queue file* saying
+# "run the migration" is now swallowed by the desktop divert and recorded done
+# without anything happening. So the weak verbs must additionally look like
+# they are naming an app — see _looks_like_app_name.
 _LAUNCH_RE = re.compile(
-    r"^(?:launch|open up|start|fire up|run)\s+(?P<q>.+?)"
-    r"(?:\s+(?:app|application))?$")
-_OPEN_APP_RE = re.compile(r"^open\s+(?P<q>[a-z0-9][a-z0-9 .+_-]*)$")
+    r"^(?:launch|open up|fire up)\s+(?P<q>.+?)"
+    r"(?:\s+(?:app|application))?$", re.I)
+_LAUNCH_WEAK_RE = re.compile(
+    r"^(?:run|start)\s+(?P<q>.+?)"
+    r"(?:\s+(?:app|application))?$", re.I)
+_OPEN_APP_RE = re.compile(r"^open\s+(?P<q>[a-z0-9][a-z0-9 .+_-]*)$", re.I)
 _OPEN_URL_RE = re.compile(
-    r"^(?:open|go to|browse to|visit)\s+(?P<q>\S+\.\S+|\S+://\S+)$")
+    r"^(?:open|go to|browse to|visit)\s+(?P<q>\S+\.\S+|\S+://\S+)$", re.I)
 _CLIP_GET_RE = re.compile(
     r"^(?:what(?:'?s| is) (?:on |in )?(?:my |the )?clipboard"
     r"|read (?:my |the )?clipboard|paste(?: buffer)?"
     r"|what did i copy)$")
 _CLIP_SET_RE = re.compile(
-    r"^(?:copy|put)\s+(?P<q>.+?)\s+(?:to|on|in)(?:to)? (?:my |the )?clipboard$")
+    r"^(?:copy|put)\s+(?P<q>.+?)\s+(?:to|on|in)(?:to)? (?:my |the )?clipboard$",
+    re.I)
 _STATUS_RE = re.compile(
     r"^(?:(?:what(?:'?s| is) the )?{s} (?:status|state)"
     r"|is the screen locked"
     r"|what(?:'?s| is) the {s} volume)$".format(s=_SYS))
+
+
+# -- shape tests for the two ambiguous branches ------------------------------
+#
+# Both are pure and lexical, because detect() may not do I/O: it cannot ask
+# resolve_app whether an app exists or DNS whether a host does. They decide
+# which BRANCH a sentence belongs to, and both are written to fail toward the
+# cheaper mistake.
+
+# Words that never appear in an app's name but are everywhere in an ordinary
+# imperative. One of these anywhere in a `run`/`start` argument is enough to
+# hand the sentence back to normal routing.
+_NOT_APP_WORDS = frozenset({
+    "the", "a", "an", "my", "our", "your", "this", "that", "these", "those",
+    "all", "some", "another", "again", "it", "them", "up", "for",
+    "with", "from", "on", "in", "of", "and", "to", "please",
+})
+
+
+def _looks_like_app_name(target: str) -> bool:
+    """Whether a `run …`/`start …` argument is plausibly an application.
+
+    The test is "does this read like a name rather than a sentence": at most
+    three words, no article or preposition anywhere ("run the tests", "start
+    the deployment"), and no leading gerund ("start writing the report").
+
+    What it cannot catch is a bare imperative whose object happens to be
+    name-shaped — "run tests" is still read as an app called "tests". That is
+    unavoidable without a lookup, and it is the same shape as the commands this
+    must keep working ("run outlook", "start overwatch"); the executor's
+    "I couldn't find an app called tests" is the backstop.
+    """
+    words = target.split()
+    if not 1 <= len(words) <= 3:
+        return False
+    low = [w.lower() for w in words]
+    if any(w in _NOT_APP_WORDS for w in low):
+        return False
+    return not low[0].endswith("ing")
+
+
+# A dotted token is only a web address if it carries a real scheme or ends in a
+# plausible TLD (2026-08-08). `_OPEN_URL_RE`'s `\S+\.\S+` matched ANY dotted
+# token, so "open notes.md" became `xdg-open https://notes.md` — a request to
+# read a local file turned into a web navigation, which is exactly the
+# exfiltration shape the `open` verb defaults to confirm over. Anything not on
+# this list falls through to the app branch, and that asymmetry is the point:
+# guessing "name" costs a sentence ("I couldn't find an app called
+# config.yaml"), guessing "URL" costs a request to a host nobody named. The
+# list is deliberately short of the two-letter TLDs that are also common file
+# extensions (md, py, sh, js, rs, pl); a site on one of those still opens with
+# an explicit scheme.
+_TLDS = frozenset("""
+com org net edu gov mil int io co dev app ai me tv cc xyz info biz online
+site tech blog news wiki cloud page shop store live fm gg to ly
+uk de fr jp cn ru br au ca nl se es it ch be at dk fi ie nz mx kr sg za us eu
+""".split())
+
+
+def looks_like_url(target: str) -> bool:
+    """Whether an `open <thing>` argument is a web address, not a name."""
+    if re.match(r"^\S+://\S+$", target):
+        return True
+    # strip path/query/fragment, then a :port — "example.com:8080/path"
+    host = re.split(r"[/?#]", target, maxsplit=1)[0].split(":", 1)[0]
+    return "." in host and host.rsplit(".", 1)[-1].lower() in _TLDS
+
 
 # Phrases that look like a launch/open but are conversation, not a command.
 VETO = (
@@ -182,16 +276,38 @@ VETO = (
     "lock in", "locked in", "start a conversation",
 )
 
+# Matched on WORD BOUNDARIES, not as bare substrings (fixed 2026-08-08). Every
+# short entry here is a prefix of real app names: "open to" ⊂ "open toolbox",
+# "run out" ⊂ "run outlook", "start over" ⊂ "start overwatch", "open to" ⊂
+# "open tor browser". All four were silently returning None, and a vetoed
+# command is invisible — it just goes to the model as if it had never been a
+# command, so nobody notices which sentences the desktop tier quietly dropped.
+_VETO_RE = re.compile("|".join(rf"\b{re.escape(v)}\b" for v in VETO))
+
 
 # Answers to a parked confirmation ("Shall I read your clipboard?" → "yeah").
 # Only consulted when that source actually has one pending, so a stray "yes" in
 # ordinary conversation can never trigger a desktop verb.
+#
+# Anchored to the WHOLE utterance, `^…$` (fixed 2026-08-08). With `\b` these
+# approved on any sentence that merely *started* with an affirmation, and
+# spoken English starts sentences that way constantly: while a confirm was
+# parked, "okay so what's on my calendar" read as "yes" — so asking one
+# question read the clipboard and swallowed the next question with it. The
+# window is 120s wide and the confirm verbs are the two sensitive ones, which
+# makes a false yes the worst outcome this module can produce.
+#
+# _normalize has already stripped a leading "please"/"can you", which is why
+# "please do" isn't spelled out: it arrives here as "do".
 _YES_RE = re.compile(
-    r"^(?:yes|yeah|yep|yup|sure|ok|okay|alright|go ahead|do it|please do"
-    r"|affirmative|confirm(?:ed)?|that's fine|fine)\b")
+    r"^(?:yes|yeah|yep|yup|sure|ok|okay|alright|go ahead|do it|do|do that"
+    r"|affirmative|confirm(?:ed)?|that'?s fine|fine)$")
+# The no side may be a little more generous than the yes side: a false decline
+# only cancels a parked verb, a false approval runs one.
 _NO_RE = re.compile(
-    r"^(?:no|nope|nah|don'?t|do not|cancel|stop|skip(?: it)?|forget it"
-    r"|never ?mind|negative|leave it)\b")
+    r"^(?:no|nope|nah|don'?t(?: do it| bother)?|do not|cancel|stop"
+    r"|skip(?: it)?|forget it|never ?mind|negative|leave it"
+    r"|no thanks?|no thank you|not now)$")
 
 
 def parse_answer(text: str) -> bool | None:
@@ -206,11 +322,17 @@ def parse_answer(text: str) -> bool | None:
     return None
 
 
-def _normalize(text: str) -> str:
-    t = (text or "").lower().strip(_PUNCT)
+def _normalize(text: str, fold: bool = True) -> str:
+    """Trim the noise around a command. `fold=False` runs the identical pipeline
+    without lowercasing, so an extracted argument keeps the case the user typed
+    or said — see detect() for why that matters."""
+    t = (text or "").strip(_PUNCT)
+    if fold:
+        t = t.lower()
     t = re.sub(r"\s+", " ", t)
-    t = re.sub(r"\bhey jarvis\b[,\s]*", "", t)
-    t = re.sub(r"^(?:please|can you|could you|would you)\s+", "", t.strip(_PUNCT))
+    t = re.sub(r"\bhey jarvis\b[,\s]*", "", t, flags=re.I)
+    t = re.sub(r"^(?:please|can you|could you|would you)\s+", "",
+               t.strip(_PUNCT), flags=re.I)
     return t.strip(_PUNCT)
 
 
@@ -219,7 +341,13 @@ def detect(text: str) -> Intent | None:
     then the service re-parses). Returns None for anything that isn't an
     unambiguous desktop command, so normal task routing is unaffected."""
     t = _normalize(text)
-    if not t or any(v in t for v in VETO):
+    # Same string with the user's capitalization intact. Matching decisions are
+    # made on `t`; every EXTRACTED argument comes from `raw`, because the arg is
+    # payload, not syntax: lowercasing it silently corrupted "copy Hello World
+    # to my clipboard" into "hello world", and turned a URL with a case-
+    # sensitive path (a YouTube video id) into a link to something else.
+    raw = _normalize(text, fold=False)
+    if not t or _VETO_RE.search(t):
         return None
     # a question mark means they're asking about it, not commanding it —
     # except the read verbs, which ARE questions
@@ -232,7 +360,7 @@ def detect(text: str) -> Intent | None:
     if asking:
         return None
 
-    m = _CLIP_SET_RE.match(t)
+    m = _CLIP_SET_RE.match(raw)
     if m:
         return Intent("clipboard_set", arg=m.group("q").strip(_PUNCT))
     if _LOCK_RE.match(t):
@@ -252,15 +380,26 @@ def detect(text: str) -> Intent | None:
         up = (m.group("dir") or m.group("dir2")) == "up"
         return Intent("volume", delta=VOLUME_STEP if up else -VOLUME_STEP)
 
-    m = _OPEN_URL_RE.match(t)
-    if m:
+    # A dotted token that isn't a plausible web address ("notes.md",
+    # "org.gnome.Nautilus") falls through to the app branch rather than being
+    # navigated to — see looks_like_url.
+    m = _OPEN_URL_RE.match(raw)
+    if m and looks_like_url(m.group("q")):
         return Intent("open", arg=m.group("q"))
-    m = _LAUNCH_RE.match(t) or _OPEN_APP_RE.match(t)
+    m = _LAUNCH_RE.match(raw) or _OPEN_APP_RE.match(raw)
     if m:
         target = m.group("q").strip(_PUNCT)
-        # "open the door" / multi-word prose is not an app name
-        if target and len(target.split()) <= 3:
+        # The old guard here was `len(target.split()) <= 3`, and its comment
+        # claimed it stopped "open the door" — it never did: "the door" is two
+        # words (verified against HEAD 2026-08-08, which returns
+        # Intent(launch, 'the door'), likewise "open the window"/"open the
+        # fridge"). An article-led phrase is prose, not an app name, so the
+        # strong verbs now use the same lexical test the weak ones do.
+        if target and _looks_like_app_name(target):
             return Intent("launch", arg=target)
+    m = _LAUNCH_WEAK_RE.match(raw)
+    if m and _looks_like_app_name(m.group("q").strip(_PUNCT)):
+        return Intent("launch", arg=m.group("q").strip(_PUNCT))
     return None
 
 
