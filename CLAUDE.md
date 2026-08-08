@@ -40,7 +40,7 @@ Every working session MUST:
 | — | Messages API backend | **built, then REMOVED 2026-07-27** — user is not funding an API key; subscription CLI only (recoverable at `ce93ea0`) |
 | K2 | Computer-use T2 (AT-SPI) / T3 (browser over CDP) | **not started** — T3 needs no new deps; offered and deferred twice |
 
-_Test count as of 2026-08-02: **450**, `.venv/bin/python -m unittest discover tests`.
+_Test count as of 2026-08-08: **550**, `.venv/bin/python -m unittest discover tests`.
 Acceptance: `scripts/smoke_phase_a.sh` 7/7._
 
 v2 (phases F–J: memory, learning loop, observability, personal OS, graph) is
@@ -93,6 +93,14 @@ Silero VAD · openWakeWord · Piper TTS (Kokoro-82M drop-in later via ABC) ·
 mpv + yt-dlp (later) · Gmail MCP read-only (Phase C) · systemd user timers.
 
 ## Repo layout
+
+**`ui/dist/` is committed on purpose and must NOT be gitignored** (learned
+2026-08-02). The dispatcher serves the built SPA straight out of it, so a fresh
+clone needs it. It was ignored *and* tracked, which looks harmless because git
+keeps tracking existing files — but Vite emits content-**hashed** asset names,
+so a rebuilt bundle is a new path the rule hides: you would commit an
+`index.html` pointing at a file that isn't in the repo. Rebuild with
+`npm run build` in `ui/` and commit the whole directory.
 
 ```
 dispatcher/   FastAPI service, task router, claude -p runner, refusal fallback
@@ -360,9 +368,35 @@ before writing from scratch.
 - **Deterministic by default**: `dispatcher/spotify.py` `detect()` is a pure
   parser (sibling of `automations.detect`) — "play X", "pause", "skip",
   "what's playing", "volume 40" never reach Claude, so they cost nothing and
-  land in well under a second. `POST /task` diverts on it (mode=auto only)
-  **after** the automation divert, so "every morning play jazz" still becomes
-  a standing automation. Non-music text returns None and routes as before;
+  land in well under a second. The divert chain (automation → media → desktop)
+  lives on **`Service.try_divert()`**, not in the HTTP handler — moved there
+  2026-08-02 because `automations.fire` and the queue watcher call
+  `svc.submit()` directly, so a *fired* "play jazz" automation had been going to
+  Claude as an agentic task every morning instead of to Spotify. `mode=auto`
+  only, media after automation so "every morning play jazz" still becomes a
+  standing automation. Over HTTP a divert streams and records nothing (as
+  before); through `submit()` it becomes a task **born settled** (`task_type:
+  divert`, no run row) because those callers need a task dict and an audit
+  trail. Diverts are **never gated** (`notify.NEVER_GATE_TASK_TYPES` — the
+  executor already wrote the one-line summary) and never captured as episodes
+  (else the graph eats an identical "play jazz" nightly). An automation can
+  never create an automation.
+  **"Announced" was aspirational until 2026-08-08**: `_settle_divert` fires the
+  plain `done` event, but that carries `kind="quick"` and the voice client only
+  speaks `kind == "agentic"` or a `notify` event — and nothing on the path
+  called `send_desktop`, so a fired "play jazz" ran in silence and
+  `NEVER_GATE_TASK_TYPES` was unreachable dead code (with a passing test over
+  it, because the test called `surfacing()` directly). Delivery now goes through
+  `_deliver_notice`, the same `notify` event the inbox watcher uses.
+  **A divert is also no longer automatically `done`**: `try_divert` returns `ok`
+  from the executor, so a parked confirmation (nobody watches the `queue` /
+  `automation` sources — it just expires), a denied verb, or an unresolvable
+  play settles `failed`. A *failed automation parse* now falls through to normal
+  routing rather than consuming the request: the parse is itself a quick task,
+  so failing is the normal outcome during a plan-cap window, and the request was
+  being left neither scheduled nor run. The whole chain is wrapped — a divert is
+  an optimization, and raising there 500s `POST /task` and files a queue file
+  under `.failed` as terminal. Non-music text returns None and routes as before;
   a trailing "?" vetoes the divert (except "what's playing?"), and a VETO
   list guards idioms ("play devil's advocate", "play it safe").
 - **LLM fallback**: music-shaped text the parser can't resolve ("put on
@@ -394,6 +428,23 @@ before writing from scratch.
 
 ## Operational notes (learned in the codebase-review remediation)
 
+- **`simulate_refusal` was outside the boundary until 2026-08-08.** It forces
+  the refusal fallback — a **second** run of the same task on `models.fallback`
+  (an Opus) — and `sanitize_untrusted_metadata` passed it straight through while
+  correctly stripping `allowed_tools` and clamping the budget. Anything that
+  could reach `POST /task` (dashboard, phone over Tailscale Serve, a queue file)
+  could therefore double the cost of every agentic run. Now stripped like the
+  rest, with one opt-in: `security.allow_simulate_refusal` (default false),
+  which `scripts/smoke_phase_a.sh` documents turning on and back off — that
+  script is the only legitimate caller and it drives the check over HTTP.
+- **The quick path silently ignored `metadata["allowed_tools"]`** (fixed
+  2026-08-08): tools came from the matched area only, so a trusted internal
+  spawn that asked for tools got **none**, plus `--disallowedTools Bash`.
+  `inbox.summarize` ships `["Read","Glob","Grep"]` with a prompt saying "Read
+  it", so it was spending a real call per file on an answer the model could not
+  ground. Honoring the key here is safe for the same reason the agentic resolver
+  already does: H1 strips it *before* the row is written, so anything still on a
+  row came from a server-internal spawn.
 - **Trust boundary (H1/H2)**: metadata from an external source
   (api/queue/voice/ui/screen) can NARROW tools/budget but never WIDEN them —
   `sanitize_untrusted_metadata` drops `allowed_tools`/`resume_session_id` and
@@ -401,6 +452,21 @@ before writing from scratch.
   `trusted=True`. Areas strip Bash/unscoped Edit-Write from SKILL.md
   frontmatter at load unless listed in `security.privileged_areas` (empty by
   default) — a reflection/learn run editing `areas/**` can't grant itself Bash.
+  Read that invariant precisely (2026-08-02): it bars **caller-supplied**
+  grants. A caller may still *select among* operator-authored on-disk manifests
+  via `metadata.task_type` (→ `config.yaml` `task_types`) or `metadata.agent`
+  (→ `areas/<area>/agents/<agent>.md`), and those can be broader than the
+  read-only default. That is deliberate — it is how the timer agents get their
+  grants at all — and safe because the manifests are repo content at the same
+  trust level as SKILL.md, with the agent path sanitized at load.
+- **…but every path to those grants must go through the sanitizer, and one
+  didn't** (fixed 2026-08-02). `memory.build_consolidation` re-parsed
+  `areas/memory/agents/consolidate.md` itself instead of calling
+  `AreaRegistry.agent_tools`, and its metadata is submitted `trusted=True` — so
+  a reflection run (which holds `Edit(areas/**)`) writing `- Bash` into that
+  file handed the nightly consolidation a shell, exactly the escalation H2
+  exists to stop. Grants now come from `AreaRegistry` on both paths; the local
+  frontmatter parse is only for the prompt body and `task_type`.
 - **The memory system was feeding on its own housekeeping** (found + fixed
   2026-08-02). `should_capture` excluded the consolidator, reflections and the
   gate/parse tasks — but **not `daily-brief`/`weekly-review`**, whose episode is
@@ -521,7 +587,10 @@ before writing from scratch.
   doesn't re-announce the whole directory.
 - `step()` returns **(arrived, removed)**. Removals trigger a reindex but no
   notification — without that a deleted file stays searchable until the next
-  restart; arrivals get both.
+  restart; arrivals get both. The notify branch must read **`arrived`**, not
+  just sit under the `if arrived or removed:` that guards the reindex: until
+  2026-08-02 it didn't, and deleting a file announced "Indexed **0 files** from
+  your inbox — searchable now."
 - **Deterministic by default**: arrival → reindex + embed + "Indexed X —
   searchable now" (desktop + SSE `notify`), which costs nothing.
   `inbox.summarize: true` additionally spends one read-only quick call per file
@@ -547,7 +616,24 @@ before writing from scratch.
   got quoted as "here's what I already have on it". So a degraded answer is
   only offered when **BM25 matched a real term** somewhere first; ranking
   still uses the hybrid path, so vectors keep floating the right chunk up —
-  they just can't conjure a topic from nothing. `<!-- -->` comments are
+  they just can't conjure a topic from nothing.
+- **…and that sentence was false until 2026-08-08 — degraded mode was dead.**
+  The anchor passed the *whole question* to `db.search_entries`, and
+  `db.fts_query` joins terms with a space, which is FTS5 implicit **AND**. So it
+  demanded every token, stopwords included, in one chunk: `'what is my preferred
+  coding tool'` → 0 hits, `'preferred coding tool'` → 0 hits, `'Neovim'` → 1.
+  Every natural-language question got "I checked my memory and didn't find
+  anything relevant" with the answer sitting in `USER.md`. (The "preferred
+  coding tool" success recorded under Phase J was measured through
+  `/memory/search`, which never applies this anchor — that claim is still
+  correct, it just never covered this path.) It now probes **one content word at
+  a time** (`ANCHOR_TERMS` = 8, `any()` short-circuits); the swallow still gets
+  nothing, because none of its content words are in the index. `about`/`did`
+  joined STOPWORDS at the same time — per-word anchoring means anything left in
+  that list can anchor alone, and both match this index by themselves.
+  `tests/test_offline.py`'s fake DB ignored the query string entirely, so it
+  could never have caught this; it now models AND semantics, and **9 of its 17
+  tests fail against the pre-fix module**. `<!-- -->` comments are
   stripped from snippets (USER.md/MEMORY.md open with an editor instruction
   that otherwise eats the whole quote).
 - The run still settles **failed** (the model call really did fail, and the
@@ -579,6 +665,12 @@ before writing from scratch.
   "volume 40" (player volume) and the media divert runs first, so every desktop
   volume pattern demands system/master/computer — otherwise the two parsers
   fight over one sentence.
+- **Matching folds case; arguments must not** (fixed 2026-08-02). `_normalize`
+  takes `fold=`, and the four arg-bearing patterns run `re.I` against the
+  case-preserving string. Pulling the arg out of the folded one stored
+  `copy Hello World to my clipboard` as `hello world`, and turned
+  `open youtube.com/watch?v=dQw4w9WgXcQ` into a link to a **different video** —
+  an argument is payload, not syntax.
 - **Safety plane** (`computer.policy` in config.yaml): allow / confirm / deny
   per verb, failing **closed** — an unknown verb or an unrecognised policy
   value denies, and an absent/disabled `computer:` block denies everything
@@ -673,7 +765,17 @@ before writing from scratch.
   notional, TTFT ~3s. That is what makes `models.meta` (haiku for internal
   classification work) the one lever that actually moved the number.
 - Costs logged on this path are **notional** — you are on a subscription, not
-  metered billing.
+  metered billing. `Config.quick_cost()` and the `prices:` config block that
+  priced Messages-API tokens by hand were **removed 2026-08-02** (dead since
+  that backend went); every run reports its own `total_cost_usd`. The unread
+  `models.classifier` key went with them — `dispatcher/classifier.py` is pure
+  heuristic and has never called a model.
+- **The repo no longer carries a `.env`.** It held a real `sk-ant-` key that
+  nothing read (doctor.sh had been warning about it); moved out of the tree to
+  `~/.local/share/mission-control/env.removed-from-repo-2026-08-02` (mode 600)
+  on 2026-08-02. It was never committed — `git log --all -- .env` is empty and
+  no `sk-ant-` string appears anywhere in history. The `.gitignore` entries stay
+  as a guard. **Rotate that key** if it was ever real: it sat in a working tree.
 
 ## Operational notes (browser verification of the dashboard)
 
