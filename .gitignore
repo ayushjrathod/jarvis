@@ -8,6 +8,10 @@ data/*.db-shm
 data/backups/
 data/consolidation/
 queue/.processed/
+# ...and the failure side of the same directory (added 2026-08-10). A queue
+# file is arbitrary user text; leaving .failed/ tracked put it in `git status`,
+# where `git add -A` sweeps it into a commit.
+queue/.failed/
 
 # python
 .venv/

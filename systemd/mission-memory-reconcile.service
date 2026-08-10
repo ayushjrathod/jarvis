@@ -7,3 +7,10 @@ Wants=mission-dispatcher.service
 Type=oneshot
 WorkingDirectory=%h/Documents/code/jarvis
 ExecStart=%h/Documents/code/jarvis/.venv/bin/python scripts/run_memory_reconcile.py
+# The worst offender of the set: /memory/reconcile blocks on a model call
+# (bounded by budgets.quick_timeout_s, 120s), and the script's single request
+# timeout alone used to be 300s — 3.3x the inherited DefaultTimeoutStartUSec of
+# 1min 30s. A reconcile that legitimately ran past 90s was killed and journaled
+# as failed while the dispatcher finished the work regardless (2026-08-10).
+# > the script's BUDGET_S (240s) + REQUEST_TIMEOUT_S (180s); keep in step.
+TimeoutStartSec=480

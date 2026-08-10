@@ -5,3 +5,9 @@ Description=Mission Control nightly SQLite backup
 Type=oneshot
 WorkingDirectory=%h/Documents/code/jarvis
 ExecStart=%h/Documents/code/jarvis/scripts/backup_db.sh
+# No client retry loop here, but the same inherited-default trap: sqlite3
+# `.backup` waits on the dispatcher's write lock (.timeout 5000) and then
+# copies the whole DB, and the retention `find` sweeps data/backups — on a
+# grown database that can outlast DefaultTimeoutStartUSec (1min 30s) and be
+# journaled as a failed backup that in fact ran (2026-08-10).
+TimeoutStartSec=300

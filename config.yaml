@@ -57,7 +57,15 @@ dispatcher:
   budgets:
     max_cost_per_task_usd: 3.00   # passed to claude -p --max-budget-usd
     quick_max_cost_usd: 1.00
-    timeout_s: 600                # wall-clock kill for agentic runs
+    timeout_s: 600                # wall-clock kill for AGENTIC runs (claude -p headless)
+    # ...and the quick path's own kill, which is a different number on a
+    # different code path (quick.py) — raising timeout_s above does nothing for
+    # it. It was read with a hardcoded 120s default and never shipped here, so a
+    # slow turn (a big screenshot read, a long resumed session) died at an
+    # invisible deadline with `error: timeout` (surfaced 2026-08-10). Note the
+    # synchronous /memory/reconcile blocks on a quick call, so its client-side
+    # timeout in scripts/run_memory_reconcile.py must stay comfortably above this.
+    quick_timeout_s: 120
     transient_retry_delay_s: 2    # backoff before the one retry on spawn/timeout error
 
   # Trust boundary (mechanical, not conventional). Only server-internal spawns
@@ -192,7 +200,12 @@ dispatcher:
     enabled: true
     nl_detect: true               # divert music phrasing in POST /task (mode=auto)
     llm_fallback: true
-    player: spotify
+    # (no `player:` key — it read like a swappable player selector but nothing
+    #  ever loaded it: the MPRIS bus name is hardcoded to
+    #  org.mpris.MediaPlayer2.spotify in dispatcher/spotify.py, so `player: vlc`
+    #  silently changed nothing. Same dead-config class as `models.classifier`,
+    #  removed 2026-08-02. Removed 2026-08-10; wiring the key through to
+    #  BUS_NAME/launch_cmd is the alternative if a second player is ever wanted.)
     launch_cmd: ["flatpak", "run", "com.spotify.Client"]
     credentials: data/spotify.json   # written by scripts/setup_spotify.sh, gitignored
     market: IN
@@ -256,6 +269,13 @@ dispatcher:
   #  2026-08-02.)
 
 jarvis:
+  # Where the voice pipeline (and jarvis.ask_screen) reaches the dispatcher.
+  # Left commented because the default is derived from dispatcher.host/port
+  # above — but it IS read (jarvis/config.py), so it was an invisible override
+  # nobody could discover from this file (surfaced 2026-08-10). Uncomment only
+  # to point Jarvis at a dispatcher somewhere else; the two are not otherwise
+  # linked, so a changed dispatcher.port is picked up here automatically.
+  # dispatcher_url: http://127.0.0.1:8765
   trigger_key: KEY_F9          # dictation (mission-dictate): hold → typed at cursor
   ptt_key: KEY_RIGHTCTRL       # assistant hold-to-talk (mission-jarvis): hold → ask
                                # must differ from trigger_key — both watch raw evdev

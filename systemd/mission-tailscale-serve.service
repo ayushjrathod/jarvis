@@ -27,6 +27,13 @@ ExecStartPre=/usr/bin/bash -c 'for i in $(seq 1 30); do \
 # dead — the mapping lives in tailscaled's own state, not in this service.
 ExecStart=/usr/bin/tailscale serve --bg --https=443 http://127.0.0.1:8765
 ExecStop=/usr/bin/tailscale serve --https=443 off
+# TimeoutStartSec covers ExecStartPre AND ExecStart together, and the readiness
+# wait above is allowed to take 60s on its own — leaving only ~30s of the
+# inherited DefaultTimeoutStartUSec (1min 30s) for `serve` itself. A slow boot
+# would therefore have been killed just short of succeeding, which reads in the
+# journal exactly like the tailscaled failure the wait exists to distinguish
+# (2026-08-10). 180s = the 60s wait plus real headroom.
+TimeoutStartSec=180
 
 [Install]
 WantedBy=default.target

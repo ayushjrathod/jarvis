@@ -6,4 +6,19 @@ Wants=mission-dispatcher.service
 [Service]
 Type=oneshot
 WorkingDirectory=%h/Documents/code/jarvis
-ExecStart=%h/Documents/code/jarvis/.venv/bin/python scripts/run_agent.py tasks daily-brief
+# --scheduled-at MUST match the timer's OnCalendar time-of-day (07:30).
+# `Persistent=true` fires a missed timer once at boot, and run_agent.py used
+# date.today(), so the 07-29 catch-up that ran at 00:42 on the 30th wrote the
+# *30th's* brief: 07-29 got none and the 30th's real run found its file already
+# there. Told the schedule, the script resolves a before-07:30 start as the
+# catch-up for yesterday's elapse and says so on stdout. Persistent= is kept
+# deliberately — dropping it would lose every brief for a box that was asleep
+# at 07:30 and opened at 09:00, which is the common case here, and a
+# right-dated brief a bit late beats no brief at all (2026-08-10).
+ExecStart=%h/Documents/code/jarvis/.venv/bin/python scripts/run_agent.py tasks daily-brief --scheduled-at 07:30
+# systemd's DefaultTimeoutStartUSec is 1min 30s and nothing overrode it, but
+# run_agent.py's own retry loop can spend BUDGET_S (240s) + REQUEST_TIMEOUT_S
+# (15s) waiting out the boot race. So a run that was working got SIGTERM'd and
+# journaled as *failed* — the false-failure class this project keeps paying
+# for. Keep this above 255s and in step with those two constants.
+TimeoutStartSec=300

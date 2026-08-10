@@ -153,7 +153,13 @@ if command -v tailscale >/dev/null 2>&1; then
     else
       warn "mission-tailscale-serve not active (dashboard not reachable from the phone)"
     fi
-    if grep -q 'public_hosts' config.yaml && ! grep -q 'public_hosts: *\[\] *$' config.yaml; then
+    # Anchored to the start of a line on purpose: config.yaml carries a
+    # commented example ("#   public_hosts: [...]") a few lines above the live
+    # key, so a bare `grep -q public_hosts` reported ✓ even with the real key
+    # commented out — i.e. the one state this check exists to catch
+    # (2026-08-10). Only a key in column 0-ish (any indent, no `#`) counts.
+    if grep -qE '^[[:space:]]*public_hosts:' config.yaml \
+       && ! grep -qE '^[[:space:]]*public_hosts:[[:space:]]*\[[[:space:]]*\][[:space:]]*$' config.yaml; then
       ok "security.public_hosts set (the origin guard trusts your tailnet name)"
     else
       warn "security.public_hosts empty — phone POSTs would be rejected by the origin guard"

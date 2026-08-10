@@ -1,6 +1,17 @@
 [Unit]
 Description=Mission Control dispatcher (FastAPI + task runner, serves the dashboard)
 After=network.target
+# A crash-on-STARTUP (a config.yaml typo, a moved venv, a port already bound)
+# used to restart forever and never reach `failed`: at RestartSec=3 the loop
+# stays inside systemd's default 5-starts-per-10s window, so the limit it
+# relies on never trips. The unit then reports "activating" indefinitely and
+# scripts/doctor.sh sees only "not active (may be run manually)" — a hard
+# failure wearing a soft label. With RestartSec=10 below, five starts land in
+# ~40s and the unit gives up into `failed`, where it is visible; genuine
+# transient restarts (the reason Restart=on-failure is here) stay well inside
+# 5-per-5-minutes (2026-08-10).
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -10,7 +21,9 @@ WorkingDirectory=%h/Documents/code/jarvis
 # the `claude` CLI abandon that login in favour of the key (removed 2026-07-27).
 ExecStart=%h/Documents/code/jarvis/.venv/bin/python -m dispatcher.main
 Restart=on-failure
-RestartSec=3
+# 10s, not 3s: paced so a crash-on-startup exhausts StartLimitBurst above
+# instead of flapping under it forever (see the [Unit] note).
+RestartSec=10
 
 [Install]
 WantedBy=default.target

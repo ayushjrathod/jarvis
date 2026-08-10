@@ -6,4 +6,11 @@ Wants=mission-dispatcher.service
 [Service]
 Type=oneshot
 WorkingDirectory=%h/Documents/code/jarvis
-ExecStart=%h/Documents/code/jarvis/.venv/bin/python scripts/run_agent.py tasks weekly-review
+# --scheduled-at MUST match the timer's OnCalendar time-of-day (Sun 18:00) —
+# see mission-daily-brief.service for why. A Persistent= catch-up that runs on
+# Monday morning is the review OF Sunday, and {{WEEK_START}} is derived from
+# that date, so getting it wrong shifts the whole reviewed window by a day.
+ExecStart=%h/Documents/code/jarvis/.venv/bin/python scripts/run_agent.py tasks weekly-review --scheduled-at 18:00
+# > run_agent.py's BUDGET_S (240s) + REQUEST_TIMEOUT_S (15s); the inherited
+# DefaultTimeoutStartUSec of 1min 30s would kill a working run mid-retry.
+TimeoutStartSec=300

@@ -38,11 +38,23 @@ fi
 
 mkdir -p "$(dirname "$CREDS")"
 umask 077
-printf '{\n  "client_id": %s,\n  "client_secret": %s\n}\n' \
-  "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$CLIENT_ID")" \
-  "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$CLIENT_SECRET")" \
-  > "$CREDS"
-chmod 600 "$CREDS"
+# Both values go in on STDIN, never in argv (fixed 2026-08-10). `python3 -c …
+# "$CLIENT_SECRET"` published the secret in /proc/<pid>/cmdline, which is world
+# readable, for the lifetime of that call — undoing the `read -rs` and the
+# `umask 077` immediately above it. `printf` is a shell builtin, so the pipe
+# never forks a process carrying the values either.
+# Written to a temp file and moved into place so a failed encode can't leave
+# truncated (or empty) credentials behind on a re-run.
+TMP="$CREDS.tmp.$$"
+trap 'rm -f "$TMP"' EXIT
+printf '%s\n%s\n' "$CLIENT_ID" "$CLIENT_SECRET" | python3 -c '
+import json, sys
+client_id = sys.stdin.readline().rstrip("\n")
+client_secret = sys.stdin.readline().rstrip("\n")
+print(json.dumps({"client_id": client_id, "client_secret": client_secret}, indent=2))
+' > "$TMP"
+chmod 600 "$TMP"
+mv -f "$TMP" "$CREDS"
 echo "wrote $CREDS (mode 600, gitignored)"
 
 echo

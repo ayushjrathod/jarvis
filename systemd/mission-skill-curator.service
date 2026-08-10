@@ -7,3 +7,8 @@ Wants=mission-dispatcher.service
 Type=oneshot
 WorkingDirectory=%h/Documents/code/jarvis
 ExecStart=%h/Documents/code/jarvis/.venv/bin/python scripts/run_skill_curator.py
+# > the script's BUDGET_S (240s) + REQUEST_TIMEOUT_S (60s). Without this the
+# unit inherited DefaultTimeoutStartUSec (1min 30s), under its own retry
+# budget, so a run still waiting out the boot race was SIGTERM'd and journaled
+# as failed (2026-08-10). Keep the two numbers in step.
+TimeoutStartSec=360
