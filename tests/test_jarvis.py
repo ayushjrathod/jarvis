@@ -4,8 +4,11 @@ and the Brain's SSE parsing — no audio hardware, no network.
 
 import asyncio
 import json
+import subprocess
+import sys
 import unittest
 from dataclasses import dataclass
+from pathlib import Path
 from unittest import mock
 
 import httpx
@@ -13,6 +16,8 @@ import numpy as np
 
 from jarvis.audio import Recorder
 from jarvis.config import JarvisConfig
+from jarvis.hotkey import HotkeyWatcher
+from jarvis.plugins.base import BrainEvent
 from jarvis.sanitize import SentenceChunker, sanitize
 from jarvis.vad import FRAME_SAMPLES
 from jarvis.wake_capture import MicLostError, MicWatchdog, capture_after_wake
@@ -77,6 +82,82 @@ class TestSentenceChunker(unittest.TestCase):
         c = SentenceChunker()
         out = c.feed("**Paris** is the capital. ")
         self.assertEqual(out, ["Paris is the capital."])
+
+
+def _stream(text: str, size: int = 40):
+    """Chop text into delta-sized pieces, the way the SSE stream arrives."""
+    return [text[i:i + size] for i in range(0, len(text), size)]
+
+
+class TestChunkerFences(unittest.TestCase):
+    """2026-08-10: sanitize()'s _CODE_BLOCK only matches a COMPLETE ```-fenced
+    pair, but the chunker sanitizes each chunk in isolation and force-flushes
+    an oversized buffer — and code has almost no sentence boundaries. So a
+    block longer than max_buffer was cut into pieces, the fence never survived
+    into one chunk, "code block omitted" never fired, and Piper read the raw
+    shell aloud (a 1029-char block became five chunks of `rm -rf …`)."""
+
+    LONG_CODE = "\n".join(f"rm -rf /tmp/junk-{i}  # step {i}. done" for i in range(30))
+
+    def test_long_code_block_is_never_read_aloud(self):
+        text = f"Here is the script.\n```bash\n{self.LONG_CODE}\n```\nRun it carefully."
+        self.assertGreater(len(self.LONG_CODE), 300)  # past max_buffer, the old bug
+        c = SentenceChunker()
+        out = []
+        for delta in _stream(text):
+            out.extend(c.feed(delta))
+        out.extend(c.flush())
+        spoken = " ".join(out)
+        self.assertNotIn("rm -rf", spoken)
+        self.assertIn("code block omitted", spoken.lower())
+        self.assertIn("Here is the script.", spoken)
+        self.assertIn("Run it carefully.", spoken)
+
+    def test_nothing_emitted_while_a_fence_is_open(self):
+        c = SentenceChunker()
+        self.assertEqual(c.feed("Sure. "), ["Sure."])
+        # a period-rich code line must not become a "sentence" of its own
+        self.assertEqual(c.feed("```py\nx = 1. y = 2. " + "z = 3. " * 80), [])
+
+    def test_short_code_block_still_announced(self):
+        c = SentenceChunker()
+        out = c.feed("Try this. ```sh\nls -l\n``` Done.")
+        out.extend(c.flush())
+        spoken = " ".join(out)
+        self.assertNotIn("ls -l", spoken)
+        self.assertIn("code block omitted", spoken.lower())
+
+    def test_runaway_fence_announced_once_then_prose_resumes(self):
+        c = SentenceChunker(max_code=60)
+        out = c.feed("```\n" + "x = 1\n" * 40)
+        self.assertEqual(out, ["Code block omitted."])
+        # the rest of the block is discarded up to its closing fence, and the
+        # announcement is NOT repeated
+        out2 = c.feed("y = 2\n" * 40)
+        self.assertEqual(out2, [])
+        out3 = c.feed("z = 3\n```\nBack to prose. ")
+        self.assertEqual(out3, ["Back to prose."])
+        self.assertNotIn("x = 1", " ".join(out + out2 + out3))
+
+    def test_unclosed_fence_at_flush_is_not_spoken(self):
+        # cancelled reply / dropped SSE mid-block: the pair never completes
+        c = SentenceChunker()
+        c.feed("Here you go. ```py\nsecret = 1\n")
+        out = c.flush()
+        self.assertNotIn("secret", " ".join(out))
+        self.assertIn("Code block omitted.", out)
+
+    def test_total_spoken_length_capped(self):
+        # nothing capped the whole reply before: a model dumping a directory
+        # listing held the speaker (and `busy`) for as long as it kept writing
+        c = SentenceChunker(max_total=100)
+        out = []
+        for _ in range(50):
+            out.extend(c.feed("This is a sentence. "))
+        out.extend(c.flush())
+        spoken = " ".join(out)
+        self.assertIn("too long to read out", spoken)
+        self.assertLess(len(spoken), 300)
 
 
 class TestEngineRegistry(unittest.TestCase):
@@ -370,17 +451,30 @@ class TestRecorderDurationCap(unittest.TestCase):
 
 
 class _FakeOut:
-    """Records writes; stands in for sd.OutputStream in Player.play tests."""
+    """Records writes and lifecycle calls; stands in for sd.OutputStream.
 
-    def __init__(self, on_write=None):
+    start()/stop()/close() rather than __enter__/__exit__ since 2026-08-10:
+    jarvis.audio._output_stream drives the stream by hand so a failing start()
+    still gets closed (sounddevice's own context manager only closes in
+    __exit__, which never runs when __enter__ raised)."""
+
+    def __init__(self, on_write=None, start_error=None):
         self.writes: list = []
         self._on_write = on_write
+        self._start_error = start_error
+        self.started = False
+        self.closed = False
 
-    def __enter__(self):
-        return self
+    def start(self):
+        if self._start_error is not None:
+            raise self._start_error
+        self.started = True
 
-    def __exit__(self, *exc):
-        return False
+    def stop(self):
+        self.started = False
+
+    def close(self):
+        self.closed = True
 
     def write(self, data):
         self.writes.append(data)
@@ -430,6 +524,70 @@ class TestPlayerSubframes(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertEqual(len(fake.writes), 4)
+
+
+class TestStreamLeakOnFailedStart(unittest.TestCase):
+    """2026-08-10: sounddevice opens the PortAudio stream in __init__, has no
+    __del__, and only closes in __exit__ — which never runs if __enter__ (i.e.
+    start()) raised. Both callers retry forever (wake_loop every 5s, play_async
+    per acknowledgment), so each failed start leaked one native stream."""
+
+    def test_output_stream_closes_when_start_fails(self):
+        from jarvis.audio import _output_stream
+
+        fake = _FakeOut(start_error=RuntimeError("device busy"))
+        with mock.patch("jarvis.audio.sd.OutputStream", return_value=fake):
+            with self.assertRaises(RuntimeError):
+                with _output_stream(16000):
+                    pass  # pragma: no cover — start() raised first
+        self.assertTrue(fake.closed)
+
+    def test_output_stream_closes_on_the_happy_path_too(self):
+        from jarvis.audio import _output_stream
+
+        fake = _FakeOut()
+        with mock.patch("jarvis.audio.sd.OutputStream", return_value=fake):
+            with _output_stream(16000) as out:
+                out.write(b"")
+        self.assertTrue(fake.closed)
+        self.assertFalse(fake.started)  # stopped (drained) before closing
+
+    def test_micstream_closes_when_start_fails(self):
+        from jarvis.audio import MicStream
+
+        fake = _FakeOut(start_error=RuntimeError("device busy"))
+        with mock.patch("jarvis.audio.sd.InputStream", return_value=fake):
+            stream = MicStream(16000, FRAME_SAMPLES)
+            with self.assertRaises(RuntimeError):
+                stream.__enter__()
+        self.assertTrue(fake.closed)
+        self.assertIsNone(stream._stream)  # and nothing left half-open on self
+
+
+class TestPlayAsyncLogsFailures(unittest.TestCase):
+    """A bare `except: pass` covered every wake acknowledgment and PTT beep, so
+    a dead output sink looked exactly like the wake word not firing — the
+    hardest failure to debug in this pipeline (2026-08-10)."""
+
+    class _InlineThread:
+        """Runs the target on start() so the fire-and-forget playback thread
+        is deterministic here (no sleeping on a real thread)."""
+
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    def test_failure_is_logged_not_swallowed(self):
+        from jarvis.audio import play_async
+
+        fake = _FakeOut(start_error=RuntimeError("no sink"))
+        with mock.patch("jarvis.audio.sd.OutputStream", return_value=fake), \
+                mock.patch("jarvis.audio.threading.Thread", self._InlineThread):
+            with self.assertLogs("jarvis.audio", level="WARNING") as caught:
+                play_async(np.zeros(160, dtype=np.int16), 16000)
+        self.assertTrue(any("playback failed" in line for line in caught.output))
 
 
 class TestSpeakSentencesBargeRace(unittest.TestCase):
@@ -740,6 +898,311 @@ class TestSanitizeForInjection(unittest.TestCase):
 
         self.assertEqual(sanitize_for_injection("\n\r\t\x00"), "")
         self.assertEqual(sanitize_for_injection(""), "")
+
+
+def _app(mode="ptt"):
+    """A Jarvis with engines constructed but nothing loaded — no models, no
+    devices. Same seam TestSpeakSentencesBargeRace already uses."""
+    from jarvis.audio import Player
+    from jarvis.main import Jarvis
+
+    cfg = JarvisConfig.load()
+    app = Jarvis(cfg, mode=mode)
+    app.player = Player(cfg.sample_rate)  # hermetic: no device until play()
+    return app
+
+
+async def _drain(q):
+    """Stand-in for speak_sentences: consumes the queue, never touches audio."""
+    while await q.get() is not None:
+        pass
+    return True
+
+
+class TestPttBargeDuringTranscription(unittest.TestCase):
+    """2026-08-10: `busy` is held from the top of handle_utterance, but
+    speak_sentences — whose resume() clears player.interrupt — is only created
+    AFTER the blocking transcribe. So a PTT press during the STT window (1-2s,
+    much longer for a long clip; max_recording_s is 300) set the interrupt,
+    had it wiped by that resume(), and the STALE question was answered and
+    spoken while the new one waited behind it. Nothing logged."""
+
+    def test_press_during_stt_drops_the_superseded_utterance(self):
+        app = _app()
+        submitted = []
+
+        async def fake_submit(text, source="voice"):
+            submitted.append(text)
+            yield BrainEvent("delta", "an answer", None)
+
+        app.brain.submit = fake_submit
+        app.speak_sentences = _drain
+
+        def transcribe(_audio):
+            app._ptt_barge()  # the user presses again to rephrase
+            return "the old question"
+
+        app.stt.transcribe = transcribe
+        audio = np.zeros(app.cfg.sample_rate, dtype=np.int16)  # 1s, past the tap guard
+        asyncio.run(app.handle_utterance(audio))
+
+        self.assertEqual(submitted, [])          # the stale question never ran
+        self.assertTrue(app.barge_request.is_set())
+
+    def test_no_press_still_answers_normally(self):
+        app = _app()
+        submitted = []
+
+        async def fake_submit(text, source="voice"):
+            submitted.append(text)
+            yield BrainEvent("delta", "an answer", None)
+
+        app.brain.submit = fake_submit
+        app.speak_sentences = _drain
+        app.stt.transcribe = lambda _audio: "the only question"
+        asyncio.run(app.handle_utterance(np.zeros(app.cfg.sample_rate, dtype=np.int16)))
+
+        self.assertEqual(submitted, ["the only question"])
+
+    def test_barge_flag_only_set_while_an_interaction_is_in_flight(self):
+        app = _app()
+
+        async def scenario():
+            self.assertFalse(app._ptt_barge())          # idle: ordinary press
+            self.assertFalse(app.barge_request.is_set())
+            async with app.busy:
+                self.assertTrue(app._ptt_barge())       # mid-interaction: barge
+            return True
+
+        asyncio.run(scenario())
+        self.assertTrue(app.barge_request.is_set())
+        self.assertTrue(app.player.interrupt.is_set())  # playback stopped too
+
+
+class TestWakeBusyPredicate(unittest.TestCase):
+    """2026-08-10: capture_after_wake's gate was `busy.locked` alone, which is
+    held only during handle_utterance — not while the PTT Recorder captures on
+    the SAME microphone. In --mode both (what mission-jarvis ships), holding
+    PTT and saying "hey jarvis, …" got the utterance answered by the wake path
+    and then again by the PTT release: two claude -p runs, two spoken replies,
+    two episode rows."""
+
+    def test_recorder_reports_capture_state(self):
+        r = Recorder(sample_rate=16000)
+        self.assertFalse(r.is_recording())
+        r._stream = object()   # what start() sets, without opening a device
+        self.assertTrue(r.is_recording())
+
+    def test_predicate_covers_recorder_and_lock(self):
+        app = _app(mode="both")
+        self.assertFalse(app._busy_for_wake())
+
+        app.recorder._stream = object()          # PTT held, nothing dispatched yet
+        self.assertTrue(app._busy_for_wake())
+        app.recorder._stream = None
+
+        async def while_busy():
+            async with app.busy:
+                return app._busy_for_wake()
+
+        self.assertTrue(asyncio.run(while_busy()))
+
+
+class TestNoticeQueue(unittest.TestCase):
+    """H-list 2026-08-10: say() discarded speak_sentences' bool, so barging in
+    on notice 1 was followed immediately by notices 2 and 3; and the pending
+    list was unbounded."""
+
+    def _app_with_speaker(self, interrupted):
+        app = _app()
+        spoken: list[str] = []
+
+        async def fake_speak(q):
+            while True:
+                s = await q.get()
+                if s is None:
+                    break
+                spoken.append(s)
+            return not interrupted
+
+        app.speak_sentences = fake_speak
+        return app, spoken
+
+    def test_barge_on_a_notice_drops_the_backlog(self):
+        app, spoken = self._app_with_speaker(interrupted=True)
+        app.pending_notices = ["one.", "two.", "three."]
+        asyncio.run(app._flush_notices())
+        self.assertEqual(spoken, ["one."])
+        self.assertEqual(app.pending_notices, [])
+
+    def test_uninterrupted_notices_all_get_spoken(self):
+        app, spoken = self._app_with_speaker(interrupted=False)
+        app.pending_notices = ["one.", "two.", "three."]
+        asyncio.run(app._flush_notices())
+        self.assertEqual(spoken, ["one.", "two.", "three."])
+
+    def test_pending_notices_are_bounded(self):
+        from jarvis.main import MAX_PENDING_NOTICES
+
+        app = _app()
+
+        async def fake_notices():
+            for i in range(MAX_PENDING_NOTICES + 5):
+                yield BrainEvent("notice", f"n{i}", None)
+
+        app.brain.notices = fake_notices
+
+        async def scenario():
+            async with app.busy:      # busy → every notice queues
+                await app.notices_loop()
+
+        asyncio.run(scenario())
+        self.assertEqual(len(app.pending_notices), MAX_PENDING_NOTICES)
+        self.assertEqual(app.pending_notices[-1], f"n{MAX_PENDING_NOTICES + 4}")
+
+
+class TestHotkeyWatcherSupervision(unittest.TestCase):
+    """2026-08-10: main.py discarded start_ptt()'s watcher, so a watcher thread
+    that raised died silently — ptt_loop parked forever on an empty queue while
+    `systemctl --user status mission-jarvis` still said active (running)."""
+
+    def test_run_records_the_exception_instead_of_losing_it(self):
+        w = HotkeyWatcher("KEY_F9", lambda: None, lambda: None)
+
+        def boom():
+            raise OSError("no such device")
+
+        w._watch = boom
+        with self.assertLogs("jarvis.hotkey", level="ERROR") as caught:
+            w.run()  # called directly: no thread, no evdev
+        self.assertIsInstance(w.error, OSError)
+        self.assertTrue(any("watcher died" in line for line in caught.output))
+
+    def test_supervisor_raises_when_the_watcher_stops(self):
+        app = _app()
+        w = HotkeyWatcher("KEY_F9", lambda: None, lambda: None)
+        w._watch = lambda: None   # "crashes" immediately, hardware never touched
+        w.start()
+
+        async def scenario():
+            await asyncio.wait_for(app._supervise_ptt(w), timeout=5)
+
+        with self.assertRaises(RuntimeError):
+            asyncio.run(scenario())
+
+
+class TestHotkeyPerDeviceState(unittest.TestCase):
+    """2026-08-10: `pressed` was one bool shared across every watched device,
+    so a second keyboard merely disappearing from select() while you held PTT
+    fired on_release and truncated the clip mid-sentence."""
+
+    def _watcher(self):
+        events: list[str] = []
+        w = HotkeyWatcher("KEY_F9",
+                          lambda: events.append("press"),
+                          lambda: events.append("release"))
+        return w, events
+
+    def test_unrelated_device_loss_does_not_release(self):
+        w, events = self._watcher()
+        pressed = {3}                 # keyboard fd 3 is holding PTT
+        w._release(9, pressed)        # a different keyboard vanished
+        self.assertEqual(events, [])
+        self.assertEqual(pressed, {3})
+
+    def test_the_holding_device_vanishing_does_release(self):
+        w, events = self._watcher()
+        pressed = {3}
+        w._release(3, pressed)        # never leave a recording stuck on
+        self.assertEqual(events, ["release"])
+
+    def test_press_and_release_fire_once_across_devices(self):
+        w, events = self._watcher()
+        pressed: set[int] = set()
+        w._press(3, pressed)
+        w._press(3, pressed)          # evdev repeat / duplicate down
+        w._press(7, pressed)          # a second keyboard holds it too
+        self.assertEqual(events, ["press"])
+        w._release(7, pressed)        # fd 3 still holds it
+        self.assertEqual(events, ["press"])
+        w._release(3, pressed)
+        self.assertEqual(events, ["press", "release"])
+        self.assertEqual(pressed, set())
+
+
+class TestDispatcherBrainCancelClose(unittest.TestCase):
+    """2026-08-10: the /cancel POST was guarded but the aclose() above it was
+    not, so on a broken socket — exactly when cancelling matters — the
+    exception propagated and the dispatcher's claude -p kept burning quota
+    against the plan cap (half of locked decision #7 not honored)."""
+
+    def test_failing_aclose_still_posts_cancel(self):
+        from jarvis.engines.brain_dispatcher import DispatcherBrain
+
+        class _ExplodingResp(_FakeResp):
+            async def aclose(self):
+                raise httpx.ReadError("socket is gone")
+
+        brain = DispatcherBrain(base_url="http://x:1")
+        brain._client = _FakeClient(None)
+        brain._response = _ExplodingResp({})
+        brain._current_task_id = "quick-7"
+
+        asyncio.run(brain.cancel())
+
+        self.assertEqual(brain._client.posts, ["http://x:1/task/quick-7/cancel"])
+        self.assertIsNone(brain._current_task_id)
+        self.assertIsNone(brain._response)
+
+
+class TestDictateTypeTimeout(unittest.TestCase):
+    """2026-08-10: `ydotool type` ran with no timeout. The single serializing
+    worker thread is the only consumer of `jobs`, so a wedged ydotoold (the
+    /dev/uinput quirk) meant every later dictation was enqueued and never
+    typed — service still active (running), nothing logged after "typing: …"."""
+
+    def test_timeout_is_passed_and_scales_with_the_transcript(self):
+        from jarvis import dictate
+
+        seen = {}
+
+        def fake_run(cmd, timeout=None):
+            seen[len(cmd[-1])] = timeout
+            return subprocess.CompletedProcess(cmd, 0)
+
+        with mock.patch("jarvis.dictate.subprocess.run", fake_run):
+            dictate.type_text("short")
+            dictate.type_text("x" * 2000)
+        short, long = seen[len("short")], seen[2000]
+        self.assertGreater(short, 0)
+        self.assertGreater(long, short)  # a long dictation isn't killed early
+
+    def test_wedged_ydotoold_is_logged_and_the_worker_survives(self):
+        from jarvis import dictate
+
+        boom = subprocess.TimeoutExpired(cmd="ydotool", timeout=10)
+        with mock.patch("jarvis.dictate.subprocess.run", side_effect=boom):
+            with self.assertLogs("jarvis.dictate", level="ERROR") as caught:
+                dictate.type_text("hello there")  # must NOT raise
+        self.assertTrue(any("ydotoold" in line for line in caught.output))
+
+
+class TestPttDictateRefusesToRun(unittest.TestCase):
+    """CLAUDE.md keeps jarvis/ptt_dictate.py as the reference for evdev hotkey
+    capture, but it still ran — re-introducing the races dictate.py fixed
+    (thread-per-release → concurrent transcribe + interleaved ydotool type,
+    `frames` read while the callback appends, unguarded select/read)."""
+
+    def test_module_entry_point_exits_nonzero(self):
+        root = Path(__file__).resolve().parent.parent
+        proc = subprocess.run(
+            [sys.executable, "-m", "jarvis.ptt_dictate"],
+            cwd=root, capture_output=True, text=True, timeout=120,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("superseded by jarvis.dictate", proc.stderr)
+        # it refuses BEFORE the whisper load, so it costs nothing
+        self.assertNotIn("Loading faster-whisper", proc.stdout)
 
 
 if __name__ == "__main__":

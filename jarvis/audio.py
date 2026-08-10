@@ -7,12 +7,39 @@ native rate. Capture pattern lifted from the original ptt_dictate.py.
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import queue
 import threading
 from typing import Iterator
 
 import numpy as np
 import sounddevice as sd
+
+log = logging.getLogger("jarvis.audio")
+
+
+@contextlib.contextmanager
+def _output_stream(sample_rate: int):
+    """An sd.OutputStream that can't leak when start() fails.
+
+    PortAudio allocates the native stream in sd.OutputStream.__init__, but
+    sounddevice's own context manager start()s in __enter__ and only close()s
+    in __exit__ — and __exit__ never runs if __enter__ raised. There is no
+    __del__ either, so every failed start() strands a native stream. Both
+    callers retry forever (play_async on each wake ack, speak_sentences on
+    every sentence), so that accumulates. 2026-08-10.
+    """
+    stream = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="int16")
+    try:
+        stream.start()
+        yield stream
+    finally:
+        # same order sounddevice's own __exit__ uses — stop() drains what is
+        # already queued (close() alone aborts it and clips the tail); both
+        # ignore a stream that never started.
+        stream.stop()
+        stream.close()
 
 
 class Recorder:
@@ -73,6 +100,18 @@ class Recorder:
                 return np.zeros(0, dtype=np.int16)
             return np.concatenate(self._frames).flatten()
 
+    def is_recording(self) -> bool:
+        """True between start() and stop().
+
+        The wake word listens on the same microphone the PTT recorder is
+        capturing from, and `busy` is only held during handle_utterance — so
+        while PTT was still recording nothing marked the assistant busy.
+        Holding PTT and saying "hey jarvis, …" (habit, or a false positive on
+        the PTT speech itself) let capture_after_wake answer the utterance,
+        and the PTT release then answered the SAME audio again: two claude -p
+        runs, two spoken replies, two episode rows (2026-08-10)."""
+        return self._stream is not None
+
 
 class MicStream:
     """Continuous capture in fixed-size frames, consumed via read()."""
@@ -94,7 +133,17 @@ class MicStream:
             samplerate=self.sample_rate, channels=1, dtype="int16",
             blocksize=self.frame_samples, callback=cb,
         )
-        self._stream.start()
+        try:
+            self._stream.start()
+        except BaseException:
+            # PortAudio opened the stream in __init__ above; only __exit__
+            # closes it, and __exit__ never runs when __enter__ raises (there
+            # is no __del__ either). wake_loop catches, sleeps 5s and retries
+            # forever, so a device that keeps refusing to start (busy after a
+            # BT dropout) leaked one native stream per retry. 2026-08-10.
+            self._stream.close()
+            self._stream = None
+            raise
         return self
 
     def __exit__(self, *exc):
@@ -137,10 +186,17 @@ def play_async(samples: np.ndarray, sample_rate: int):
 
     def run():
         try:
-            with sd.OutputStream(samplerate=sample_rate, channels=1, dtype="int16") as out:
+            with _output_stream(sample_rate) as out:
                 out.write(data.reshape(-1, 1))
         except Exception:
-            pass
+            # This covers every wake acknowledgment and PTT beep, and the bare
+            # `pass` that used to be here made a dead output sink look exactly
+            # like the wake word not firing — the hardest failure to debug in
+            # this pipeline. Fire-and-forget on our own thread, so a log line
+            # is all we can do, but it's the difference between "the mic is
+            # broken" and "the speaker is". 2026-08-10.
+            log.warning("acknowledgment playback failed (%d samples @ %dHz)",
+                        len(data), sample_rate, exc_info=True)
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -172,7 +228,7 @@ class Player:
         sub-frames with the interrupt flag checked before every write, so a
         long sentence still stops within ~100ms — locked decision #7."""
         sub = max(1, self.sample_rate // 10)  # ~100ms of audio
-        with sd.OutputStream(samplerate=self.sample_rate, channels=1, dtype="int16") as out:
+        with _output_stream(self.sample_rate) as out:
             for chunk in chunks:
                 for frame in _subframes(chunk, sub):
                     if self.interrupt.is_set():

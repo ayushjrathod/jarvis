@@ -32,6 +32,14 @@ from jarvis.wake_capture import capture_after_wake
 
 log = logging.getLogger("jarvis")
 
+# How long speak_sentences waits for its barge-in watcher THREAD to finish
+# before giving up on it (one mic-read timeout plus slack) — see _barge_monitor.
+MONITOR_JOIN_S = 2.0
+# Ceiling on notices queued behind an in-flight interaction. The list was
+# unbounded: a burst of agentic completions during one long conversation would
+# queue minutes of speech to be read out the moment the user stopped talking.
+MAX_PENDING_NOTICES = 10
+
 
 class Jarvis:
     def __init__(self, cfg: JarvisConfig, mode: str = "both"):
@@ -66,6 +74,10 @@ class Jarvis:
 
         self.loop: asyncio.AbstractEventLoop | None = None
         self.busy = asyncio.Lock()          # one interaction at a time
+        # Set by the PTT key going down mid-interaction; separate from
+        # player.interrupt because speak_sentences' resume() clears that flag
+        # unconditionally (see _ptt_barge / handle_utterance).
+        self.barge_request = threading.Event()
         self.ptt_audio: asyncio.Queue = asyncio.Queue()
         self.pending_notices: list[str] = []
 
@@ -138,7 +150,22 @@ class Jarvis:
                     break
         finally:
             monitor_stop.set()  # watcher thread exits within one mic-read timeout
-            monitor.cancel()
+            # …and we have to WAIT for it, which monitor.cancel() did not do:
+            # cancelling only detaches the asyncio.to_thread future, while the
+            # worker thread runs on and pushes one more frame through the
+            # shared self.barge_vad (the stop check sits at the TOP of the
+            # loop, before the blocking read). SileroVAD.prob is an unlocked
+            # read-modify-write of _state/_context, so monitor N+1 — started
+            # immediately when _flush_notices calls say() — would reset() the
+            # VAD while N's thread was still inside is_speech(), interleaving
+            # the state and yielding garbage probabilities on the first frames
+            # of the next utterance: a spurious or a missed barge-in.
+            # 2026-08-10.
+            try:
+                await asyncio.wait_for(monitor, MONITOR_JOIN_S)
+            except asyncio.TimeoutError:
+                log.warning("barge monitor still running after %.0fs; abandoning it",
+                            MONITOR_JOIN_S)
         if interrupted:
             await self.brain.cancel()
         return not interrupted
@@ -179,12 +206,15 @@ class Jarvis:
             # mic unavailable: this utterance plays without barge-in, that's all
             log.warning("barge-in monitor failed; playback continues", exc_info=True)
 
-    async def say(self, text: str):
+    async def say(self, text: str) -> bool:
+        """Speak one short line. Returns False if the user barged in — the
+        caller has to act on that (see _flush_notices); discarding it meant a
+        barge-in on notice 1 was immediately followed by notices 2 and 3."""
         q = asyncio.Queue()
         for s in [x for x in [sanitize(text)] if x]:
             q.put_nowait(s)
         q.put_nowait(None)
-        await self.speak_sentences(q)
+        return await self.speak_sentences(q)
 
     # -- one interaction ------------------------------------------------------
 
@@ -192,7 +222,22 @@ class Jarvis:
         if len(audio) < self.cfg.sample_rate // 4:  # <250ms: key tap, ignore
             return
         async with self.busy:
+            # `busy` is held from here, but speak_sentences (and its
+            # resume(), which clears player.interrupt) doesn't exist until
+            # after the blocking transcribe below. A PTT press in between —
+            # the user rephrasing while whisper chews on a long clip — set
+            # player.interrupt and had it wiped by that resume(), so the STALE
+            # question was answered and spoken while the new one waited behind
+            # it, with nothing logged. The request is tracked separately now:
+            # cleared here as this interaction begins (a press aimed at the
+            # PREVIOUS reply is already spent), honored right after transcribe.
+            # 2026-08-10.
+            self.barge_request.clear()
             text = await asyncio.to_thread(self.stt.transcribe, audio)
+            if self.barge_request.is_set():
+                log.info("barged in during transcription; dropping the superseded "
+                         "utterance (%s)", text or "empty")
+                return
             if not text:
                 log.info("empty transcription")
                 return
@@ -225,9 +270,45 @@ class Jarvis:
 
     async def _flush_notices(self):
         while self.pending_notices:
-            await self.say(self.pending_notices.pop(0))
+            if not await self.say(self.pending_notices.pop(0)):
+                # Barging in on notice 1 used to be followed instantly by
+                # notices 2 and 3, because say()'s result was discarded. An
+                # interruption means the user wants the floor, not the rest of
+                # the backlog — drop it (every notice is also on the dashboard).
+                dropped, self.pending_notices = len(self.pending_notices), []
+                log.info("barge-in during a notice; dropped %d queued notice(s)", dropped)
+                return
 
     # -- input sources ---------------------------------------------------------
+
+    def _ptt_barge(self) -> bool:
+        """PTT pressed while an interaction is in flight = explicit barge-in.
+
+        Stops playback (speak_sentences then cancels the in-flight dispatcher
+        call) so the new utterance isn't queued behind a long reply, AND
+        records the request in `barge_request` — player.interrupt alone is
+        erased by the next resume(), which is how a press during the STT
+        window used to be swallowed. Kept out of the on_press closure so it is
+        testable without a mic or a hotkey device.
+        """
+        if not self.busy.locked():
+            return False
+        self.barge_request.set()
+        if self.player is not None:
+            self.player.stop()
+        return True
+
+    def _busy_for_wake(self) -> bool:
+        """Is the assistant occupied, as far as the wake word is concerned?
+
+        `busy` alone was wrong: it is held only during handle_utterance, not
+        while the PTT Recorder is capturing — and the wake MicStream listens on
+        the same microphone. So in --mode both (what mission-jarvis ships)
+        holding PTT and saying "hey jarvis, …" had capture_after_wake answer
+        the utterance, and the PTT release answered the same audio again.
+        2026-08-10.
+        """
+        return self.busy.locked() or self.recorder.is_recording()
 
     def start_ptt(self):
         """Hold-to-talk on `ptt_key`: press = listen, release = ask.
@@ -236,11 +317,7 @@ class Jarvis:
         minus the VAD endpointing — the key edge IS the endpoint.
         """
         def on_press():
-            # Pressing while Jarvis talks is an explicit barge-in: stop playback
-            # (speak_sentences then cancels the in-flight dispatcher call) so the
-            # new utterance isn't queued behind a long reply.
-            if self.busy.locked() and self.player is not None:
-                self.player.stop()
+            self._ptt_barge()
             if self.cfg.ptt_beep_ms > 0:
                 play_beep_async(ms=self.cfg.ptt_beep_ms)
             self.recorder.start()
@@ -307,7 +384,7 @@ class Jarvis:
             return capture_after_wake(
                 mic.read, self.wake, self.vad, self.cfg,
                 prebuffer_frames=prebuffer_frames,
-                is_busy=self.busy.locked, on_busy=on_busy,
+                is_busy=self._busy_for_wake, on_busy=on_busy,
                 on_wake=on_wake,
                 # mic.read uses a ~1s timeout, so seconds-of-silence ≈ None count
                 none_limit=self.cfg.mic_lost_after_s,
@@ -317,6 +394,11 @@ class Jarvis:
         async for ev in self.brain.notices():
             try:
                 if self.busy.locked():
+                    if len(self.pending_notices) >= MAX_PENDING_NOTICES:
+                        # bounded on purpose: the newest completion is the one
+                        # worth hearing, and the dashboard keeps them all
+                        log.warning("notice backlog full; dropping the oldest")
+                        self.pending_notices.pop(0)
                     self.pending_notices.append(ev.text)
                 else:
                     async with self.busy:
@@ -326,12 +408,32 @@ class Jarvis:
 
     # -- entry ------------------------------------------------------------------
 
+    async def _supervise_ptt(self, watcher: HotkeyWatcher):
+        """Fail the process if the hotkey thread stops.
+
+        start_ptt()'s return value used to be discarded (compare dictate.py,
+        which join()s the watcher and sys.exit()s precisely so a dead one trips
+        Restart=on-failure). A watcher that died left ptt_loop parked forever
+        on an empty queue while `systemctl --user status mission-jarvis` still
+        reported active (running) — in --mode ptt, a no-op that looks healthy.
+        join() blocks in a worker thread, so this task simply never completes
+        while PTT is alive; it costs one default-executor thread for the life
+        of the process, which is cheap next to a silently dead hotkey.
+        2026-08-10.
+        """
+        await asyncio.to_thread(watcher.join)
+        raise RuntimeError(
+            f"PTT hotkey watcher exited ({watcher.error or 'no error recorded'}); "
+            "exiting so systemd restarts us"
+        )
+
     async def run(self):
         self.loop = asyncio.get_running_loop()
         tasks = [asyncio.create_task(self.notices_loop())]
         if self.mode in ("ptt", "both"):
-            self.start_ptt()
+            watcher = self.start_ptt()
             tasks.append(asyncio.create_task(self.ptt_loop()))
+            tasks.append(asyncio.create_task(self._supervise_ptt(watcher)))
         if self.mode in ("wake", "both"):
             tasks.append(asyncio.create_task(self.wake_loop()))
         log.info("jarvis is up (mode=%s, dispatcher=%s)", self.mode, self.cfg.dispatcher_url)

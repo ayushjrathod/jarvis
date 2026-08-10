@@ -34,6 +34,12 @@ _WS = re.compile(r"[ \t]+")
 # sentence boundary: ./!/? followed by whitespace (avoids most mid-number splits)
 _SENTENCE_END = re.compile(r"(?<=[.!?…])[\"')\]]*\s+")
 
+_FENCE = "```"
+# spoken in place of a fenced block the chunker refuses to buffer to its close,
+# and when a single reply outruns the whole-reply cap
+_CODE_OMITTED = "Code block omitted."
+_TRUNCATED = "The rest of the answer is too long to read out."
+
 
 def sanitize(text: str) -> str:
     """Make model output speakable. Idempotent, safe on plain prose."""
@@ -82,33 +88,113 @@ def sanitize_for_injection(text: str) -> str:
 
 
 class SentenceChunker:
-    """Feed streaming deltas in, get complete speakable sentences out."""
+    """Feed streaming deltas in, get complete speakable sentences out.
 
-    def __init__(self, max_buffer: int = 300):
+    Fence-aware since 2026-08-10. `sanitize()` can only swallow a COMPLETE
+    ```-fenced pair, but this chunker sanitizes each chunk in isolation and
+    force-flushes an oversized buffer — and code has almost no sentence
+    boundaries, so a block longer than `max_buffer` was cut into pieces, the
+    fence never survived into a single chunk, "code block omitted" never fired
+    and Piper read the raw shell aloud (verified: a 1029-char block became five
+    chunks of `rm -rf …` text). Two rules fix it: nothing is emitted while a
+    fence is open, and no chunk boundary is ever placed inside a pair.
+    """
+
+    def __init__(self, max_buffer: int = 300, max_code: int = 4000,
+                 max_total: int = 3000):
         self._buf = ""
         self._max = max_buffer
+        # Ceiling on how much unterminated code we'll hold waiting for the
+        # closing fence. Past it we say so once and discard to the closer —
+        # buffering a model that decided to print a whole file is worse than
+        # losing it, and a stream that dies mid-fence would never flush.
+        self._max_code = max_code
+        # Nothing capped the total spoken length anywhere (2026-08-10): a
+        # reply that dumps a directory listing holds the speaker — and `busy`
+        # — for as long as the model keeps writing, with barge-in the only
+        # way out. ~3000 chars is a few minutes of Piper.
+        self._max_total = max_total
+        self._spoken = 0
+        self._dropping = False  # inside a runaway block, discarding to its closer
+
+    # -- fence bookkeeping ---------------------------------------------------
+    # A position sits inside a ``` pair iff an odd number of fences precede it;
+    # the buffer as a whole has an open fence iff its fence count is odd.
+
+    def _fence_open(self) -> bool:
+        return self._buf.count(_FENCE) % 2 == 1
+
+    def _inside_fence(self, index: int) -> bool:
+        return self._buf.count(_FENCE, 0, index) % 2 == 1
+
+    def _next_boundary(self) -> int | None:
+        """End offset of the next sentence boundary that is NOT inside a
+        fenced pair — code is full of periods, and splitting there would
+        strand the two fences in different chunks."""
+        for m in _SENTENCE_END.finditer(self._buf):
+            if not self._inside_fence(m.start()):
+                return m.end()
+        return None
+
+    def _emit(self, out: list[str], text: str) -> None:
+        """Append one speakable chunk, enforcing the whole-reply cap."""
+        if not text or self._spoken >= self._max_total:
+            return
+        self._spoken += len(text)
+        out.append(text)
+        if self._spoken >= self._max_total:
+            out.append(_TRUNCATED)  # once: further chunks return above
 
     def feed(self, delta: str) -> list[str]:
+        out: list[str] = []
+        if self._dropping:
+            # mid-runaway-block: everything up to the closing fence is code we
+            # already announced as omitted, so it never reaches the buffer
+            _code, fence, tail = delta.partition(_FENCE)
+            if not fence:
+                return out
+            self._dropping, delta = False, tail
         self._buf += delta
-        out = []
         while True:
-            m = _SENTENCE_END.search(self._buf)
-            if m:
-                sentence, self._buf = self._buf[: m.end()], self._buf[m.end():]
-                sentence = sanitize(sentence)
-                if sentence:
-                    out.append(sentence)
+            if self._fence_open():
+                # Hold everything while a fence is open: emitting now would
+                # speak raw code, because the closing fence sanitize() needs
+                # would land in a later chunk.
+                if len(self._buf) <= self._max_code:
+                    return out
+                cut = self._buf.rfind(_FENCE)  # the last fence is the open one
+                prefix, self._buf, self._dropping = self._buf[:cut], "", True
+                self._emit(out, sanitize(prefix))
+                self._emit(out, _CODE_OMITTED)
+                return out
+            end = self._next_boundary()
+            if end is not None:
+                sentence, self._buf = self._buf[:end], self._buf[end:]
+                self._emit(out, sanitize(sentence))
             elif len(self._buf) > self._max:
                 # no boundary in an oversized buffer — flush at last space
                 cut = self._buf.rfind(" ", 0, self._max)
                 cut = cut if cut > 0 else self._max
+                if self._inside_fence(cut):
+                    # the fence count is even here, so the next fence at/after
+                    # the cut closes the pair the cut fell into: take the whole
+                    # block as one chunk and let sanitize() swallow it
+                    close = self._buf.find(_FENCE, cut)
+                    cut = close + len(_FENCE) if close >= 0 else len(self._buf)
                 chunk, self._buf = self._buf[:cut], self._buf[cut:]
-                chunk = sanitize(chunk)
-                if chunk:
-                    out.append(chunk)
+                self._emit(out, sanitize(chunk))
             else:
                 return out
 
     def flush(self) -> list[str]:
-        rest, self._buf = sanitize(self._buf), ""
-        return [rest] if rest else []
+        out: list[str] = []
+        rest, self._buf, self._dropping = self._buf, "", False
+        if rest.count(_FENCE) % 2 == 1:
+            # the stream ended mid-block (cancelled reply, dropped SSE): the
+            # unpaired fence means sanitize() would hand the code to the TTS
+            cut = rest.rfind(_FENCE)
+            self._emit(out, sanitize(rest[:cut]))
+            self._emit(out, _CODE_OMITTED)
+            return out
+        self._emit(out, sanitize(rest))
+        return out

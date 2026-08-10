@@ -101,7 +101,16 @@ class DispatcherBrain(Brain):
         # from under us and skip cancelling the genuinely-live stream.
         task_id, self._current_task_id = self._current_task_id, None
         if resp is not None:
-            await resp.aclose()  # server-side generator dies with the connection
+            try:
+                await resp.aclose()  # server-side generator dies with the connection
+            except Exception as e:
+                # A close that raises (broken socket, half-dead transport) must
+                # NOT skip the /cancel POST below: the POST was guarded and
+                # this wasn't, so on exactly the connection failure that makes
+                # cancelling urgent, the dispatcher's `claude -p` kept running
+                # and burning quota against the plan cap — half of locked
+                # decision #7 quietly not honored. 2026-08-10.
+                log.warning("closing the stream failed during cancel (%s)", e)
         if task_id:
             try:
                 await self._client.post(f"{self.base_url}/task/{task_id}/cancel")

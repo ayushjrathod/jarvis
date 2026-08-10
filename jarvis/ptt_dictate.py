@@ -33,6 +33,22 @@ COMPUTE_TYPE = "int8"              # int8 is the fast option on CPU
 LANGUAGE = "en"                    # set to None for auto-detect / multilingual
 # ----------------------------------------------------------------------
 
+# Refuse to RUN while staying readable as the reference CLAUDE.md keeps it for
+# (jarvis/hotkey.py's evdev loop is descended from main() below). Everything
+# here predates the fixes in jarvis/dictate.py and would re-introduce them: a
+# thread per key-release runs concurrent WhisperModel.transcribe calls and
+# interleaves `ydotool type` output, `frames` is read while the PortAudio
+# callback appends to it, and select()/read() are unguarded so one unplugged
+# keyboard kills the loop. The guard sits above the model load on purpose —
+# below it, refusing would still cost a whisper download/warm first.
+# 2026-08-10.
+if __name__ == "__main__":
+    sys.exit(
+        "jarvis/ptt_dictate.py is superseded by jarvis.dictate — run "
+        "`.venv/bin/python -m jarvis.dictate` instead. This file is kept "
+        "read-only as the reference for evdev hotkey capture (CLAUDE.md)."
+    )
+
 print(f"Loading faster-whisper model '{MODEL_SIZE}' (first run downloads it)...")
 from faster_whisper import WhisperModel
 model = WhisperModel(MODEL_SIZE, device="cpu", compute_type=COMPUTE_TYPE)
@@ -126,5 +142,7 @@ def main():
                         threading.Thread(target=stop_recording_and_transcribe).start()
 
 
+# Unreachable — the guard near the top of the file exits first. Left in place
+# so the script still reads end-to-end as the original.
 if __name__ == "__main__":
     main()

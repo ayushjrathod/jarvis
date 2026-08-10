@@ -28,10 +28,24 @@ def type_text(text: str):
     text = sanitize_for_injection(text)
     if not text:
         return
+    # ydotool types key-by-key (~12ms each), so the budget has to scale with
+    # the transcript — a flat few seconds would kill a legitimately long
+    # dictation (max_recording_s is 300). 60ms/char is ~5x the observed rate.
+    timeout_s = 10.0 + 0.06 * len(text)
     try:
-        res = subprocess.run(["ydotool", "type", "--", text])
+        res = subprocess.run(["ydotool", "type", "--", text], timeout=timeout_s)
     except FileNotFoundError:
         log.error("ydotool not installed — sudo pacman -S ydotool")
+        return
+    except subprocess.TimeoutExpired:
+        # A wedged ydotoold (the documented /dev/uinput quirk) never returns,
+        # and this runs on the single worker thread that drains `jobs` — so
+        # every later dictation was enqueued and never typed, with the service
+        # still `active (running)` and nothing logged after "typing: …".
+        # Give up on this one and keep the worker alive. 2026-08-10.
+        log.error("ydotool did not finish within %.0fs — is ydotoold wedged? "
+                  "(systemctl --user status ydotool; the /dev/uinput quirk in "
+                  "CLAUDE.md); dropping this dictation", timeout_s)
         return
     if res.returncode != 0:
         log.error("ydotool exited %d — is ydotoold up? (systemctl --user status ydotool)",
@@ -86,8 +100,10 @@ def main():
         print("bye")
     else:
         # the watcher only returns via stop(); anything else is a crash — exit
-        # nonzero so systemd's Restart=on-failure actually fires
-        sys.exit("hotkey watcher exited unexpectedly")
+        # nonzero so systemd's Restart=on-failure actually fires. run() now
+        # parks the exception in watcher.error rather than losing it with the
+        # thread, so say which one it was.
+        sys.exit(f"hotkey watcher exited unexpectedly: {watcher.error or 'no error recorded'}")
 
 
 if __name__ == "__main__":
