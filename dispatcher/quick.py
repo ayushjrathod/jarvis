@@ -135,6 +135,11 @@ async def _stream_cli(text: str, cfg: Config, model_override: str | None,
                         "retry_on_refusal": refused,
                         "error": error,
                     })
+                    # `streamed` tells the caller whether any INCREMENTAL text
+                    # arrived. When it didn't, the single delta below is
+                    # synthesized from the final result, so there is no real
+                    # time-to-first-token to record (see telemetry.stream_stats).
+                    meta["streamed"] = saw_delta
                     if not saw_delta and not obj.get("is_error") and obj.get("result"):
                         yield ("delta", obj["result"])
             await proc.wait()

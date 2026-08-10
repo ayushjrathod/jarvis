@@ -177,8 +177,26 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                 async def diverted():
                     yield sse("task", {"task_id": None, "kind": divert["kind"]})
                     yield sse("delta", {"text": divert["speech"]})
+                    # status comes from the EXECUTOR, not a hardcoded "done"
+                    # (fixed 2026-08-10 — the two halves of one feature
+                    # disagreed: an unresolved "put on something chill"
+                    # streamed status=done here while the identical command
+                    # through submit() settled 'failed', and an SSE client had
+                    # no field to tell a failed play from a real one).
+                    #
+                    # ...with one deliberate difference from _settle_divert: a
+                    # parked confirmation is NOT a failure over HTTP. There the
+                    # caller is present, gets `confirm_id`, and answers via the
+                    # ConfirmBar or by voice — the interaction is proceeding
+                    # normally. It settles 'failed' on the queue/automation
+                    # path only because nobody is watching those sources, so
+                    # the intent just expires. Reporting 'failed' here would
+                    # make the dashboard show an error for an ordinary
+                    # "Shall I read your clipboard?" prompt.
+                    acted = divert.get("ok") or divert.get("confirm_id")
                     yield sse("done", {k: v for k, v in {
-                        "status": "done", "kind": divert["kind"],
+                        "status": "done" if acted else "failed",
+                        "kind": divert["kind"],
                         "automation_id": divert.get("automation_id"),
                         "desktop_status": divert.get("desktop_status"),
                         "confirm_id": divert.get("confirm_id"),
@@ -336,7 +354,26 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     async def memory_consolidate():
         """Export unconsolidated episodes and queue the consolidation agent.
         Episodes are marked at hand-off; the export file in data/consolidation/
-        is the audit trail if the run then fails."""
+        is the audit trail if the run then fails.
+
+        Serialized (2026-08-10): build-then-mark is a read-then-write with an
+        await in between, so two callers — the 02:30 timer and a manual POST,
+        or a double-fire — could both read the SAME unconsolidated set before
+        either marked it, and both would submit an agent run over it. Export
+        filenames no longer collide, but the duplicate *run* is the expensive
+        half. asyncio has no preemption, so a plain flag is a sufficient lock
+        here; a second caller is told nothing to do rather than made to wait,
+        because the first one already claimed every episode there was.
+        """
+        if getattr(app.state, "consolidating", False):
+            return {"status": "already_running"}
+        app.state.consolidating = True
+        try:
+            return await _consolidate()
+        finally:
+            app.state.consolidating = False
+
+    async def _consolidate():
         job = memory.build_consolidation(cfg, svc.db)
         if not job:
             return {"status": "nothing_to_consolidate"}

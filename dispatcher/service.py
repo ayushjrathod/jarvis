@@ -153,6 +153,19 @@ class Service:
         orphans = self.db.reconcile_orphans()
         if orphans:
             log.warning("marked %d orphaned task(s) from a previous run as failed", orphans)
+        # ...and give back any episodes those orphans were holding. Without this
+        # a consolidation interrupted by a restart stranded its whole batch
+        # forever — marked consolidated at hand-off, never distilled, never
+        # re-exported (added 2026-08-10).
+        try:
+            stranded = self.db.orphaned_consolidation_episode_ids()
+            if stranded:
+                n = self.db.mark_episodes_unconsolidated(stranded)
+                if n:
+                    log.warning("returned %d episode(s) from an interrupted "
+                                "consolidation to the pool", n)
+        except Exception:
+            log.exception("startup episode roll-back failed")
         self.bus = EventBus()
         self.hooks = HookRegistry()
         self.hooks.register(self.bus.publish)  # SSE broadcaster is the first hook
@@ -395,13 +408,19 @@ class Service:
         (0 = continuity off)."""
         idle_min = self.cfg.quick_session_idle_minutes
         entry = self.quick_sessions.get(source)
-        if not idle_min or not entry:
+        if not idle_min:
             return None
-        session_id, last_used = entry
-        if time.monotonic() - last_used > idle_min * 60:
-            self.quick_sessions.pop(source, None)
-            return None
-        return session_id
+        # Sweep every expired source, not just the one being looked up (fixed
+        # 2026-08-10). Entries were only ever dropped when that SAME source was
+        # queried again and found stale — but ask-about-my-screen uses a fresh
+        # source per screenshot (`screen:<shot_id>`), so each one is looked up a
+        # couple of times and then never again, leaving a permanent dict entry
+        # for the life of the process. Small, but monotonic and unbounded.
+        cutoff = time.monotonic() - idle_min * 60
+        for src in [s for s, (_, used) in self.quick_sessions.items() if used <= cutoff]:
+            self.quick_sessions.pop(src, None)
+        entry = self.quick_sessions.get(source)
+        return entry[0] if entry else None
 
     def _is_cancelled(self, task_id: str) -> bool:
         row = self.db.get_task(task_id)
@@ -508,7 +527,20 @@ class Service:
                     meta = {"status": "failed", "error": f"{type(e).__name__}: {e}"}
 
                 status = meta.get("status", "failed")
-                lat = telemetry.stream_stats(t0, delta_times, meta.get("output_tokens"))
+                # A cancel that already landed wins (fixed 2026-08-10). An HTTP
+                # quick task is never registered in self.bg, so cancel() only
+                # kills the subprocess — after it has written 'cancelled' — and
+                # the kill surfaces here as EOF with no result event, i.e.
+                # status "failed" and error "claude exited -9: …". That then
+                # overwrote the run row's honest 'cancelled', and it happens on
+                # EVERY voice barge-in, which is exactly this path. The task row
+                # was already correct (the _is_cancelled guard further down);
+                # only the run row and its error string were wrong.
+                if status != "done" and self._is_cancelled(task["id"]):
+                    status = "cancelled"
+                    meta = {**meta, "error": None}
+                lat = telemetry.stream_stats(t0, delta_times, meta.get("output_tokens"),
+                                             streamed=meta.get("streamed", True))
                 self.db.finish_run(
                     run_id, status,
                     stop_reason=meta.get("stop_reason"), cost_usd=meta.get("cost_usd"),
@@ -638,15 +670,50 @@ class Service:
     def start_agentic(self, task: dict):
         self.bg[task["id"]] = asyncio.create_task(self._run_agentic(task))
 
+    def _rollback_episodes(self, task: dict, meta: dict | None = None):
+        """Return a consolidation run's episodes to the unconsolidated pool.
+
+        Episodes are marked consolidated at HAND-OFF (main.py), so any way the
+        run fails to actually distil them strands that batch forever: nothing
+        re-exports them, and the only artefact left is the export file, which
+        nobody is prompted to replay. Until 2026-08-10 this ran on exactly one
+        path — `_run_agentic_inner` settling 'failed' — leaving three holes:
+        cancellation, the outer crash handler, and a dispatcher restart
+        mid-run (which `reconcile_orphans` settles as failed with no idea the
+        task owned episodes). Safe to call more than once: the UPDATE only
+        touches rows that are still marked, and a no-op logs nothing.
+        """
+        try:
+            if meta is None:
+                row = self.db.get_task(task["id"]) or {}
+                meta = json.loads(row["metadata"]) if row.get("metadata") else {}
+        except (TypeError, ValueError):
+            meta = {}
+        if (meta or {}).get("task_type") != "memory-consolidate":
+            return
+        ids = (meta or {}).get("episode_ids")
+        if not ids:
+            return
+        try:
+            n = self.db.mark_episodes_unconsolidated(ids)
+            if n:
+                log.warning("consolidation %s did not complete; %d episode(s) "
+                            "returned to the pool", task["id"], n)
+        except Exception:
+            log.exception("episode roll-back failed for %s", task["id"])
+
     async def _run_agentic(self, task: dict):
         try:
             async with self.sem:
                 await self._run_agentic_inner(task)
         except asyncio.CancelledError:
-            pass  # cancel() already wrote state and fired the event
+            # cancel() already wrote state and fired the event — but it cannot
+            # know this task was holding a batch of episodes hostage.
+            self._rollback_episodes(task)
         except Exception:
             log.exception("agentic task %s crashed", task["id"])
             self.db.set_task_status(task["id"], "failed")
+            self._rollback_episodes(task)
             await self.fire("failed", task, error="internal error")
         finally:
             self.bg.pop(task["id"], None)
@@ -733,17 +800,8 @@ class Service:
                 requeue_delay = self._limit_requeue_delay(limit)
                 speech += " I'll retry the task after that."
             self.db.set_task_status(task["id"], final)
-            if (final == "failed"
-                    and meta.get("task_type") == "memory-consolidate"
-                    and meta.get("episode_ids")):
-                # the episodes were marked consolidated at hand-off; the run
-                # failed, so return them to the pool for the next pass (M6)
-                try:
-                    n = self.db.mark_episodes_unconsolidated(meta["episode_ids"])
-                    log.warning("consolidation %s failed; %d episode(s) requeued",
-                                task["id"], n)
-                except Exception:
-                    log.exception("episode roll-back failed for %s", task["id"])
+            if final == "failed":
+                self._rollback_episodes(task, meta)
             self._capture_episode(task, final, result.get("output_text"))
             suppress = self._maybe_notify(task, meta, final,
                                           result.get("output_text"),

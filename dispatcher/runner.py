@@ -96,8 +96,16 @@ async def run_once(text: str, cfg: Config, model: str | None, tools: list[str],
                                   system_extra, resume_session_id, max_cost_usd,
                                   on_step)
         except _Timeout as exc:
-            if attempt == 2:
-                return {"status": "timeout", "error": str(exc)}
+            # A timeout is NOT retried (changed 2026-08-10). It used to be, and
+            # that was wrong twice over: a run that hit the 600s wall-clock was
+            # usually *working*, so re-running the same prompt from scratch with
+            # the same write grants meant a second pass over files the first
+            # attempt had already edited. And the first attempt raises before any
+            # `result` event, so it reports no cost_usd, no session_id and no
+            # steps — up to 600s of real model work invisible to /stats, with
+            # both attempts sharing the single runs row. Only a spawn failure is
+            # genuinely transient; a timeout is a verdict.
+            return {"status": "timeout", "error": str(exc)}
         except SPAWN_ERRORS as exc:
             if attempt == 2:
                 return {"status": "failed", "error": f"spawn error: {exc}"}
@@ -157,7 +165,13 @@ def build_cmd(text: str, cfg: Config, model: str | None, tools: list[str],
               system_extra: str = "", resume_session_id: str | None = None,
               max_cost_usd: float | None = None) -> list[str]:
     system = AGENT_SYSTEM + ("\n\n" + system_extra if system_extra else "")
-    budget = max_cost_usd or cfg.budgets.get("max_cost_per_task_usd", 0.50)
+    # `is None`, not `or` (fixed 2026-08-10): sanitize_untrusted_metadata lets a
+    # caller NARROW the budget and passes 0 through unchanged, and `0 or 0.50`
+    # is 0.50 — so asking for the tightest possible cap silently produced the
+    # loosest configured one. Not an escalation (only a narrowing was lost), but
+    # the exact opposite of what was asked for.
+    budget = (cfg.budgets.get("max_cost_per_task_usd", 0.50)
+              if max_cost_usd is None else max_cost_usd)
     cmd = [
         cfg.claude_bin, "-p", text,
         "--output-format", "stream-json",

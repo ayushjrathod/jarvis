@@ -16,7 +16,7 @@ from dispatcher.classifier import classify
 from dispatcher.config import Config
 from dispatcher.db import Database
 from dispatcher.queue_watcher import _ingest_one, parse_task_file
-from dispatcher import runner
+from dispatcher import runner, telemetry
 from dispatcher.runner import is_refusal, run_once
 from dispatcher.service import make_ack
 
@@ -212,6 +212,45 @@ class TestQueueIngestRetry(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((self.processed / "t.t1.md").exists())
         self.assertEqual(retries, {})
 
+    async def test_a_file_that_ran_is_never_submitted_twice(self):
+        # The killer case (fixed 2026-08-10): submit succeeded, filing it into
+        # .processed did not (read-only mount, ENOSPC, a permission problem, a
+        # synced/FUSE queue dir). OSError is on the transient whitelist, so the
+        # old order — submit, THEN rename, both in one try — left the file in
+        # the queue and the next poll ran the whole task again, up to
+        # max_retries times: three extra full agentic runs with real side
+        # effects, and the log never said a task had already been dispatched.
+        f = self._write("t.md")
+        service = _FakeService(submit_effect={"id": "t1", "kind": "agentic"})
+        retries: dict = {}
+        real_rename = Path.rename
+
+        def rename(self, target):
+            if ".processed" in str(target):
+                raise OSError("read-only file system")
+            return real_rename(self, target)
+
+        with patch.object(Path, "rename", rename):
+            await _ingest_one(f, service, self.processed, self.failed, retries, 3)
+        self.assertEqual(service.calls, 1)
+        # the .md is gone (claimed), so the next poll cannot pick it up again
+        self.assertFalse(f.exists())
+        for _ in range(4):
+            await _ingest_one(f, service, self.processed, self.failed, retries, 3)
+        self.assertEqual(service.calls, 1, "the task ran more than once")
+
+    async def test_a_file_that_did_NOT_run_is_returned_to_the_queue(self):
+        # ...and the converse: a claim followed by a failed submit must put the
+        # file back as *.md, or it sits as *.claimed forever — the glob only
+        # matches *.md, so it would be neither run nor visible in .failed.
+        f = self._write("t.md")
+        service = _FakeService(submit_effect=OSError("dispatcher busy"))
+        retries: dict = {}
+        await _ingest_one(f, service, self.processed, self.failed, retries, 3)
+        self.assertTrue(f.exists())
+        self.assertFalse((self.qdir / "t.claimed").exists())
+        self.assertEqual(retries["t.md"], 1)
+
 
 class _FakeProc:
     """Models the stream-json CLI (Phase H runner): stdout yields one result
@@ -274,7 +313,16 @@ class TestRunnerTransientRetry(unittest.IsolatedAsyncioTestCase):
         self.assertIn("spawn error", result["error"])
         self.assertEqual(mock_spawn.call_count, 2)
 
-    async def test_timeout_then_success_retries_once(self):
+    async def test_timeout_is_not_retried(self):
+        # CHANGED 2026-08-10 — this used to assert the opposite (one retry on
+        # timeout, "done" on the second attempt). Retrying was wrong twice
+        # over: a run that hit the wall-clock was usually working, so a second
+        # pass re-ran the same prompt with the same write grants over files the
+        # first attempt had already edited; and _attempt raises before any
+        # result event, so the timed-out attempt contributes no cost_usd,
+        # session_id or steps while sharing the single runs row — up to
+        # timeout_s of real model work invisible to /stats. A spawn failure is
+        # transient; a timeout is a verdict.
         cfg = _test_cfg(timeout_s=0.05)
         slow_proc = _FakeProc(communicate_delay=1.0)
         good_proc = _FakeProc()
@@ -283,21 +331,9 @@ class TestRunnerTransientRetry(unittest.IsolatedAsyncioTestCase):
             AsyncMock(side_effect=[slow_proc, good_proc]),
         ) as mock_spawn:
             result = await run_once("do it", cfg, None, [], {}, "task1")
-        self.assertEqual(result["status"], "done")
-        self.assertEqual(mock_spawn.call_count, 2)
-        self.assertTrue(slow_proc.killed)
-
-    async def test_timeout_twice_returns_timeout_status(self):
-        cfg = _test_cfg(timeout_s=0.05)
-        slow_proc_1 = _FakeProc(communicate_delay=1.0)
-        slow_proc_2 = _FakeProc(communicate_delay=1.0)
-        with patch(
-            "dispatcher.runner.asyncio.create_subprocess_exec",
-            AsyncMock(side_effect=[slow_proc_1, slow_proc_2]),
-        ) as mock_spawn:
-            result = await run_once("do it", cfg, None, [], {}, "task1")
         self.assertEqual(result["status"], "timeout")
-        self.assertEqual(mock_spawn.call_count, 2)
+        self.assertEqual(mock_spawn.call_count, 1)
+        self.assertTrue(slow_proc.killed)   # and the first one is still reaped
     async def test_refusal_is_not_retried(self):
         cfg = _test_cfg()
         refusal_proc = _FakeProc(
@@ -553,6 +589,44 @@ class TestStreamQuickBookkeeping(unittest.IsolatedAsyncioTestCase):
             [e async for e in self.svc.stream_quick(task)]
         self.assertIsNone(seen["tools"])
 
+    async def test_a_killed_subprocess_does_not_overwrite_cancelled(self):
+        # An HTTP quick task is never registered in svc.bg, so cancel() only
+        # kills the subprocess — after writing 'cancelled'. The kill surfaces
+        # as EOF with no result event, i.e. status "failed" + "claude exited
+        # -9", which then clobbered the run row's honest 'cancelled'. This is
+        # the path EVERY voice barge-in takes, so failed run rows with spurious
+        # kill errors were accumulating (fixed 2026-08-10).
+        task = await self.svc.create_task("q", "voice", "quick")
+
+        async def stream(text, cfg, model_override=None, tools=None, context="",
+                         resume_session_id=None, **kwargs):
+            yield ("delta", "partial ")
+            self.svc.db.cancel_open_runs(task["id"])          # what cancel() does
+            self.svc.db.set_task_status(task["id"], "cancelled")
+            yield ("meta", {"status": "failed",
+                            "error": "claude exited -9: killed"})
+
+        with patch("dispatcher.service.quick.stream", stream):
+            [e async for e in self.svc.stream_quick(task)]
+        got = self.svc.db.get_task(task["id"])
+        self.assertEqual(got["status"], "cancelled")
+        self.assertEqual(got["runs"][0]["status"], "cancelled")
+        self.assertIsNone(got["runs"][0]["error"])
+
+    def test_expired_quick_sessions_are_swept_not_just_the_one_asked_for(self):
+        # ask-about-my-screen uses a fresh source per screenshot
+        # (screen:<shot_id>), each looked up a couple of times and then never
+        # again — so entries were never revisited and never expired, growing
+        # for the life of the process.
+        self.svc.cfg.quick_session_idle_minutes = 10
+        stale = time.monotonic() - 999999
+        for i in range(5):
+            self.svc.quick_sessions[f"screen:{i}"] = (f"sess{i}", stale)
+        self.svc.quick_sessions["voice"] = ("live", time.monotonic())
+        self.assertIsNone(self.svc._fresh_quick_session("api"))  # unrelated lookup
+        self.assertEqual(set(self.svc.quick_sessions), {"voice"})
+        self.assertEqual(self.svc._fresh_quick_session("voice"), "live")
+
     async def test_client_disconnect_settles_rows_as_cancelled(self):
         task = await self.svc.create_task("q", "voice", "quick")
         fake = self._fake_stream(("delta", "hi "), ("delta", "never consumed"))
@@ -593,6 +667,146 @@ class TestStreamQuickBookkeeping(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RuntimeError):
                 [e async for e in self.svc.stream_quick(task)]
         self.assertEqual(self.svc.db.get_task(task["id"])["status"], "failed")
+
+
+class TestRunnerBudgetAndTimeout(unittest.IsolatedAsyncioTestCase):
+    """A timeout is a verdict, not a transient error; and a zero budget means
+    zero, not 'use the default'."""
+
+    def _cfg(self):
+        cfg = Config(root=Path("/tmp"))
+        cfg.budgets = {"max_cost_per_task_usd": 3.00, "transient_retry_delay_s": 0}
+        cfg.claude_bin = "/nonexistent/claude"
+        return cfg
+
+    def test_zero_budget_is_honored_not_replaced_by_the_default(self):
+        # `max_cost_usd or default` made 0 -> 3.00: a caller asking for the
+        # tightest possible cap silently got the loosest configured one.
+        cmd = runner.build_cmd("hi", self._cfg(), None, [], max_cost_usd=0)
+        self.assertEqual(cmd[cmd.index("--max-budget-usd") + 1], "0")
+
+    def test_absent_budget_still_falls_back_to_the_configured_cap(self):
+        cmd = runner.build_cmd("hi", self._cfg(), None, [], max_cost_usd=None)
+        self.assertEqual(cmd[cmd.index("--max-budget-usd") + 1], "3.0")
+
+    async def test_a_timeout_is_not_retried(self):
+        # Retrying a 600s wall-clock timeout re-ran the same prompt with the
+        # same write grants over files the first attempt had already edited,
+        # and the timed-out attempt reports no cost/session/steps at all — so
+        # up to 600s of real model work vanished from /stats.
+        attempts = 0
+
+        async def fake_attempt(*a, **k):
+            nonlocal attempts
+            attempts += 1
+            raise runner._Timeout(600)
+
+        with patch.object(runner, "_attempt", fake_attempt):
+            out = await runner.run_once("hi", self._cfg(), None, [], {}, "t1")
+        self.assertEqual(attempts, 1)
+        self.assertEqual(out["status"], "timeout")
+
+    async def test_a_spawn_error_is_still_retried_once(self):
+        attempts = 0
+
+        async def fake_attempt(*a, **k):
+            nonlocal attempts
+            attempts += 1
+            raise OSError("fork failed")
+
+        with patch.object(runner, "_attempt", fake_attempt):
+            out = await runner.run_once("hi", self._cfg(), None, [], {}, "t1")
+        self.assertEqual(attempts, 2)
+        self.assertEqual(out["status"], "failed")
+
+
+class TestLatencyHonesty(unittest.TestCase):
+    def test_a_synthesized_delta_records_no_latency(self):
+        # When the CLI emits no incremental text, quick.py yields ONE delta made
+        # from the final result — so "time to first token" is the whole run
+        # duration. Recording that put a ~30s TTFT into /stats' quick_latency
+        # averages, indistinguishable from a real measurement.
+        self.assertEqual(telemetry.stream_stats(0.0, [30.0], 100, streamed=False), {})
+
+    def test_a_real_stream_still_records(self):
+        out = telemetry.stream_stats(0.0, [1.0, 1.5, 2.0], 100, streamed=True)
+        self.assertEqual(out["ttft_ms"], 1000.0)
+        self.assertIsNotNone(out["tokens_per_s"])
+
+
+class TestConsolidationRollback(unittest.IsolatedAsyncioTestCase):
+    """Episodes are marked consolidated at HAND-OFF, so every way a
+    consolidation fails to finish must return them to the pool — otherwise the
+    batch is stranded forever: never distilled, never re-exported."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        cfg = Config(root=Path(self.tmp.name))
+        cfg.db_path = Path(self.tmp.name) / "t.db"
+        from dispatcher.service import Service
+        self.svc = Service(cfg)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _consolidation_task(self):
+        eids = [self.svc.db.add_episode(None, "voice", "quick", None, "done",
+                                        f"q{i}", f"a{i}") for i in range(3)]
+        self.svc.db.mark_episodes_consolidated(eids)
+        task = self.svc.db.create_task(
+            "consolidate", "timer", "agentic", None,
+            {"task_type": "memory-consolidate", "episode_ids": eids})
+        return task, eids
+
+    def _unconsolidated(self):
+        return {e["id"] for e in self.svc.db.unconsolidated_episodes(50)}
+
+    async def test_a_crash_returns_the_episodes(self):
+        task, eids = self._consolidation_task()
+        self.assertEqual(self._unconsolidated(), set())
+
+        async def boom(_task):
+            raise RuntimeError("kaboom")
+
+        with patch.object(self.svc, "_run_agentic_inner", boom):
+            await self.svc._run_agentic(task)
+        self.assertEqual(self._unconsolidated(), set(eids))
+
+    async def test_a_cancel_returns_the_episodes(self):
+        task, eids = self._consolidation_task()
+
+        async def cancelled(_task):
+            raise asyncio.CancelledError()
+
+        with patch.object(self.svc, "_run_agentic_inner", cancelled):
+            await self.svc._run_agentic(task)
+        self.assertEqual(self._unconsolidated(), set(eids))
+
+    def test_a_restart_mid_run_returns_the_episodes(self):
+        # reconcile_orphans settles the task as failed but has no idea it was
+        # holding episodes; the sweep at Service startup is what closes this.
+        task, eids = self._consolidation_task()
+        self.svc.db.set_task_status(task["id"], "running")
+        from dispatcher.service import Service
+        cfg2 = Config(root=Path(self.tmp.name))
+        cfg2.db_path = self.svc.cfg.db_path
+        svc2 = Service(cfg2)          # simulates the next boot
+        self.assertEqual({e["id"] for e in svc2.db.unconsolidated_episodes(50)},
+                         set(eids))
+
+    async def test_an_ordinary_failed_task_is_untouched(self):
+        eids = [self.svc.db.add_episode(None, "voice", "quick", None, "done",
+                                        "q", "a")]
+        self.svc.db.mark_episodes_consolidated(eids)
+        task = self.svc.db.create_task("do a thing", "api", "agentic", None,
+                                       {"task_type": "summarize"})
+
+        async def boom(_task):
+            raise RuntimeError("kaboom")
+
+        with patch.object(self.svc, "_run_agentic_inner", boom):
+            await self.svc._run_agentic(task)
+        self.assertEqual(self._unconsolidated(), set())
 
 
 class TestTrustBoundaryMetadata(unittest.TestCase):
