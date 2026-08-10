@@ -188,7 +188,17 @@ MIGRATIONS = [
     "ALTER TABLE runs ADD COLUMN ttft_ms REAL",
     "ALTER TABLE runs ADD COLUMN itl_p95_ms REAL",
     "ALTER TABLE runs ADD COLUMN tokens_per_s REAL",
+    # When this fact was last shown to a model as an invalidation candidate.
+    # NULL = never offered, which is where every pre-2026-08-10 fact starts —
+    # additive and nullable, so an existing db needs nothing but the ALTER.
+    "ALTER TABLE kg_facts ADD COLUMN last_offered_at TEXT",
 ]
+
+# Share of a candidate window reserved for the NEWEST active facts. Today's
+# episodes usually contradict something recent, so that half keeps the old
+# id-DESC behaviour; the other half rotates oldest-offered-first so no fact is
+# immortal (see candidate_facts).
+CANDIDATE_RECENT_SHARE = 0.5
 
 # Vector mirrors (Phase J1, sqlite-vec): rowid == the entries/episodes id, so
 # deletion is a rowid DELETE and KNN results join straight back. 384 dims =
@@ -313,6 +323,31 @@ class Database:
                 "UPDATE tasks SET status='failed' WHERE status IN ('queued','running')"
             )
             return cur.rowcount
+
+    def orphaned_consolidation_episode_ids(self) -> list[int]:
+        """Episode ids held by consolidation tasks that never settled 'done'.
+
+        Episodes are marked consolidated at hand-off, so a consolidation
+        interrupted by a restart (suspend at 02:30, a crash, a kill) strands
+        that whole batch: it is neither distilled nor eligible for the next
+        pass, and the only trace is an export file nobody is prompted to
+        replay. Read AFTER reconcile_orphans has settled those tasks as
+        failed, so this is "every consolidation that did not finish", not just
+        the ones from this boot. Cheap: consolidation tasks are one a night.
+        """
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT metadata FROM tasks"
+                " WHERE json_extract(metadata,'$.task_type')='memory-consolidate'"
+                "   AND status!='done'"
+            ).fetchall()
+        ids: list[int] = []
+        for r in rows:
+            try:
+                ids.extend(json.loads(r["metadata"]).get("episode_ids") or [])
+            except (TypeError, ValueError):
+                continue
+        return ids
 
     def get_task(self, task_id: str) -> dict | None:
         with self._conn() as c:
@@ -629,9 +664,35 @@ class Database:
                 "SELECT name FROM kg_entities ORDER BY id LIMIT ?",
                 (limit,)).fetchall()]
 
+    def active_fact_id(self, fact: str) -> int | None:
+        """Id of an ACTIVE fact with exactly this text, if one exists.
+
+        Deliberately only active: an invalidated fact that later becomes true
+        again is a legitimate new row, and resurrecting it would lose the
+        bi-temporal history invalidation exists to keep."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT id FROM kg_facts WHERE fact=? AND invalid_at IS NULL"
+                " ORDER BY id LIMIT 1", (fact,)).fetchone()
+            return row["id"] if row else None
+
     def add_fact(self, fact: str, entity_names: list[str],
                  valid_at: str | None = None,
                  episode_ids: list[int] | None = None) -> int:
+        # Exact-text duplicates of a still-ACTIVE fact are rejected, returning
+        # the existing id and writing nothing (2026-08-10). The insert used to be
+        # unconditional, and the graph has a standing way to see the same
+        # episodes twice: /memory/consolidate marks the batch, spawns the
+        # consolidation agent AND graph extraction over it, and a FAILED
+        # consolidation calls mark_episodes_unconsolidated (the M6 fix) — which
+        # returns episodes the extractor has already read. The next nightly pass
+        # re-extracts them and, without this, permanently duplicated that night's
+        # facts, one copy per retry, none of which the reconcile window may ever
+        # reach. Cheap guard: a few hundred rows, no index needed.
+        existing = self.active_fact_id(fact)
+        if existing is not None:
+            log.debug("kg: duplicate active fact, not re-added: %r", fact[:80])
+            return existing
         # one transaction: fact + FTS row + entity upserts + links commit or roll
         # back together, so an error partway can't leave a fact with no FTS index
         # or dangling half its entity links (L1).
@@ -662,11 +723,72 @@ class Database:
             return cur.rowcount
 
     def active_facts(self, limit: int = 80) -> list[dict]:
+        """Newest-first active facts. Used for counting and display; the
+        invalidation candidate window is candidate_facts()."""
         with self._conn() as c:
             return [dict(r) for r in c.execute(
                 "SELECT id, fact, valid_at FROM kg_facts"
                 " WHERE invalid_at IS NULL ORDER BY id DESC LIMIT ?",
                 (limit,)).fetchall()]
+
+    def candidate_facts(self, limit: int = 80,
+                        recent: int | None = None) -> list[dict]:
+        """Active facts to offer a model as invalidation candidates.
+
+        Was `ORDER BY id DESC LIMIT ?`, which made every fact outside the newest
+        80 (extraction) / 200 (reconcile) IMMORTAL once the graph outgrew that
+        window: invalidation is the only removal mechanism ("never deletes"), so
+        a contradicted old fact was never shown to either pass again and kept
+        ranking in /memory/search?scope=graph forever (2026-08-10).
+
+        Half the window still goes to the newest facts — today's episodes
+        usually contradict something recent — and the rest rotates
+        oldest-offered-first (NULL = never offered sorts first), so every active
+        fact comes up eventually. On the existing db every row starts NULL, so
+        the first passes see the OLDEST facts, which is the backlog.
+
+        Must stay DETERMINISTIC between calls: service.py derives the allowed-id
+        set and builds the prompt in two separate calls, and if they disagreed
+        the model's verdict on a fact it was shown would be silently dropped by
+        the anti-wipe guard. Marking is therefore a separate step
+        (mark_facts_offered), done at apply time."""
+        if limit <= 0:
+            return []
+        if recent is None:
+            recent = max(1, int(limit * CANDIDATE_RECENT_SHARE))
+        recent = min(recent, limit)
+        with self._conn() as c:
+            rows = [dict(r) for r in c.execute(
+                "SELECT id, fact, valid_at FROM kg_facts"
+                " WHERE invalid_at IS NULL ORDER BY id DESC LIMIT ?",
+                (recent,)).fetchall()]
+            have = {r["id"] for r in rows}
+            if len(rows) < limit:
+                for r in c.execute(
+                    "SELECT id, fact, valid_at FROM kg_facts"
+                    " WHERE invalid_at IS NULL"
+                    " ORDER BY last_offered_at IS NOT NULL, last_offered_at,"
+                    "          id LIMIT ?", (limit + recent,)).fetchall():
+                    if r["id"] in have:
+                        continue
+                    rows.append(dict(r))
+                    have.add(r["id"])
+                    if len(rows) >= limit:
+                        break
+        return rows
+
+    def mark_facts_offered(self, ids) -> int:
+        """Stamp facts as shown to a model, which is what rotates the window in
+        candidate_facts. Called on apply, not on selection — see there."""
+        ids = list(ids or [])
+        if not ids:
+            return 0
+        ts = now()
+        with self._conn() as c:
+            cur = c.executemany(
+                "UPDATE kg_facts SET last_offered_at=? WHERE id=?",
+                [(ts, i) for i in ids])
+            return cur.rowcount
 
     def search_facts(self, q: str, limit: int = 10,
                      include_invalid: bool = False) -> list[dict]:
@@ -859,6 +981,27 @@ class Database:
             f"SELECT rowid FROM {table} WHERE embedding MATCH ? AND k = ?"
             " ORDER BY distance", (qvec, k)).fetchall()]
 
+    # Fused rank position → row, walked until `limit` LIVE rows are collected.
+    # Both hybrid searches used to slice order[:limit] BEFORE fetching the
+    # backing rows and then drop ids whose row had vanished, so every orphan
+    # vector (a row deleted while vec_ok was False, the L3 window that
+    # sweep_orphan_vectors exists to close) silently ate a result slot: the
+    # caller asked for 10 and got 8, with nothing logged and the next-best real
+    # hits still sitting in `order`. Walk instead of slice (2026-08-10).
+    def _fuse(self, c, order, scores, by_id, limit, sql):
+        out = []
+        for i in order:
+            if len(out) >= limit:
+                break
+            row = by_id.get(i)
+            if row is None:
+                fetched = c.execute(sql, (i,)).fetchone()
+                if not fetched:
+                    continue        # orphan vector: skip it, don't spend a slot
+                row = dict(fetched)
+            out.append({**row, "rrf": round(scores[i], 5)})
+        return out
+
     def search_entries_hybrid(self, q: str, qvec: bytes | None,
                               limit: int = 10) -> list[dict]:
         """FTS BM25 + vector KNN fused with RRF; degrades to FTS-only when
@@ -869,16 +1012,10 @@ class Database:
         with self._conn() as c:
             knn_ids = self._knn(c, "entries_vec", qvec, 40)
             order, scores = _rrf([[r["id"] for r in fts], knn_ids])
-            by_id = {r["id"]: dict(r) for r in fts}
-            for eid in order[:limit]:
-                if eid not in by_id:
-                    row = c.execute(
-                        "SELECT id, file_path, heading, line_no, raw"
-                        " FROM entries WHERE id=?", (eid,)).fetchone()
-                    if row:
-                        by_id[eid] = dict(row)
-        return [{**by_id[i], "rrf": round(scores[i], 5)}
-                for i in order[:limit] if i in by_id]
+            return self._fuse(
+                c, order, scores, {r["id"]: dict(r) for r in fts}, limit,
+                "SELECT id, file_path, heading, line_no, raw"
+                " FROM entries WHERE id=?")
 
     def search_episodes_hybrid(self, q: str, qvec: bytes | None,
                                limit: int = 10) -> list[dict]:
@@ -888,17 +1025,10 @@ class Database:
         with self._conn() as c:
             knn_ids = self._knn(c, "episodes_vec", qvec, 40)
             order, scores = _rrf([[r["id"] for r in fts], knn_ids])
-            by_id = {r["id"]: dict(r) for r in fts}
-            for eid in order[:limit]:
-                if eid not in by_id:
-                    row = c.execute(
-                        "SELECT id, task_id, source, kind, area, status,"
-                        " user_text, assistant_text, valid_at FROM episodes"
-                        " WHERE id=?", (eid,)).fetchone()
-                    if row:
-                        by_id[eid] = dict(row)
-        return [{**by_id[i], "rrf": round(scores[i], 5)}
-                for i in order[:limit] if i in by_id]
+            return self._fuse(
+                c, order, scores, {r["id"]: dict(r) for r in fts}, limit,
+                "SELECT id, task_id, source, kind, area, status,"
+                " user_text, assistant_text, valid_at FROM episodes WHERE id=?")
 
     def search_entries(self, q: str, limit: int = 10,
                        file_like: str | None = None,

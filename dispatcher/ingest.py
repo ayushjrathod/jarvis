@@ -366,7 +366,17 @@ def ingest_vault(db: Database, root: Path, dirs: list[str]) -> dict:
                 chunks = chunker(rel, p)
                 added, deleted = db.replace_file_entries(rel, mtime, chunks)
             except DepMissing:
-                seen.discard(rel)
+                # `rel` deliberately STAYS in `seen`: a missing parser dep is a
+                # statement about this process, not about the file, so the prune
+                # pass below must not treat it as "gone from disk". Discarding it
+                # here (until 2026-08-10) meant an already-good index was DELETED
+                # the first time a dep broke — index a PDF, let rapidocr fail to
+                # import after an onnxruntime upgrade, touch the file, and the
+                # walk reported {'deleted': 1, 'dep_gated': 1} and every OCR'd
+                # document silently left search. The sibling OSError/Exception
+                # handlers never discarded, and the module docstring promises we
+                # "degrade back to dep_gated counting" — this is that promise.
+                # The stat adjustments stay: nothing was scanned, one was gated.
                 stats["files_scanned"] -= 1
                 stats["dep_gated"] += 1
                 gated_names.append(rel)

@@ -31,21 +31,26 @@ def _is_privileged_tool(tool: str) -> bool:
     return False
 
 
-def _sanitize_tools(tools: list, area_name: str, privileged: set) -> list:
+def _sanitize_tools(tools: list, dir_name: str, privileged: set) -> list:
     """Strip privilege-escalating grants (Bash, unscoped Edit/Write) from a
     loaded area's tool list unless the area is config-blessed (H2). SKILL.md
     frontmatter is the privilege manifest, and a reflection/learn run editing
     areas/** could be prompt-injected into writing Bash into it — load-time
     validation makes such a grant inert. Non-string entries pass through
-    untouched (same tolerance as trigger parsing)."""
-    if not tools or area_name in privileged:
+    untouched (same tolerance as trigger parsing).
+
+    `dir_name` is the area's DIRECTORY name, never the frontmatter's `name:` —
+    the operator blesses a directory in security.privileged_areas, and the
+    frontmatter lives inside the very file whose grants are being checked
+    (see _parse_skill, 2026-08-10)."""
+    if not tools or dir_name in privileged:
         return tools
     safe = []
     for t in tools:
         if isinstance(t, str) and _is_privileged_tool(t):
             log.warning("area %r: stripped privileged tool grant %r at load "
                         "(add %r to security.privileged_areas to allow it)",
-                        area_name, t, area_name)
+                        dir_name, t, dir_name)
             continue
         safe.append(t)
     return safe
@@ -91,31 +96,53 @@ class Area:
 
 
 def _parse_skill(path: Path, privileged: set = frozenset()) -> Area | None:
-    text = path.read_text()
-    meta, body = {}, text
-    if text.startswith("---"):
-        parts = text.split("---", 2)
-        if len(parts) == 3:
-            try:
+    # The whole parse is guarded, not just the YAML: load() runs on EVERY
+    # POST /task (match() → Service.route(), re-read from disk, uncached), and
+    # nothing on that path catches. So one SKILL.md that is unreadable
+    # (PermissionError) or not valid UTF-8 (UnicodeDecodeError) used to 500
+    # every single dispatch — no attacker needed, since reflection and learn
+    # runs write these files and an interrupted write is enough. One bad area
+    # now drops out exactly like bad frontmatter already did (2026-08-10).
+    try:
+        text = path.read_text()
+        meta, body = {}, text
+        if text.startswith("---"):
+            parts = text.split("---", 2)
+            if len(parts) == 3:
                 meta = yaml.safe_load(parts[1]) or {}
-            except yaml.YAMLError:
-                log.warning("bad frontmatter in %s", path)
-                return None
-            body = parts[2].strip()
+                body = parts[2].strip()
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
+        log.warning("skipping unreadable area skill %s: %s", path, e)
+        return None
+    if not isinstance(meta, dict):  # `---\n- a\n---` parses to a list
+        log.warning("skipping area skill %s: frontmatter is not a mapping", path)
+        return None
+
     def phrases(key):
         # tolerate hand-edited frontmatter: drop empty/non-string entries
         # rather than letting one of them 500 every /task at match time
         return [t.lower() for t in meta.get(key) or [] if isinstance(t, str) and t.strip()]
 
-    name = meta.get("name", path.parent.name)
+    # Two different names on purpose. `name` is the display/routing key the
+    # frontmatter chooses; the privilege decision keys on the DIRECTORY, which
+    # is what the operator actually blessed in security.privileged_areas. They
+    # used to be the same value, so `areas/notes-helper/SKILL.md` declaring
+    # `name: tasks` inherited whatever "tasks" was blessed for — a manifest
+    # granting itself privilege from inside the file being validated, which is
+    # exactly the escalation H2 exists to stop (2026-08-10).
+    dir_name = path.parent.name
+    name = meta.get("name", dir_name)
+    if not isinstance(name, str) or not name.strip():
+        name = dir_name   # a non-string name would become a bogus telemetry key
     return Area(
         name=name,
         path=path.parent,
         triggers=phrases("triggers"),
         quick_triggers=phrases("quick_triggers"),
-        allowed_tools=_sanitize_tools(meta.get("allowed_tools", []), name, privileged),
+        allowed_tools=_sanitize_tools(meta.get("allowed_tools", []), dir_name,
+                                      privileged),
         quick_allowed_tools=_sanitize_tools(
-            meta.get("quick_allowed_tools", []), name, privileged),
+            meta.get("quick_allowed_tools", []), dir_name, privileged),
         skill_body=body,
     )
 
@@ -175,6 +202,10 @@ class AreaRegistry:
         tools = meta.get("allowed_tools")
         if not isinstance(tools, list) or not tools:
             return None
+        # `area_name` here IS the directory name — it was just used to build the
+        # path we read — so the privilege key is already the operator-blessed
+        # one, unlike the frontmatter `name:` _parse_skill used to pass
+        # (checked 2026-08-10 while fixing that).
         return _sanitize_tools(tools, area_name, self.privileged)
 
     def match(self, text: str) -> tuple[Area | None, str | None]:

@@ -23,6 +23,7 @@ import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from .areas import AreaRegistry
 from .config import Config
 from .db import Database
 
@@ -51,8 +52,20 @@ def run(db: Database, cfg: Config) -> dict:
     now = datetime.now(timezone.utc)
 
     areas_dir = cfg.root / "areas"
-    on_disk = {d.name for d in areas_dir.iterdir()
-               if d.is_dir() and not d.name.startswith(".")} if areas_dir.is_dir() else set()
+    # Ages the SKILL name, not the directory name (2026-08-10). Telemetry is
+    # keyed on Area.name (service.py calls record_skill_use(task["area"]), and
+    # task["area"] is the frontmatter name), while this pass used to key on
+    # areas_dir.iterdir() — so any area whose frontmatter renames it, which the
+    # learn area's own SKILL.md actively invites ("lowercase-hyphenated,
+    # class-level"), aged under a name no usage row ever matched: a daily-driven
+    # areas/expenses declaring `name: expense-tracking` got a fresh clock, went
+    # stale at 30d and was MOVED to areas/.archive/ at 120d, while its real row
+    # never aged at all. AreaRegistry is the one place that knows both, so use
+    # area.name as the telemetry key and area.path for the move. Side effect,
+    # and the safe direction: a directory the registry can't parse is invisible
+    # here, so a broken SKILL.md defers archiving rather than causing it.
+    registry = AreaRegistry(areas_dir, privileged_areas=cfg.privileged_areas)
+    on_disk = registry.load()
     usage = {u["name"]: u for u in db.skill_usage_all()}
 
     report = {"stale": [], "archived": [], "skipped": []}
@@ -77,11 +90,13 @@ def run(db: Database, cfg: Config) -> dict:
             report["stale"].append(name)
         elif state == "stale":
             if idle > stale_after + archive_after:
-                target = areas_dir / ".archive" / name
+                src = on_disk[name].path        # the real directory, not `name`
+                target = areas_dir / ".archive" / src.name
                 target.parent.mkdir(exist_ok=True)
-                shutil.move(str(areas_dir / name), str(target))
+                shutil.move(str(src), str(target))
                 db.set_skill_state(name, "archived")
                 report["archived"].append(name)
-                log.warning("curator: archived area %s -> %s", name, target)
+                log.warning("curator: archived area %s (%s) -> %s",
+                            name, src.name, target)
             # record_skill_use/patch already flip stale->active on activity
     return report

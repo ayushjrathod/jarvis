@@ -203,5 +203,69 @@ class TestCurator(unittest.TestCase):
         self.assertEqual(AreaRegistry(self.root / "areas").load(), {})
 
 
+class TestCuratorAgesTheSkillNameNotTheDirectory(unittest.TestCase):
+    """The curator must age the name telemetry is recorded under.
+
+    record_skill_use(task["area"]) is called with Area.name — the FRONTMATTER
+    name — while the curator walked areas_dir.iterdir(), i.e. DIRECTORY names.
+    The learn area's own SKILL.md asks for "lowercase-hyphenated, class-level"
+    names, so areas/expenses declaring `name: expense-tracking` is the expected
+    shape, not a corner case. Split like that, usage landed on row
+    'expense-tracking' while the curator saw 'expenses', found no row, started a
+    fresh clock, marked it stale at 30d and MOVED it to areas/.archive/ at
+    120d — deleting a skill invoked daily, while the real row never aged.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.db = Database(self.root / "t.db")
+        self.cfg = make_cfg(self.root)
+        d = self.root / "areas" / "expenses"      # directory
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(              # ...declaring another name
+            "---\nname: expense-tracking\n---\nbody\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_daily_use_keeps_a_renamed_area_alive(self):
+        """The regression, end to end: telemetry as service.py writes it, then
+        the curator run that used to archive the directory anyway."""
+        self.db.record_skill_use("expense-tracking")      # what dispatch records
+        report = curator.run(self.db, self.cfg)
+        self.assertEqual(report["stale"], [])
+        self.assertEqual(report["archived"], [])
+        self.assertTrue((self.root / "areas" / "expenses" / "SKILL.md").exists())
+        # and no phantom row was opened under the directory name
+        self.assertEqual([r["name"] for r in self.db.skill_usage_all()],
+                         ["expense-tracking"])
+
+    def test_ageing_still_happens_under_the_skill_name(self):
+        with self.db._conn() as c:
+            c.execute(
+                "INSERT INTO skill_usage (name, use_count, last_used_at,"
+                " first_seen_at, state) VALUES (?,?,?,?,?)",
+                ("expense-tracking", 1, iso_days_ago(45), iso_days_ago(200),
+                 "active"))
+        report = curator.run(self.db, self.cfg)
+        self.assertEqual(report["stale"], ["expense-tracking"])
+
+    def test_archive_moves_the_real_directory(self):
+        """When a renamed area genuinely is dead, the move must target its
+        directory — areas/<frontmatter name> does not exist."""
+        with self.db._conn() as c:
+            c.execute(
+                "INSERT INTO skill_usage (name, use_count, last_used_at,"
+                " first_seen_at, state) VALUES (?,?,?,?,?)",
+                ("expense-tracking", 1, iso_days_ago(150), iso_days_ago(300),
+                 "stale"))
+        report = curator.run(self.db, self.cfg)
+        self.assertEqual(report["archived"], ["expense-tracking"])
+        self.assertFalse((self.root / "areas" / "expenses").exists())
+        self.assertTrue((self.root / "areas" / ".archive" / "expenses"
+                         / "SKILL.md").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -101,6 +101,63 @@ class TestVecStore(unittest.TestCase):
         self.assertEqual(left, 0)
 
 
+class TestOrphanVectorsDoNotEatResultSlots(unittest.TestCase):
+    """A vec row whose backing entry is gone must not cost the caller a hit.
+
+    Both hybrid searches sliced `order[:limit]` from the RRF fusion BEFORE
+    fetching the backing rows, then dropped ids whose row had vanished — so an
+    orphan vector (an entry deleted while vec_ok was False, the L3 window
+    sweep_orphan_vectors exists to close) silently consumed a result slot: ask
+    for 2, get 1, nothing logged, the next-best real hit still sitting unread
+    in `order`.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.tmp.name) / "t.db")
+        if not self.db.vec_ok:
+            self.skipTest("sqlite-vec unavailable")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _orphan_entries(self):
+        for i, name in enumerate("abc"):
+            _entries(self.db, f"{name}.md", f"note number {i} about things")
+        ids = {r["compiled"].split(".md")[0][-1]: r["id"]
+               for r in self.db.entries_missing_embeddings(10)}
+        self.db.add_entry_embeddings([(ids[n], vec(i))
+                                      for i, n in enumerate("abc")])
+        with self.db._conn() as c:      # entry gone, its vector left behind
+            c.execute("DELETE FROM entries WHERE id=?", (ids["a"],))
+        return ids
+
+    def test_entries_hybrid_still_returns_limit_live_rows(self):
+        self._orphan_entries()
+        # no FTS hits, so ranking is pure KNN and the orphan is nearest
+        out = self.db.search_entries_hybrid("zzz nothing matches", vec(0), limit=2)
+        self.assertEqual(len(out), 2)
+        self.assertEqual({r["file_path"] for r in out}, {"b.md", "c.md"})
+        self.assertTrue(all("rrf" in r for r in out))
+
+    def test_orphan_never_appears_in_results(self):
+        self._orphan_entries()
+        out = self.db.search_entries_hybrid("zzz nothing matches", vec(0), limit=5)
+        self.assertEqual(len(out), 2)          # only two live entries exist
+        self.assertNotIn("a.md", [r.get("file_path") for r in out])
+
+    def test_episodes_hybrid_still_returns_limit_live_rows(self):
+        eids = [self.db.add_episode(f"t{i}", "voice", "quick", None, "done",
+                                    f"episode number {i}", "ok")
+                for i in range(3)]
+        self.db.add_episode_embeddings([(e, vec(i)) for i, e in enumerate(eids)])
+        with self.db._conn() as c:
+            c.execute("DELETE FROM episodes WHERE id=?", (eids[0],))
+        out = self.db.search_episodes_hybrid("zzz nothing matches", vec(0), limit=2)
+        self.assertEqual(len(out), 2)
+        self.assertEqual({r["id"] for r in out}, set(eids[1:]))
+
+
 class TestGraphStore(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -154,6 +211,32 @@ class TestGraphStore(unittest.TestCase):
         counts = self.db.graph_counts()
         self.assertEqual(counts["facts_active"], 0)
         self.assertFalse(self.db.search_facts("Half-written"))
+
+    def test_duplicate_active_fact_is_not_re_added(self):
+        """add_fact was an unconditional INSERT, and the graph has a standing
+        way to see the same episodes twice: /memory/consolidate marks a batch,
+        spawns BOTH the consolidation agent and graph extraction over it, and a
+        failed consolidation calls mark_episodes_unconsolidated (the M6 fix) —
+        returning to the pool episodes the extractor already read. The next
+        nightly pass re-extracted them and permanently duplicated that night's
+        facts, one copy per retry."""
+        first = self.db.add_fact("Ayra prefers Neovim.", ["Ayra", "Neovim"])
+        again = self.db.add_fact("Ayra prefers Neovim.", ["Ayra"])
+        self.assertEqual(again, first)                   # same row, no insert
+        self.assertEqual(self.db.graph_counts()["facts_active"], 1)
+        self.assertEqual(len(self.db.search_facts("Neovim")), 1)
+
+    def test_dedup_does_not_resurrect_an_invalidated_fact(self):
+        """Only ACTIVE duplicates are rejected: a fact that stopped being true
+        and later becomes true again is a legitimate new row, and reusing the
+        old one would erase the bi-temporal history."""
+        first = self.db.add_fact("Ayra lives in Pune.", ["Ayra"])
+        self.db.invalidate_facts([first])
+        second = self.db.add_fact("Ayra lives in Pune.", ["Ayra"])
+        self.assertNotEqual(second, first)
+        counts = self.db.graph_counts()
+        self.assertEqual((counts["facts_active"], counts["facts_invalidated"]),
+                         (1, 1))
 
     def test_busy_timeout_pragma_applied(self):
         # M3: every connection gets a generous busy_timeout so WAL contention
@@ -259,6 +342,204 @@ class TestApplyExtraction(unittest.TestCase):
         self.assertIn("Ayra", p)
         r = graph.reconcile_prompt(self.db, "2026-07-19")
         self.assertIn("Existing fact.", r)
+
+    def test_re_extraction_of_the_same_batch_does_not_duplicate(self):
+        """The rolled-back-consolidation path, end to end: the identical
+        extraction reply applied twice must leave one fact, and say so."""
+        reply = {"facts": [{"fact": "Ayra runs Arch Linux.",
+                            "entities": ["Ayra", "Arch Linux"]}]}
+        first = graph.apply_extraction(self.db, dict(reply), episode_ids=[1, 2])
+        second = graph.apply_extraction(self.db, dict(reply), episode_ids=[1, 2])
+        self.assertEqual(first["facts_added"], 1)
+        self.assertEqual(second["facts_added"], 0)
+        self.assertEqual(second["duplicates_skipped"], 1)
+        self.assertEqual(self.db.graph_counts()["facts_active"], 1)
+
+    def test_unparseable_valid_at_is_dropped_not_stored(self):
+        """`str(valid_at)[:10]` stored whatever the model said, so a reply of
+        "valid_at": "yesterday" came back out of reconcile_prompt as
+        "· since yesterday" — an undated fact rendered as dated, into the prompt
+        that decides what to invalidate."""
+        graph.apply_extraction(self.db, {"facts": [
+            {"fact": "Ayra started the rewrite.", "entities": ["Ayra"],
+             "valid_at": "yesterday"},
+            {"fact": "Ayra bought a keyboard.", "entities": ["Ayra"],
+             "valid_at": "2026-08-09"},
+            {"fact": "Ayra adopted a cat.", "entities": ["Ayra"],
+             "valid_at": "2026-13-45"},        # well-formed but not a date
+        ]}, episode_ids=[1])
+        by_fact = {f["fact"]: f["valid_at"] for f in self.db.active_facts()}
+        self.assertIsNone(by_fact["Ayra started the rewrite."])
+        self.assertIsNone(by_fact["Ayra adopted a cat."])
+        self.assertEqual(by_fact["Ayra bought a keyboard."], "2026-08-09")
+        # and the junk never reaches the next prompt
+        r = graph.reconcile_prompt(self.db, "2026-08-10")
+        self.assertNotIn("yesterday", r)
+        self.assertIn("· since ?", r)
+
+    def test_valid_at_keeps_the_date_from_a_timestamp(self):
+        graph.apply_extraction(self.db, {"facts": [
+            {"fact": "Dated fact.", "entities": ["X"],
+             "valid_at": "2026-08-09T14:30:00Z"}]}, episode_ids=[1])
+        self.assertEqual(self.db.active_facts()[0]["valid_at"], "2026-08-09")
+
+
+class TestCandidateWindowRotates(unittest.TestCase):
+    """Every active fact must eventually become an invalidation candidate.
+
+    The window was `ORDER BY id DESC LIMIT ?`, so once the graph held more than
+    80 (extraction) / 200 (reconcile) active facts, everything older was
+    IMMORTAL: neither pass was ever shown it again, and invalidation is the only
+    removal mechanism ("never deletes"), so a contradicted old fact kept ranking
+    in /memory/search?scope=graph forever.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.tmp.name) / "t.db")
+        self.ids = [self.db.add_fact(f"Durable fact number {i}.", ["X"])
+                    for i in range(1, 7)]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_every_fact_is_eventually_offered(self):
+        """The regression: with a window of 2 over 6 facts, the old query
+        returned the same two ids forever."""
+        offered = set()
+        for _ in range(6):
+            window = graph.candidate_ids(self.db, limit=2)
+            offered |= window
+            # what the real path does once the window has been used
+            graph.apply_extraction(self.db, {}, episode_ids=[],
+                                   allowed_ids=window)
+        self.assertEqual(offered, set(self.ids))
+
+    def test_newest_facts_stay_in_the_window(self):
+        """Half the window is still reserved for recent facts — today's
+        episodes usually contradict something recent."""
+        for _ in range(4):
+            window = graph.candidate_ids(self.db, limit=2)
+            self.assertIn(self.ids[-1], window)
+            self.db.mark_facts_offered(window)
+
+    def test_oldest_offered_comes_back_first(self):
+        stamps = ["2026-08-09T00:00:00+0000", "2026-08-06T00:00:00+0000",
+                  "2026-08-08T00:00:00+0000", "2026-08-07T00:00:00+0000"]
+        with self.db._conn() as c:
+            for fid, ts in zip(self.ids, stamps):
+                c.execute("UPDATE kg_facts SET last_offered_at=? WHERE id=?",
+                          (ts, fid))
+        # recent=0 isolates the rotating half
+        rotating = self.db.candidate_facts(limit=2, recent=0)
+        self.assertEqual([f["id"] for f in rotating],
+                         [self.ids[4], self.ids[5]])   # never offered (NULL) first
+        rotating = self.db.candidate_facts(limit=4, recent=0)
+        self.assertEqual([f["id"] for f in rotating][2:],
+                         [self.ids[1], self.ids[3]])   # then 08-06, then 08-07
+
+    def test_selection_is_stable_between_calls(self):
+        """service.py derives allowed_ids and builds the prompt in two separate
+        calls. If they disagreed, the model's verdict on a fact it WAS shown
+        would be silently dropped by the anti-wipe guard."""
+        a = graph.candidate_ids(self.db, limit=3)
+        b = {f["id"] for f in self.db.candidate_facts(limit=3)}
+        self.assertEqual(a, b)
+
+    def test_rotation_never_offers_an_invalidated_fact(self):
+        self.db.invalidate_facts(self.ids[:3])
+        offered = set()
+        for _ in range(6):
+            window = graph.candidate_ids(self.db, limit=2)
+            offered |= window
+            self.db.mark_facts_offered(window)
+        self.assertEqual(offered, set(self.ids[3:]))
+
+    def test_anti_wipe_guard_still_holds_over_a_rotated_window(self):
+        """H3 must survive the rotation: an apply may still only invalidate ids
+        it was actually shown."""
+        window = graph.candidate_ids(self.db, limit=2)
+        counts = graph.apply_extraction(
+            self.db, {"invalidated_ids": list(range(1, 500))},
+            episode_ids=[1], allowed_ids=window)
+        self.assertEqual(counts["invalidated"], 2)
+        self.assertEqual(self.db.graph_counts()["facts_active"], 4)
+
+
+class TestEpisodeClipping(unittest.TestCase):
+    """Graph extraction clipped the export at 12000 chars with a bare slice —
+    silent, mid-sentence, and dropping the TAIL, i.e. the NEWEST episodes (the
+    export is ordered by id). All 200 exported episodes are marked consolidated
+    either way, so on a busy day the newest ones never reached the graph and
+    never would."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.tmp.name) / "t.db")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _export(self, n: int, body_chars: int) -> str:
+        parts = ["# Episode export — 2026-08-10T02:30:00+0000", ""]
+        for i in range(1, n + 1):
+            parts += [f"## Episode {i} — 2026-08-10 · voice · quick · done",
+                      f"**User:** marker{i} " + "x" * body_chars, ""]
+        return "\n".join(parts)
+
+    def test_under_budget_is_untouched(self):
+        text = self._export(3, 50)
+        self.assertEqual(graph.clip_episodes(text, 100000), text)
+
+    def test_keeps_the_newest_episodes_not_the_oldest(self):
+        text = self._export(10, 400)
+        out = graph.clip_episodes(text, 1500)
+        self.assertLessEqual(len(out), 1500)
+        self.assertIn("marker10", out)       # the newest survived
+        self.assertNotIn("marker1 ", out)    # the oldest did not
+
+    def test_clips_on_whole_episode_boundaries(self):
+        out = graph.clip_episodes(self._export(10, 400), 1500)
+        blocks = out.split("## Episode ")[1:]
+        self.assertTrue(blocks)
+        for b in blocks:                     # no half-parsed episode survives
+            self.assertIn("**User:** marker", b)
+
+    def test_the_clip_is_announced_in_band_and_logged(self):
+        with self.assertLogs("dispatcher.graph", level="WARNING") as cm:
+            out = graph.clip_episodes(self._export(10, 400), 1500)
+        self.assertIn("older episode(s) omitted", out)
+        self.assertTrue(any("over the" in m for m in cm.output))
+
+    def test_result_never_exceeds_the_budget(self):
+        for budget in (400, 900, 1500, 3000):
+            with self.subTest(budget=budget):
+                with self.assertLogs("dispatcher.graph", level="WARNING"):
+                    out = graph.clip_episodes(self._export(10, 400), budget)
+                self.assertLessEqual(len(out), budget)
+
+    def test_a_single_oversized_episode_is_truncated_not_dropped(self):
+        """Handing the extractor an empty <episodes> block would be worse than
+        a truncated one."""
+        with self.assertLogs("dispatcher.graph", level="WARNING"):
+            out = graph.clip_episodes(self._export(2, 5000), 900)
+        self.assertLessEqual(len(out), 900)
+        self.assertIn("marker2", out)          # the newest, truncated
+        self.assertNotIn("marker1 ", out)
+
+    def test_unrecognized_shape_still_keeps_the_recent_end(self):
+        text = "oldest marker\n" + "y" * 5000 + "\nnewest marker"
+        with self.assertLogs("dispatcher.graph", level="WARNING"):
+            out = graph.clip_episodes(text, 200)
+        self.assertIn("newest marker", out)
+        self.assertNotIn("oldest marker", out)
+
+    def test_extraction_prompt_applies_the_clip(self):
+        with self.assertLogs("dispatcher.graph", level="WARNING"):
+            p = graph.extraction_prompt(self.db, self._export(60, 400),
+                                        "2026-08-10")
+        self.assertIn("marker60", p)
+        self.assertIn("older episode(s) omitted", p)
 
 
 if __name__ == "__main__":

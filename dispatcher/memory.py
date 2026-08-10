@@ -139,6 +139,26 @@ def should_capture(cfg: Config, task: dict, status: str) -> bool:
     return meta.get("task_type") not in INTERNAL_TASK_TYPES
 
 
+def _write_new(path: Path, text: str, tries: int = 50) -> Path:
+    """Write `text` to `path`, or to `<stem>-N<suffix>` if that name is taken.
+    Returns the path actually written. Exclusive-create ("x") rather than
+    exists()-then-write, so concurrent callers can't both pick the same name."""
+    for n in range(tries):
+        p = path if n == 0 else path.with_name(f"{path.stem}-{n}{path.suffix}")
+        try:
+            with open(p, "x") as fh:
+                fh.write(text)
+            return p
+        except FileExistsError:
+            continue
+    # 50 exports in one second is not a real workload; overwrite rather than
+    # fail the consolidation outright.
+    log.warning("consolidation export: %d collisions on %s; overwriting",
+                tries, path)
+    path.write_text(text)
+    return path
+
+
 def build_consolidation(cfg: Config, db: Database) -> dict | None:
     """Export unconsolidated episodes to data/consolidation/<ts>.md and build
     the agent task from areas/memory/agents/consolidate.md. Returns None when
@@ -161,7 +181,14 @@ def build_consolidation(cfg: Config, db: Database) -> dict | None:
         lines += [head, f"**User:** {e['user_text']}", ""]
         if e.get("assistant_text"):
             lines += [f"**Jarvis:** {e['assistant_text']}", ""]
-    export.write_text("\n".join(lines))
+    # Exclusive create, uniquified on collision (2026-08-10). `stamp` has
+    # one-second resolution and write_text overwrites, so two /memory/consolidate
+    # calls landing in the same second both built a job and the second export
+    # CLOBBERED the first — destroying the only replay artefact a failed
+    # consolidation has, for the batch that most needed it. "x" makes the loser
+    # of the race take the next name instead of the winner's file; there is no
+    # check-then-write gap to lose.
+    export = _write_new(export, "\n".join(lines))
 
     prompt_path = cfg.root / "areas" / "memory" / "agents" / "consolidate.md"
     text = prompt_path.read_text()

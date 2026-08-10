@@ -1,6 +1,7 @@
 """Phase C unit tests: area registry parsing + trigger routing (uses the real
 areas/tasks/SKILL.md so the shipped frontmatter stays valid)."""
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -125,12 +126,139 @@ class TestFrontmatterToolValidation(unittest.TestCase):
         # quick tools are validated the same way
         self.assertEqual(area.quick_allowed_tools, ["Read"])
 
-    def test_privileged_area_keeps_bash(self):
+    def test_privileged_area_keyed_on_the_directory_the_operator_blessed(self):
+        """Blessing is per DIRECTORY, so the directory name is what unlocks it."""
         area = AreaRegistry(self.root, privileged_areas=["risky"]).load()["risky"]
         self.assertIn("Bash", area.allowed_tools)
         self.assertIn("Edit", area.allowed_tools)
         self.assertIn("Bash(ls:*)", area.allowed_tools)
         self.assertIn("Bash", area.quick_allowed_tools)
+
+
+class TestPrivilegeKeysOnTheDirectory(unittest.TestCase):
+    """H2: the privilege check must NOT key on the frontmatter `name:`, which
+    lives in the very file whose grants are being validated.
+
+    A reflection/learn run holds Edit(areas/**). If the check read `name:`, such
+    a run could create areas/notes-helper/SKILL.md declaring `name: tasks` plus
+    `- Bash` and inherit whatever the operator blessed for the real "tasks"
+    directory — a manifest granting itself privilege. Inert while
+    security.privileged_areas is empty, but the config documents adding entries
+    to it as supported, and on that day it stops being a boundary.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _area(self, dirname: str, declared: str):
+        d = self.root / dirname
+        d.mkdir()
+        (d / "SKILL.md").write_text(
+            f"---\nname: {declared}\nallowed_tools:\n"
+            f"  - Bash\n  - Read\n---\nbody\n")
+
+    def test_impostor_cannot_borrow_a_blessed_name(self):
+        # what a prompt-injected reflection run would write: a new area whose
+        # frontmatter claims the blessed area's name, plus Bash
+        self._area("notes-helper", declared="tasks")
+        area = AreaRegistry(self.root, privileged_areas=["tasks"]).load()["tasks"]
+        self.assertEqual(area.path.name, "notes-helper")   # unblessed directory
+        self.assertNotIn("Bash", area.allowed_tools)
+        self.assertEqual(area.allowed_tools, ["Read"])
+
+    def test_the_real_blessed_directory_still_keeps_bash(self):
+        self._area("tasks", declared="tasks")
+        area = AreaRegistry(self.root, privileged_areas=["tasks"]).load()["tasks"]
+        self.assertIn("Bash", area.allowed_tools)
+
+    def test_renamed_area_is_not_privileged_by_its_directory_either(self):
+        """The converse: blessing the frontmatter name must not leak in. Only
+        `security.privileged_areas` naming the DIRECTORY unlocks Bash."""
+        self._area("expenses", declared="expense-tracking")
+        reg = AreaRegistry(self.root, privileged_areas=["expense-tracking"])
+        self.assertNotIn("Bash", reg.load()["expense-tracking"].allowed_tools)
+        reg = AreaRegistry(self.root, privileged_areas=["expenses"])
+        self.assertIn("Bash", reg.load()["expense-tracking"].allowed_tools)
+
+    def test_agent_tools_key_on_the_directory_too(self):
+        """agent_tools resolves areas/<dir>/agents/<agent>.md, so its privilege
+        key is already the directory — pinned so it cannot drift to `name:`."""
+        self._area("notes-helper", declared="tasks")
+        agents = self.root / "notes-helper" / "agents"
+        agents.mkdir(parents=True)
+        (agents / "helper.md").write_text(
+            "---\nallowed_tools:\n  - Bash\n  - Read\n---\nbody\n")
+        reg = AreaRegistry(self.root, privileged_areas=["tasks"])
+        self.assertEqual(reg.agent_tools("notes-helper", "helper"), ["Read"])
+
+
+class TestUnreadableSkillDoesNotBreakDispatch(unittest.TestCase):
+    """One bad SKILL.md used to 500 EVERY POST /task.
+
+    load() runs on every dispatch (match() → Service.route()), re-read from
+    disk with no cache and no try/except anywhere on that path, but only the
+    YAML parse was guarded — read_text() was not. Reflection and learn runs
+    write these files, so a truncated or interrupted write (non-UTF-8 bytes) or
+    a bad mode was enough to take the whole dispatcher down. A broken area must
+    drop out exactly like bad frontmatter already did.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        good = self.root / "tasks"
+        good.mkdir()
+        (good / "SKILL.md").write_text(
+            "---\nname: tasks\ntriggers:\n  - add task\n---\nbody\n")
+        self.reg = AreaRegistry(self.root)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _break(self, name: str, data: bytes):
+        d = self.root / name
+        d.mkdir()
+        (d / "SKILL.md").write_bytes(data)
+
+    def test_non_utf8_skill_is_skipped_not_raised(self):
+        # a half-written file: valid frontmatter start, then raw bytes
+        self._break("broken", b"---\nname: broken\n---\n\xff\xfe not utf-8\n")
+        areas = self.reg.load()
+        self.assertNotIn("broken", areas)
+        self.assertIn("tasks", areas)          # the good area still loads
+
+    def test_dispatch_path_still_routes(self):
+        """The observable outcome: matching still works, which is what
+        Service.route() calls on every single task."""
+        self._break("broken", b"---\nname: broken\n---\n\xff\xfe\n")
+        area, hint = self.reg.match("add a task: renew the domain")
+        self.assertEqual(area.name, "tasks")
+        self.assertEqual(hint, "agentic")
+
+    def test_unreadable_file_is_skipped(self):
+        d = self.root / "locked"
+        d.mkdir()
+        skill = d / "SKILL.md"
+        skill.write_text("---\nname: locked\n---\nbody\n")
+        skill.chmod(0o000)
+        try:
+            if os.access(skill, os.R_OK):
+                self.skipTest("running as root; chmod does not block the read")
+            areas = self.reg.load()
+            self.assertNotIn("locked", areas)
+            self.assertIn("tasks", areas)
+        finally:
+            skill.chmod(0o644)
+
+    def test_list_frontmatter_is_not_a_mapping(self):
+        # valid YAML, wrong shape: meta.get() would AttributeError on a list
+        self._break("listy", b"---\n- a\n- b\n---\nbody\n")
+        self.assertNotIn("listy", self.reg.load())
+        self.assertIsNotNone(self.reg.match("add a task: x")[0])
 
 
 class TestAgentToolResolution(unittest.TestCase):

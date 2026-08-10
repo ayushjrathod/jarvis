@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from dispatcher import ingest, memory
 from dispatcher.config import Config
@@ -147,6 +148,73 @@ class TestIngest(unittest.TestCase):
         ingest.ingest_vault(self.db, self.root, ["vault"])
         hits = self.db.search_entries("shared term", file_like="vault/briefs/*")
         self.assertEqual([h["file_path"] for h in hits], ["vault/briefs/b.md"])
+
+
+class TestDepMissingKeepsTheIndex(unittest.TestCase):
+    """A parser dependency breaking must DEGRADE to counting, never delete a
+    previously-good index.
+
+    The realistic trigger is rapidocr_onnxruntime failing to import after an
+    onnxruntime upgrade: every OCR'd document would silently leave search, and
+    the only visible sign was a `deleted` count in a log nobody reads. The
+    DepMissing handler used to discard the file from the `seen` set that the
+    prune pass treats as "still on disk", so the prune deleted its entries —
+    unlike the sibling OSError/Exception handlers, which never discarded.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / "vault" / "notes").mkdir(parents=True)
+        self.db = Database(self.root / "data" / "test.db")
+        self.doc = self.root / "vault" / "notes" / "scan.md"
+        self.doc.write_text("# Scanned\nthe quarterly invoice total\n")
+        os.utime(self.doc, (1000, 1000))
+        ingest.ingest_vault(self.db, self.root, ["vault"])
+        self.assertEqual(len(self.db.search_entries("quarterly invoice")), 1)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _reindex_with_broken_parser(self):
+        """Touch the file (so it is re-parsed) with its chunker raising."""
+        os.utime(self.doc, (2000, 2000))
+
+        def broken(label, path):
+            raise ingest.DepMissing("rapidocr_onnxruntime not installed")
+
+        original = dict(ingest.CHUNKERS)
+        ingest.CHUNKERS[".md"] = broken
+        try:
+            return ingest.ingest_vault(self.db, self.root, ["vault"])
+        finally:
+            ingest.CHUNKERS.clear()
+            ingest.CHUNKERS.update(original)
+
+    def test_entries_survive_a_missing_dep(self):
+        stats = self._reindex_with_broken_parser()
+        self.assertEqual(stats["dep_gated"], 1)
+        self.assertEqual(stats["deleted"], 0)        # nothing was pruned
+        # the observable outcome: the document is still searchable
+        hits = self.db.search_entries("quarterly invoice")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["file_path"], "vault/notes/scan.md")
+
+    def test_recovers_when_the_dep_comes_back(self):
+        self._reindex_with_broken_parser()
+        self.doc.write_text("# Scanned\nthe quarterly invoice total revised\n")
+        os.utime(self.doc, (3000, 3000))
+        ingest.ingest_vault(self.db, self.root, ["vault"])
+        hits = self.db.search_entries("revised")
+        self.assertEqual(len(hits), 1)
+
+    def test_a_real_deletion_still_prunes(self):
+        """The guard must not make the index un-prunable: a file that is gone
+        from disk is still removed."""
+        self.doc.unlink()
+        stats = ingest.ingest_vault(self.db, self.root, ["vault"])
+        self.assertEqual(stats["deleted"], 1)
+        self.assertEqual(self.db.search_entries("quarterly invoice"), [])
 
 
 class TestEpisodes(unittest.TestCase):
@@ -358,6 +426,31 @@ class TestConsolidation(unittest.TestCase):
         self.assertNotIn("Bash", tools)
         self.assertNotIn("Write", tools)          # unscoped write, also stripped
         self.assertIn("Edit(vault/memory/**)", tools)   # the scoped grant stays
+
+    def test_same_second_exports_do_not_clobber_each_other(self):
+        """The export file is the ONLY replay artefact a failed consolidation
+        has. `stamp` is one-second resolution and write_text overwrites, so two
+        /memory/consolidate calls in the same second used to leave one export
+        holding both batches' name and neither's guaranteed content."""
+        # pin the clock so the collision is certain, not a race the test may lose
+        with mock.patch.object(memory, "now",
+                               return_value="2026-08-10T02:30:00+0000"):
+            self.db.add_episode("t1", "voice", "quick", None, "done",
+                                "first batch marker", "ok")
+            first = memory.build_consolidation(self.cfg, self.db)
+            self.db.mark_episodes_consolidated(first["episode_ids"])
+            self.db.add_episode("t2", "voice", "quick", None, "done",
+                                "second batch marker", "ok")
+            second = memory.build_consolidation(self.cfg, self.db)
+
+        self.assertNotEqual(first["export_path"], second["export_path"])
+        self.assertIn("first batch marker",
+                      (self.root / first["export_path"]).read_text())
+        self.assertIn("second batch marker",
+                      (self.root / second["export_path"]).read_text())
+        # each prompt points at its OWN export, not a shared name
+        self.assertIn(first["export_path"], first["text"])
+        self.assertIn(second["export_path"], second["text"])
 
 
 if __name__ == "__main__":
