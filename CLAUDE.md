@@ -40,7 +40,7 @@ Every working session MUST:
 | — | Messages API backend | **built, then REMOVED 2026-07-27** — user is not funding an API key; subscription CLI only (recoverable at `ce93ea0`) |
 | K2 | Computer-use T2 (AT-SPI) / T3 (browser over CDP) | **not started** — T3 needs no new deps; offered and deferred twice |
 
-_Test count as of 2026-08-08: **550**, `.venv/bin/python -m unittest discover tests`.
+_Test count as of 2026-08-10: **721**, `.venv/bin/python -m unittest discover tests`.
 Acceptance: `scripts/smoke_phase_a.sh` 7/7._
 
 v2 (phases F–J: memory, learning loop, observability, personal OS, graph) is
@@ -445,6 +445,47 @@ before writing from scratch.
   ground. Honoring the key here is safe for the same reason the agentic resolver
   already does: H1 strips it *before* the row is written, so anything still on a
   row came from a server-internal spawn.
+- **The queue watcher claims a file before submitting** (2026-08-10). It used to
+  submit and *then* rename into `.processed`, with the rename inside the same
+  `try` and `OSError` on the transient-retry whitelist — so a rename failure
+  (read-only mount, ENOSPC, permissions, a synced/FUSE queue dir) left the file
+  in place and the next poll ran the whole task **again**, up to
+  `queue_max_retries` times, with real side effects and no log line saying a
+  task had already gone out. Order is now claim (`*.claimed`) → submit → file.
+  Past the submit, nothing may return the file to the queue: a failed *filing*
+  logs loudly and leaves it claimed, because "the task ran but wasn't recorded"
+  is recoverable and "the task ran four times" is not.
+- **A wall-clock timeout is NOT retried** (2026-08-10). `runner.run_once` used to
+  retry it like a spawn error. A run that hits `budgets.timeout_s` was usually
+  working, so the retry re-ran the same prompt with the same write grants over
+  files the first attempt had already edited — and `_attempt` raises before any
+  `result` event, so the timed-out attempt reports no cost/session/steps while
+  sharing the single runs row. Spawn failures stay transient.
+- **A cancel that already landed wins over the subprocess kill's error**
+  (2026-08-10). An HTTP quick task is never in `svc.bg`, so `cancel()` only kills
+  the process — after writing 'cancelled' — and the kill surfaces as `failed` +
+  "claude exited -9", which then overwrote the run row on **every voice
+  barge-in**. The task row was always correct; the run row was not.
+- **Latency columns are only written for a real stream** (2026-08-10). When the
+  CLI emits no incremental text, `quick.py` synthesizes one delta from the final
+  result, so "TTFT" was the whole run duration — sitting in `/stats`
+  quick-latency averages looking like a genuine measurement. `meta["streamed"]`
+  now gates `telemetry.stream_stats`.
+- **Consolidation episodes roll back on every non-`done` path** (2026-08-10):
+  `Service._rollback_episodes` is called from the failed settle, the cancel
+  branch, the outer crash handler, and a startup sweep
+  (`db.orphaned_consolidation_episode_ids`) for a restart mid-run — episodes are
+  marked at hand-off, so any uncovered path stranded that batch forever.
+  `/memory/consolidate` is also serialized now (it was a read-then-mark race:
+  two callers could both claim the same set and both submit an agent run).
+- **The two divert renderers deliberately disagree on one point** (2026-08-10).
+  Both derive status from the executor rather than hardcoding 'done' (the
+  `main.py` renderer didn't until this date, so an unresolved play was reported
+  to the dashboard as a success). But a **parked confirmation** is 'done' over
+  HTTP and 'failed' through `submit()`: over HTTP the caller is present, gets
+  `confirm_id` and answers via the ConfirmBar or by voice, so it is a live
+  interaction; on the queue/automation path nobody is watching that source and
+  the intent simply expires. Tests pin both sides.
 - **Trust boundary (H1/H2)**: metadata from an external source
   (api/queue/voice/ui/screen) can NARROW tools/budget but never WIDEN them —
   `sanitize_untrusted_metadata` drops `allowed_tools`/`resume_session_id` and

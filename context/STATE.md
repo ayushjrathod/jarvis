@@ -1,6 +1,48 @@
 # STATE — read me first each session
 
-_Last updated: 2026-08-08 (session 27, end)_
+_Last updated: 2026-08-10 (session 28, end)_
+
+## Session 28 (2026-08-10): worked the standing list — READ THIS FIRST
+
+User asked to keep going on the remaining review findings, under a hard
+constraint: **no API key, no credits**. Everything is offline — source fixes plus
+LLM-free unit tests. No smoke script, no `claude -p`. Full detail:
+`context/sessions/2026-08-10-1.md`. **Tests 550 → 721, green.**
+
+Five batches (voice, memory, dispatch core, ops, HTTP coverage). The ones that
+would have bitten you soonest:
+
+- **The queue watcher could run a task up to 4×** — it submitted *before* renaming
+  the file into `.processed`, and a rename failure is on the transient-retry
+  whitelist. Now claims the file first.
+- **A wall-clock timeout re-ran the whole agentic task** over files the first
+  attempt had already edited, and lost that attempt's cost entirely from `/stats`.
+- **Every voice barge-in wrote a bogus `failed` run row** ("claude exited -9") over
+  the honest `cancelled`.
+- **A missing parser dep DELETED index rows** — an onnxruntime upgrade breaking
+  rapidocr would have silently removed every OCR'd document from search.
+- **One unreadable `SKILL.md` 500'd every `POST /task`** (areas are re-read on
+  every dispatch, and reflection/learn runs write those files).
+- **Code blocks are no longer read aloud** — a 1029-char block used to produce five
+  chunks of raw `rm -rf` shell.
+- **Timer units had no `TimeoutStartSec`** while reconcile's own retry budget
+  reached ~61 minutes against systemd's 90s default — SIGTERM'd and journaled as
+  failed while the dispatcher kept working.
+- **`tests/test_http.py` (94 tests)** where the HTTP layer had none — and it caught
+  a bug I introduced on 08-08: the divert renderer in `main.py` hardcoded
+  `status: "done"` while `_settle_divert` derived it, so an unresolved play was
+  reported to the dashboard as a success.
+
+**Note:** a `create_app(Config.load('config.yaml'))` sanity check instantiated a
+Service against the **live** `data/mission.db` and wrote to it — returning 4
+episodes stranded by a consolidation that failed on 08-07 to the pool. That is the
+repair the new code exists to do and nothing else was touched (no task was
+queued/running; `/health` fine), but it was unintended; use a temp config for that
+check.
+
+Standing list is now short — see the session log's "Still not done": the `Host`
+header check (needs a live tailnet check first), `graph_extracted_at`, the
+jarvis/dictate restart loop, `Config.brief`, ConfirmBar client-side expiry.
 
 ## Session 27 (2026-08-08): second full review + fixes — READ THIS FIRST
 
