@@ -17,8 +17,23 @@ REFLECTION_TOOLS = ["Read", "Glob", "Grep", "Edit(areas/**)"]
 
 # Task types that must never trigger another reflection (meta-work), on top
 # of the source check ("reflection" tasks are themselves submitted with
-# source="reflection").
+# source="reflection"). This set is NOT configurable: `reflection` in
+# particular is what stops the loop reflecting on its own reflections.
 NO_REFLECT_TASK_TYPES = {"reflection", "memory-consolidate", "learn"}
+
+# Additions an operator may make (learning.no_reflect_extra). Separate from the
+# hard set above so config can widen the exclusion but never narrow it past the
+# recursion guard — the same fail-closed shape as the desktop policy plane.
+#
+# The default excludes the two timer agents (2026-08-11). They are the most
+# repetitive runs in the system — a fixed prompt over the same vault, landing
+# at 8-11 turns — so with reflection_min_turns lowered to 8 they would spawn a
+# ~$0.21 review of "I wrote today's brief" essentially every day, almost always
+# answering "Nothing to save." That is the same mistake `should_capture` made
+# with episodes until 2026-08-02, where daily-brief runs were left in and the
+# knowledge graph filled with the system observing itself. Delete the config
+# key to reflect on them again.
+DEFAULT_NO_REFLECT_EXTRA = ("daily-brief", "weekly-review")
 
 PROMPT = """\
 The task above is finished and delivered. You are now in a private review \
@@ -69,7 +84,10 @@ def should_reflect(learning_cfg: dict, task: dict, task_meta: dict,
         return False
     if task.get("source") == "reflection":
         return False
-    if task_meta.get("task_type") in NO_REFLECT_TASK_TYPES:
+    extra = learning_cfg.get("no_reflect_extra")
+    skip = NO_REFLECT_TASK_TYPES | set(
+        DEFAULT_NO_REFLECT_EXTRA if extra is None else extra)
+    if task_meta.get("task_type") in skip:
         return False
     if result.get("status") != "done" or not result.get("session_id"):
         return False

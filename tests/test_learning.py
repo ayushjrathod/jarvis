@@ -76,6 +76,31 @@ class TestReflectionPolicy(unittest.TestCase):
         self.assertFalse(reflection.should_reflect(
             {}, self._task(source="reflection"), {}, self._result()))
 
+    def test_timer_agents_are_excluded_by_default(self):
+        """The daily brief is the same prompt over the same vault every day and
+        lands at 8-11 turns, i.e. right at the lowered threshold. Reflecting on
+        it would spend ~$0.21 a day to conclude there is nothing to save — the
+        mistake `should_capture` made with episodes until 2026-08-02."""
+        for tt in reflection.DEFAULT_NO_REFLECT_EXTRA:
+            self.assertFalse(reflection.should_reflect(
+                {}, self._task(), {"task_type": tt}, self._result()), tt)
+        # …and an operator can put them back
+        self.assertTrue(reflection.should_reflect(
+            {"no_reflect_extra": []}, self._task(),
+            {"task_type": "daily-brief"}, self._result()))
+
+    def test_config_can_widen_but_never_narrow_the_meta_set(self):
+        """`reflection` must stay excluded whatever config says — it is what
+        stops the loop reflecting on its own reflections."""
+        for tt in ("reflection", "memory-consolidate", "learn"):
+            self.assertFalse(reflection.should_reflect(
+                {"no_reflect_extra": []}, self._task(),
+                {"task_type": tt}, self._result()), tt)
+        # and an arbitrary extra type is honored
+        self.assertFalse(reflection.should_reflect(
+            {"no_reflect_extra": ["summarize"]}, self._task(),
+            {"task_type": "summarize"}, self._result()))
+
     def test_config_gates(self):
         self.assertFalse(reflection.should_reflect(
             {"reflection": False}, self._task(), {}, self._result()))

@@ -163,7 +163,19 @@ dispatcher:
   # exempt, as are never-used areas younger than the stale window.
   learning:
     reflection: true
-    reflection_min_turns: 12      # num_turns >= this queues a reflection
+    # num_turns >= this queues a reflection. Was 12, which measured out at 5 of
+    # 83 agentic runs ever (6%) — the loop worked but almost never fired, since
+    # the daily brief lands at 8-11 turns and sat just under the bar. At 8 it is
+    # 41% of historical runs (2026-08-11).
+    reflection_min_turns: 8
+    # Task types excluded on top of the hard-coded meta set in reflection.py.
+    # The timer agents are here because they are the same prompt over the same
+    # vault every day: at the threshold above they would spawn a ~$0.21 review
+    # of "I wrote today's brief" daily, almost always concluding there is
+    # nothing to save. Delete this key to reflect on them too; the meta types
+    # (reflection/memory-consolidate/learn) can't be re-enabled from here on
+    # purpose — that's the recursion guard.
+    no_reflect_extra: [daily-brief, weekly-review]
     reflection_max_cost_usd: 1.00  # budget cap for the reflection run
     curator:
       stale_after_days: 30

@@ -15,6 +15,15 @@ Every working session MUST:
 2. At session end: **update `context/STATE.md`** and **append a session log** to
    `context/sessions/YYYY-MM-DD-<n>.md` (decisions made, files touched, what's next).
 3. Keep the **Phase tracker** below current.
+4. **Keep STATE.md to roughly the last five sessions.** Step 1 reads it in full
+   every single session, so it is the one file whose length is a recurring
+   cost — it had reached 80KB before the 2026-08-11 trim. Roll older blocks
+   verbatim into `context/state-archive.md` (never condense: the detail is the
+   value) and leave the standing sections — Current phase, What runs where,
+   What the user still needs to do, Known caveats, Deferred — at the foot,
+   **corrected rather than appended to**. A stale standing section is worse
+   than a long one: the pre-trim copy still said "31 unit tests" and called
+   `mission-jarvis` "deliberately not enabled" while it was running.
 
 ## Phase tracker
 
@@ -40,7 +49,7 @@ Every working session MUST:
 | — | Messages API backend | **built, then REMOVED 2026-07-27** — user is not funding an API key; subscription CLI only (recoverable at `ce93ea0`) |
 | K2 | Computer-use T2 (AT-SPI) / T3 (browser over CDP) | **not started** — T3 needs no new deps; offered and deferred twice |
 
-_Test count as of 2026-08-11: **736**, `.venv/bin/python -m unittest discover tests`.
+_Test count as of 2026-08-11: **738**, `.venv/bin/python -m unittest discover tests`.
 Acceptance: `scripts/smoke_phase_a.sh` 7/7._
 
 v2 (phases F–J: memory, learning loop, observability, personal OS, graph) is
