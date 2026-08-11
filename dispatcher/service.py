@@ -1057,9 +1057,10 @@ class Service:
                     "speech": f"I'm not allowed to {intent.describe()}."}
         if verdict == "confirm":
             cid = uuid.uuid4().hex[:12]
+            timeout_s = ccfg.get("confirm_timeout_s", 120)
             self.pending_desktop[cid] = {
                 "intent": intent, "source": source,
-                "expires": time.monotonic() + ccfg.get("confirm_timeout_s", 120),
+                "expires": time.monotonic() + timeout_s,
             }
             self._expire_desktop_confirms()
             speech = f"Shall I {intent.describe()}?"
@@ -1069,6 +1070,10 @@ class Service:
                 "event": "confirm", "task_id": None, "kind": "desktop",
                 "source": source, "text": intent.describe(),
                 "confirm_id": cid, "verb": intent.verb,
+                # The client can't know the window otherwise, so a dashboard
+                # banner sat there offering Yes on an id the server had already
+                # expired — clicking it reported "expired" with no warning.
+                "timeout_s": timeout_s,
                 "description": intent.describe(), "speech": speech,
             })
             log.info("desktop: %s awaiting confirmation (%s)", intent.verb, cid)
@@ -1142,6 +1147,11 @@ class Service:
         except ValueError as e:
             log.warning("graph extraction failed: %s", e)
             return None
+        # Marked only here, on the success path: a parse failure or a
+        # rate-limited run leaves the episodes unmarked so the next pass
+        # retries them, which is the same fail-toward-retry direction
+        # `mark_episodes_unconsolidated` takes for the consolidation half.
+        self.db.mark_episodes_graph_extracted(episode_ids)
         await self.hooks.fire({"event": "graph", **counts})
         log.info("graph extraction: %s", counts)
         return counts

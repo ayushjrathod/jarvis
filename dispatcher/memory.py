@@ -159,6 +159,25 @@ def _write_new(path: Path, text: str, tries: int = 50) -> Path:
     return path
 
 
+def render_episodes(episodes: list[dict]) -> str:
+    """The markdown the consolidation agent and the graph extractor both read.
+
+    Shared (2026-08-11) so the graph can be handed a DIFFERENT subset than the
+    consolidation export holds: the two hand-offs are marked independently, and
+    after a rolled-back consolidation the next pass re-exports episodes the
+    extractor has already digested."""
+    lines = [f"# Episode export — {now()}", ""]
+    for e in episodes:
+        head = (f"## Episode {e['id']} — {e['valid_at']} · {e['source']}"
+                f" · {e['kind']} · {e['status']}")
+        if e.get("area"):
+            head += f" · area:{e['area']}"
+        lines += [head, f"**User:** {e['user_text']}", ""]
+        if e.get("assistant_text"):
+            lines += [f"**Jarvis:** {e['assistant_text']}", ""]
+    return "\n".join(lines)
+
+
 def build_consolidation(cfg: Config, db: Database) -> dict | None:
     """Export unconsolidated episodes to data/consolidation/<ts>.md and build
     the agent task from areas/memory/agents/consolidate.md. Returns None when
@@ -172,15 +191,6 @@ def build_consolidation(cfg: Config, db: Database) -> dict | None:
     stamp = now().replace(":", "").replace("+0000", "Z")
     export = cfg.root / "data" / "consolidation" / f"{stamp}.md"
     export.parent.mkdir(parents=True, exist_ok=True)
-    lines = [f"# Episode export — {now()}", ""]
-    for e in episodes:
-        head = (f"## Episode {e['id']} — {e['valid_at']} · {e['source']}"
-                f" · {e['kind']} · {e['status']}")
-        if e.get("area"):
-            head += f" · area:{e['area']}"
-        lines += [head, f"**User:** {e['user_text']}", ""]
-        if e.get("assistant_text"):
-            lines += [f"**Jarvis:** {e['assistant_text']}", ""]
     # Exclusive create, uniquified on collision (2026-08-10). `stamp` has
     # one-second resolution and write_text overwrites, so two /memory/consolidate
     # calls landing in the same second both built a job and the second export
@@ -188,7 +198,7 @@ def build_consolidation(cfg: Config, db: Database) -> dict | None:
     # consolidation has, for the batch that most needed it. "x" makes the loser
     # of the race take the next name instead of the winner's file; there is no
     # check-then-write gap to lose.
-    export = _write_new(export, "\n".join(lines))
+    export = _write_new(export, render_episodes(episodes))
 
     prompt_path = cfg.root / "areas" / "memory" / "agents" / "consolidate.md"
     text = prompt_path.read_text()

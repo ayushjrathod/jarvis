@@ -40,7 +40,7 @@ Every working session MUST:
 | — | Messages API backend | **built, then REMOVED 2026-07-27** — user is not funding an API key; subscription CLI only (recoverable at `ce93ea0`) |
 | K2 | Computer-use T2 (AT-SPI) / T3 (browser over CDP) | **not started** — T3 needs no new deps; offered and deferred twice |
 
-_Test count as of 2026-08-11: **732**, `.venv/bin/python -m unittest discover tests`.
+_Test count as of 2026-08-11: **736**, `.venv/bin/python -m unittest discover tests`.
 Acceptance: `scripts/smoke_phase_a.sh` 7/7._
 
 v2 (phases F–J: memory, learning loop, observability, personal OS, graph) is
@@ -486,6 +486,32 @@ before writing from scratch.
   `confirm_id` and answers via the ConfirmBar or by voice, so it is a live
   interaction; on the queue/automation path nobody is watching that source and
   the intent simply expires. Tests pin both sides.
+- **`Restart=on-failure` needs a widened StartLimit to mean anything**
+  (dispatcher 2026-08-10, both voice units 2026-08-11). systemd's default is 5
+  starts per **10s**; at `RestartSec=5` only ~2 land in that window, so the
+  limit never trips and a crash-on-startup restarts forever reporting
+  "activating", never `failed`. On `mission-jarvis`/`mission-dictate` that is
+  worse than on the dispatcher: nothing else tells you the assistant has gone
+  deaf. All three now run `StartLimitIntervalSec=300` / `StartLimitBurst=5` /
+  `RestartSec=10`, and `tests/test_dispatcher.py` pins the arithmetic
+  (`burst * RestartSec < interval`) for every restarting unit, since the
+  mistake has now been made twice.
+- **The graph tracks its own hand-off** (`episodes.graph_extracted_at`,
+  2026-08-11). `/memory/consolidate` marks a batch consolidated and spawns
+  *both* the consolidation agent and graph extraction over it — and a failed
+  consolidation rolls `consolidated_at` back, handing the extractor episodes it
+  had already digested. The graph is now marked separately and **only on
+  success**, `episodes_needing_graph()` filters the batch, and the extractor is
+  rendered its own subset via `memory.render_episodes()` rather than reusing
+  the consolidation export. `add_fact`'s duplicate-rejection stays as the
+  backstop it was always meant to be, not the mechanism.
+- **A parked confirmation now expires in the UI too.** The SSE `confirm` event
+  carries `timeout_s`; `ConfirmBar` counts it down and removes the row. Before
+  that the banner kept offering **Yes** on an id the dispatcher had already
+  dropped (and survived a dispatcher restart, which drops every pending
+  intent) — clicking it reported "expired" with no prior warning, on the two
+  verbs the confirm plane exists to guard. Verified in a browser against an
+  isolated dispatcher with `confirm_timeout_s: 8`: 7→1 then gone.
 - **Trust boundary (H1/H2)**: metadata from an external source
   (api/queue/voice/ui/screen) can NARROW tools/budget but never WIDEN them —
   `sanitize_untrusted_metadata` drops `allowed_tools`/`resume_session_id` and

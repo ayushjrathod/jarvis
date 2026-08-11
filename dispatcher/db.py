@@ -192,6 +192,14 @@ MIGRATIONS = [
     # NULL = never offered, which is where every pre-2026-08-10 fact starts —
     # additive and nullable, so an existing db needs nothing but the ALTER.
     "ALTER TABLE kg_facts ADD COLUMN last_offered_at TEXT",
+    # When this episode's facts were extracted into the knowledge graph.
+    # Tracked SEPARATELY from consolidated_at because the two hand-offs fail
+    # independently: /memory/consolidate marks the batch and spawns both the
+    # consolidation agent and graph extraction over it, and a failed
+    # consolidation rolls consolidated_at back — returning episodes the
+    # extractor had already read successfully. NULL = never extracted, which is
+    # where every pre-2026-08-11 episode starts.
+    "ALTER TABLE episodes ADD COLUMN graph_extracted_at TEXT",
 ]
 
 # Share of a candidate window reserved for the NEWEST active facts. Today's
@@ -517,6 +525,31 @@ class Database:
                 [(i,) for i in ids],
             )
             return cur.rowcount
+
+    def episodes_needing_graph(self, ids: list[int]) -> list[dict]:
+        """The subset of `ids` whose facts have not been extracted yet, in id
+        order. The graph's own hand-off marker, independent of
+        consolidated_at — see the MIGRATIONS note."""
+        if not ids:
+            return []
+        marks = ",".join("?" * len(ids))
+        with self._conn() as c:
+            rows = c.execute(
+                f"SELECT * FROM episodes WHERE id IN ({marks})"
+                " AND graph_extracted_at IS NULL ORDER BY id", ids,
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def mark_episodes_graph_extracted(self, ids: list[int]):
+        """Called only after a SUCCESSFUL extraction, so a parse failure or a
+        rate-limited run is retried on the next pass rather than dropped."""
+        if not ids:
+            return
+        with self._conn() as c:
+            c.executemany(
+                "UPDATE episodes SET graph_extracted_at=? WHERE id=?",
+                [(now(), i) for i in ids],
+            )
 
     def search_episodes(self, q: str, limit: int = 10,
                         after: str | None = None,

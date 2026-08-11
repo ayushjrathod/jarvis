@@ -408,6 +408,47 @@ class TestConsolidation(unittest.TestCase):
         # hand-off marking is the caller's job — episodes still pending here
         self.assertEqual(len(self.db.unconsolidated_episodes()), 1)
 
+    def test_graph_hand_off_is_marked_separately_from_consolidation(self):
+        """The two hand-offs fail independently, so they need separate marks.
+
+        /memory/consolidate marks the batch consolidated and spawns BOTH the
+        consolidation agent and graph extraction over it. A failed consolidation
+        rolls `consolidated_at` back (the M6 fix) — which returns episodes the
+        extractor already digested. Before `graph_extracted_at` the next pass
+        re-extracted them, and only `add_fact`'s duplicate guard kept the graph
+        from accumulating a copy of that night's facts per retry.
+        """
+        a = self.db.add_episode("t1", "voice", "quick", None, "done", "one", "1")
+        b = self.db.add_episode("t2", "voice", "quick", None, "done", "two", "2")
+
+        # first pass: both episodes are new to the graph
+        self.assertEqual([e["id"] for e in self.db.episodes_needing_graph([a, b])],
+                         [a, b])
+        self.db.mark_episodes_consolidated([a, b])
+        self.db.mark_episodes_graph_extracted([a, b])
+
+        # the consolidation agent then fails, so its half rolls back…
+        self.db.mark_episodes_unconsolidated([a, b])
+        self.assertEqual(len(self.db.unconsolidated_episodes()), 2)
+        # …and the next pass re-exports them for the agent, but the graph has
+        # already read them and must not be handed them again.
+        self.assertEqual(self.db.episodes_needing_graph([a, b]), [])
+
+        # a genuinely new episode still reaches the graph
+        c = self.db.add_episode("t3", "voice", "quick", None, "done", "three", "3")
+        self.assertEqual([e["id"] for e in
+                          self.db.episodes_needing_graph([a, b, c])], [c])
+
+    def test_graph_export_renders_only_its_own_subset(self):
+        a = self.db.add_episode("t1", "voice", "quick", None, "done", "alpha", "A")
+        self.db.add_episode("t2", "voice", "quick", None, "done", "beta", "B")
+        self.db.mark_episodes_graph_extracted([a])
+        pending = self.db.episodes_needing_graph(
+            [e["id"] for e in self.db.unconsolidated_episodes()])
+        text = memory.render_episodes(pending)
+        self.assertIn("beta", text)
+        self.assertNotIn("alpha", text)
+
     def test_privileged_grants_in_the_agent_file_are_stripped(self):
         """H2 on the consolidation path.
 

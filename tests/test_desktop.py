@@ -708,6 +708,19 @@ class TestConfirmFlow(unittest.TestCase):
         self.assertEqual(out["status"], "done")
         self.assertEqual(svc.pending_desktop, {})
 
+    def test_confirm_event_carries_the_window(self):
+        """The client can't know how long it has otherwise, so the dashboard
+        banner kept offering Yes on an id the dispatcher had already dropped —
+        clicking it reported "expired" with no prior warning. ConfirmBar counts
+        this down and removes the row itself."""
+        svc = _Svc({"enabled": True, "confirm_timeout_s": 45})
+        with mock.patch.object(desktop, "run_intent") as ran:
+            self.run_cmd(svc, "what's on my clipboard")
+        ran.assert_not_called()
+        event = svc.hooks.fire.await_args.args[0]
+        self.assertEqual(event["event"], "confirm")
+        self.assertEqual(event["timeout_s"], 45)
+
     def test_confirm_verb_parks_and_does_not_run(self):
         svc = _Svc(self.CFG)
         with mock.patch.object(desktop, "run_intent") as run:

@@ -6,6 +6,7 @@ Run: .venv/bin/python -m unittest discover tests
 import asyncio
 import json
 import os
+import re
 import tempfile
 import time
 import unittest
@@ -956,6 +957,35 @@ class TestVaultTolerance(unittest.TestCase):
         (self.vault / "tasks" / "bad.md").write_text("---\ntitle: [unclosed\n---\nbody\n")
         tasks = vault.list_tasks(self.vault)
         self.assertEqual([t["title"] for t in tasks], ["Good"])
+
+
+class TestSystemdUnits(unittest.TestCase):
+    """The unit files are shipped code too, and this particular mistake has now
+    been made twice — the dispatcher (fixed 2026-08-10) and both voice units
+    (fixed 2026-08-11)."""
+
+    UNITS = Path(__file__).resolve().parent.parent / "systemd"
+
+    def test_every_restarting_unit_can_actually_give_up(self):
+        """`Restart=on-failure` without a widened StartLimit is a trap: at a
+        short RestartSec the restarts are slower than systemd's default
+        5-per-10s window, so the limit never trips and a crash-on-startup loops
+        forever reporting "activating" instead of `failed`. A hard failure
+        wearing a soft label — nothing surfaces it, and for the voice units
+        nothing surfaces it at all: Jarvis just stops answering."""
+        for unit in sorted(self.UNITS.glob("*.service")):
+            text = unit.read_text()
+            if "Restart=" not in text or "Restart=no" in text:
+                continue                      # oneshots don't restart
+            self.assertIn("StartLimitBurst=", text, unit.name)
+            self.assertIn("StartLimitIntervalSec=", text, unit.name)
+            # The pacing is the load-bearing half: burst * RestartSec must fit
+            # inside the interval, or the limit still can't trip.
+            burst = int(re.search(r"StartLimitBurst=(\d+)", text).group(1))
+            interval = int(
+                re.search(r"StartLimitIntervalSec=(\d+)", text).group(1))
+            delay = int(re.search(r"RestartSec=(\d+)", text).group(1))
+            self.assertLess(burst * delay, interval, unit.name)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,7 @@ class Config:
     automations: dict = field(default_factory=dict)
     media: dict = field(default_factory=dict)
     computer: dict = field(default_factory=dict)
+    brief: dict = field(default_factory=dict)
     inbox: dict = field(default_factory=dict)
     screenshots_dir: Path = None
     stt: dict = field(default_factory=dict)
@@ -68,6 +69,7 @@ class Config:
         cfg.automations = d.get("automations", {})
         cfg.media = d.get("media", {})
         cfg.computer = d.get("computer", {})
+        cfg.brief = d.get("brief", {})
         cfg.inbox = d.get("inbox", {})
         cfg.screenshots_dir = rel(d.get("screenshots_dir", "data/screenshots"))
         cfg.stt = d.get("stt", {})

@@ -5,13 +5,20 @@ Description=Mission Control dictation (hold F9, speech typed at cursor via ydoto
 # start, see the /dev/uinput quirk in CLAUDE.md. Not enabled by default:
 #   systemctl --user enable --now mission-dictate
 After=pipewire.service ydotool.service
+# See the note in mission-jarvis.service: at RestartSec=5 the default
+# 5-starts-per-10s limit can never trip, so a crash-on-startup (ydotoold down,
+# the /dev/uinput quirk, user not in `input`) loops forever as "activating"
+# instead of failing where doctor.sh and `systemctl --user status` can see it.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 WorkingDirectory=%h/Documents/code/jarvis
 ExecStart=%h/Documents/code/jarvis/.venv/bin/python -m jarvis.dictate
 Restart=on-failure
-RestartSec=5
+# 10s, not 5s: paced so a crash-on-startup exhausts StartLimitBurst above.
+RestartSec=10
 
 [Install]
 WantedBy=default.target

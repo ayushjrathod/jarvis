@@ -8,13 +8,24 @@ Description=Mission Control Jarvis voice assistant
 #   systemctl --user enable --now mission-jarvis
 After=mission-dispatcher.service pipewire.service
 Wants=mission-dispatcher.service
+# Same trap the dispatcher hit (2026-08-10), missed here at the time: at
+# RestartSec=5 only ~2 starts land in systemd's default 10s window, so the
+# default StartLimitBurst=5 never trips and a crash-on-startup (no mic, models
+# missing, user not in `input`) restarts forever while the unit reports
+# "activating" and never `failed`. That is worse here than on the dispatcher:
+# nothing else tells you the assistant is deaf — it simply stops answering.
+# Five starts now land in ~40s, well inside the 300s window, so it gives up
+# where you can see it.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 WorkingDirectory=%h/Documents/code/jarvis
 ExecStart=%h/Documents/code/jarvis/.venv/bin/python -m jarvis.main --mode both
 Restart=on-failure
-RestartSec=5
+# 10s, not 5s: paced so a crash-on-startup exhausts StartLimitBurst above.
+RestartSec=10
 
 [Install]
 WantedBy=default.target

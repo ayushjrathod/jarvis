@@ -354,7 +354,16 @@ table.docs-table td.ep code { font-size: 0.85rem; }
 }
 .confirm-row.resolved { border-color: var(--border); color: var(--dim); }
 .confirm-q { font-weight: 600; overflow-wrap: anywhere; }
-.confirm-actions { display: flex; gap: 0.5rem; }
+.confirm-actions { display: flex; gap: 0.5rem; align-items: center; }
+/* Seconds left before the dispatcher drops the parked intent. Muted and
+   tabular so a ticking number doesn't jitter the buttons beside it. */
+.confirm-ttl {
+  color: var(--muted);
+  font-size: 0.85em;
+  font-variant-numeric: tabular-nums;
+  min-width: 2.5em;
+  text-align: right;
+}
 .confirm-row button {
   background: transparent;
   color: var(--fg);

@@ -129,12 +129,7 @@ def main():
     # Deterministic pre-check: a brief for a vault with no open tasks and no
     # fresh notes says "clean slate" for ~$0.40 and 8-11 turns. Write it here
     # for nothing instead. Any material at all and we fall through to the agent.
-    #
-    # `brief:` is the one config block Config has no field for, so read it back
-    # from the SAME file Config just used rather than a second, possibly
-    # different, one. Follow-up: add `Config.brief` and drop this re-read.
-    raw = yaml.safe_load(config_path().read_text()) or {}
-    bcfg = (raw.get("dispatcher") or {}).get("brief") or {}
+    bcfg = cfg.brief or {}
     if agent == "daily-brief" and bcfg.get("skip_model_when_quiet", True):
         days = int(bcfg.get("quiet_notes_days", brief_mod.DEFAULT_NOTES_DAYS))
         if brief_mod.is_quiet(ROOT, days):

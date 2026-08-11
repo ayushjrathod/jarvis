@@ -383,11 +383,20 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         task = await svc.submit(job["text"], source="timer", mode="agentic",
                                 area="memory", metadata=meta,
                                 trusted=True)  # server spawn (consolidation agent)
-        # graph extraction (Phase J2) reads the same export, in parallel with
-        # the block-consolidation agent
+        # Graph extraction (Phase J2) runs in parallel with the
+        # block-consolidation agent, but over its OWN subset (2026-08-11): the
+        # graph marks episodes only on success, and a failed consolidation
+        # rolls `consolidated_at` back, so the next pass re-exports episodes
+        # the extractor already digested. Without this filter those facts are
+        # re-derived every retry — survivable only because `add_fact` rejects
+        # exact duplicates of an active fact, which is a guard, not a design.
         try:
-            export_text = (cfg.root / job["export_path"]).read_text()
-            svc.spawn_graph_extract(export_text, job["episode_ids"])
+            pending = svc.db.episodes_needing_graph(job["episode_ids"])
+            if pending:
+                svc.spawn_graph_extract(memory.render_episodes(pending),
+                                        [e["id"] for e in pending])
+            else:
+                log.info("graph extract: nothing new in this batch")
         except Exception:
             log.exception("graph extract spawn failed")
         return JSONResponse(status_code=202, content={

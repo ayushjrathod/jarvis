@@ -1,8 +1,54 @@
 # STATE — read me first each session
 
-_Last updated: 2026-08-10 (session 29, end)_
+_Last updated: 2026-08-11 (session 29, end)_
 
-## Session 29 (2026-08-10): system volume phrasings widened — READ THIS FIRST
+## Session 29, part 3 (2026-08-11): standing list swept — READ THIS FIRST
+
+Session 29's volume work is **committed** on `feat/system-volume-phrasings`
+(branched off main at `a5f1fe8`). **736 tests.** Then, on the user's pick,
+three standing items:
+
+- **Both voice units could flap forever without ever failing.**
+  `mission-jarvis` and `mission-dictate` ran `Restart=on-failure` +
+  `RestartSec=5` with no StartLimit — at that pace only ~2 starts land in
+  systemd's default 10s window, so the limit never trips and a crash-on-startup
+  loops as "activating" indefinitely. Session 28 fixed exactly this on the
+  dispatcher and missed the two units where it matters more: nothing else tells
+  you Jarvis has gone deaf. Both now match the dispatcher (300s/5/10s),
+  installed + `daemon-reload`ed **without restarting either service** (systemd
+  picked the values up; both still active). A test now pins
+  `burst * RestartSec < interval` for every restarting unit.
+- **`graph_extracted_at`** — the graph now tracks its own hand-off, marked
+  **only on success**, so a rolled-back consolidation no longer re-feeds
+  episodes the extractor already digested. It also gets its own rendered subset
+  (`memory.render_episodes`) instead of the whole consolidation export.
+  `add_fact`'s duplicate guard goes back to being a backstop rather than the
+  thing holding the line. Additive migration; applied live, integrity ok, 82
+  episodes intact.
+- **`ConfirmBar` expires client-side** — the `confirm` SSE event now carries
+  `timeout_s` and the banner counts down and removes itself. It used to keep
+  offering **Yes** on an id the dispatcher had already dropped. Verified in a
+  browser (chromium + CDP) against an **isolated** dispatcher on :8799 with
+  `confirm_timeout_s: 8` — banner appeared, ticked 7→1, vanished at 8s; the
+  clipboard was never read. Real dispatcher and DB untouched.
+- **`Config.brief`** landed too (`scripts/run_agent.py` no longer re-reads
+  config.yaml by hand).
+
+**Still open:** the `Host` header check (needs one live check of what Host
+Tailscale Serve forwards from your phone) — that is now the whole code list.
+User-side: rotate the `sk-ant-` key, `git rm` the two smoke artifacts
+(`vault/briefs/test.md`, `refusal-test.md`) + reindex, reboot test, phone
+add-to-home-screen, ask-screen/Spotify E2E, and **merging this branch**.
+Biggest unbuilt feature remains K2 (computer-use T2 via AT-SPI, T3 browser over
+CDP with zero new deps).
+
+Two gotchas worth keeping: `pkill -f "remote-debugging-port=9222"` matches the
+issuing shell's own command line and kills it (exit 144); and an isolated
+dispatcher's config must live **in the repo root**, because `Config.root` is
+the config file's parent — put it in /tmp and `ui/dist` isn't found, so `/`
+serves the API JSON instead of the SPA and every DOM check silently fails.
+
+## Session 29 (2026-08-10): system volume phrasings widened
 
 User asked to "add system volume control". **It already existed** — computer-use
 T1 has had `volume`/`mute`/`status` over wpctl since session 20, live and
