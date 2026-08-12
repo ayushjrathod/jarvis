@@ -14,7 +14,7 @@ route handlers over 31 paths, and 16 systemd units.
 ## 1. The one-sentence version
 
 **Everything that talks to Claude goes through one Python process.** Voice, the
-web dashboard, your phone, a markdown file dropped in a folder, and eight
+web dashboard, your phone, a markdown file dropped in a folder, and six
 systemd timers are all just clients of a single FastAPI service on
 `127.0.0.1:8765` that owns every `claude` subprocess, every SQLite write, and
 every decision about whether a model needs to be involved at all.
@@ -581,7 +581,7 @@ always-on:      mission-dispatcher           :8765, serves the SPA
                 mission-tailscale-serve      oneshot, HTTPS front door
 ```
 
-Plus **three in-process loops** inside the dispatcher, started in the FastAPI
+Plus **four in-process loops** inside the dispatcher, started in the FastAPI
 lifespan:
 - queue watcher (5s) — `queue/*.md` → tasks;
 - automations scheduler (30s) — due rows → tasks;
@@ -666,10 +666,11 @@ dependency and it degrades to `dep_gated` counting instead of breaking the walk.
 
 Honest notes on the current state.
 
-**The learning loop is dormant.** Two reflections ever, last on 07-19. The
-trigger is `num_turns >= 12`; the daily brief runs 8–11, so normal operation
-never reaches it. The machinery is correct and tested; it just isn't firing.
-Lower the threshold or accept that it's aspirational.
+**The learning loop fires** (since 2026-08-11). The trigger was `num_turns >=
+12`, which normal operation never reached — two reflections ever, last on 07-19.
+It is now **8**, with `learning.no_reflect_extra: [daily-brief, weekly-review]`
+layered on top of the hard-coded `NO_REFLECT_TASK_TYPES` so the timer agents
+don't spawn a review of "I wrote today's brief" every morning.
 
 **Orphaned FTS rows in the knowledge graph.** `kg_facts` has 0 rows but
 `kg_facts_fts` has 2. The session-25 purge deleted facts with manual SQL, and
@@ -685,8 +686,10 @@ saved verbatim 2026-07-05, kept as the reference for evdev hotkey capture.
 `_normalize` / `VETO` / `parse_response` are duplicated between `spotify.py` and
 `desktop.py`; `create_app` is 452 lines; `_conn()` reconnects per query.
 
-**`context/STATE.md` is 66KB** and the session protocol reads it every session.
-That is itself a cost.
+**`context/STATE.md` was 79KB** and the session protocol reads it every session.
+Trimmed to ~23KB on 2026-08-11; sessions 3–25 rolled verbatim into
+`context/state-archive.md`, and protocol rule 4 now caps it at roughly the last
+five sessions.
 
 **Unbounded quick-path concurrency.** `max_concurrent_agentic: 2` gates agentic
 runs via a semaphore; quick tasks have no such limit.

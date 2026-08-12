@@ -40,3 +40,8 @@ data/spotify.json
 # Local secrets (e.g. ANTHROPIC_API_KEY) — never commit
 .env
 .env.*
+
+# The 2026-08-13 review report is deliberately NOT committed: it details a live,
+# unfixed escalation path and this repo is public. Ignored so `git add -A` can't
+# sweep it in. Commit it once the repo is private or the finding is fixed.
+context/reviews/2026-08-13-full-codebase-review.md

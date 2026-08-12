@@ -30,7 +30,7 @@ by voice · **phone access** over Tailscale + installable PWA · **inbox
 watcher** (drop a file in `vault/inbox/`, it indexes itself) · **degraded
 mode** (answers from local memory when Claude's plan cap is hit).
 
-**432 tests**, all green. Read `context/STATE.md` for exactly where things
+**738 tests**, all green. Read `context/STATE.md` for exactly where things
 stand; `CLAUDE.md` has the operational notes for every subsystem.
 
 ## One-time setup
@@ -42,7 +42,7 @@ cd ~/Documents/code/jarvis
 python -m venv .venv
 .venv/bin/pip install fastapi uvicorn pyyaml \
   sounddevice evdev httpx numpy faster-whisper onnxruntime \
-  openwakeword piper-tts sqlite-vec fastembed pymupdf rapidocr-onnxruntime jeepney
+  'openwakeword==0.4.0' piper-tts sqlite-vec fastembed pymupdf rapidocr-onnxruntime jeepney
 
 # 2. Voice models (~90MB total; idempotent)
 ./scripts/setup_voice.sh
@@ -76,7 +76,8 @@ loginctl enable-linger $USER   # optional: start at boot without logging in
 
 That starts the dispatcher (with the dashboard at **http://127.0.0.1:8765/**)
 and schedules: daily brief 07:30, weekly review Sun 18:00, DB backup 03:30
-(kept 14 days in `data/backups/`). Jarvis voice is installed but disabled
+(kept 14 days in `data/backups/`). The backup covers **SQLite only** — not
+`vault/`, not `config.yaml`, not `data/spotify.json`, and not `~/.claude-per`. Jarvis voice is installed but disabled
 until your mic/input-group setup is done: `systemctl --user enable --now
 mission-jarvis`. Logs: `journalctl --user -u mission-dispatcher -f` (same for
 `mission-jarvis`, `mission-daily-brief`, …).
@@ -166,9 +167,15 @@ today's brief aloud/streamed). Trigger words match loosely — "can you add a
 new task for me" works. Task files live in `vault/tasks/`, briefs in
 `vault/briefs/`.
 
-**Gmail in the daily brief (optional):** register a read-only Gmail MCP server
-in Claude Code (`claude-per mcp add gmail …` + OAuth). The brief agent uses it
-automatically when present and silently skips email when not.
+**The daily brief is deliberately email-free** (your call, 2026-08-01). A
+read-only Gmail MCP server *is* registered in `~/.claude-per`, so
+`mcp__claude_ai_Gmail__*` appears in every agent's tool list — but the brief is
+not granted it, and its prompt says explicitly not to call the tools it can see.
+(The old dead `mcp__gmail` grant matched nothing, so the agent requested Gmail,
+was denied, and burned a turn on every run from Phase C until 2026-08-01.)
+To enable it: grant `mcp__claude_ai_Gmail__search_threads` +
+`…__get_thread` in `areas/tasks/agents/daily-brief.md` and restore an Email
+section to the prompt — no code change needed.
 
 ### Memory
 
@@ -256,7 +263,7 @@ installs as an app, mic and all.
 ## Tests
 
 ```bash
-.venv/bin/python -m unittest discover tests   # 432 unit tests, no network, ~9s
+.venv/bin/python -m unittest discover tests   # 738 unit tests, no network, ~6s
 ./scripts/smoke_phase_a.sh                    # dispatcher acceptance (server must be up)
 .venv/bin/python scripts/smoke_phase_b.py     # voice acceptance, no mic needed
 ./scripts/smoke_ask_screen.sh                 # ask-about-my-screen acceptance

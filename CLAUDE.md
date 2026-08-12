@@ -49,8 +49,20 @@ Every working session MUST:
 | — | Messages API backend | **built, then REMOVED 2026-07-27** — user is not funding an API key; subscription CLI only (recoverable at `ce93ea0`) |
 | K2 | Computer-use T2 (AT-SPI) / T3 (browser over CDP) | **not started** — T3 needs no new deps; offered and deferred twice |
 
-_Test count as of 2026-08-11: **738**, `.venv/bin/python -m unittest discover tests`.
-Acceptance: `scripts/smoke_phase_a.sh` 7/7._
+_Test count as of 2026-08-13: **738**, `.venv/bin/python -m unittest discover tests`.
+Acceptance: `scripts/smoke_phase_a.sh` 8/8._
+
+> **Open, unremediated: the 2026-08-13 full review** — 81 findings across all
+> eight subsystems, **none fixed**. It disproved several claims made as fact in
+> the operational notes below; those are corrected inline, but treat the rest as
+> hypotheses until re-checked. Start with the vault/public-repo decision and the
+> `Edit(**)` sanitizer hole.
+>
+> The report itself is **deliberately not in git**: it details a live escalation
+> path and this repo is public. It sits uncommitted (and gitignored) at
+> `context/reviews/2026-08-13-full-codebase-review.md`. Commit it once the repo
+> is private or the finding is fixed — until then it exists only on this box, so
+> do not assume a fresh clone has it.
 
 v2 (phases F–J: memory, learning loop, observability, personal OS, graph) is
 planned in `context/v2-plan.md` (user approved the direction 2026-07-18);
@@ -139,7 +151,7 @@ Clone reference repos into `references/`, read, and lift specific code/patterns
 | hoangsonww/Claude-Code-Agent-Monitor | ideas only: reading session JSONL for agent monitor |
 | LiveKit Agents / Pipecat | barge-in pattern (reference only) |
 | NousResearch/hermes-agent (MIT) | learning-loop review prompts, skill lifecycle/curator, memory guidance (Phase G) |
-| open-jarvis/OpenJarvis (Apache-2.0) | observability: TTFT/ITL stats, run_steps timeline, X-ray footer (Phase H) |
+| open-jarvis/OpenJarvis (Apache-2.0) | observability: TTFT/ITL stats, run_steps timeline, X-ray footer (Phase H); **also** `agents/executor.py` (settle the run in a `finally`), `agents/errors.py` (classify_error with an explicit default), `agents/loop_guard.py`. **Not a voice reference** — it has no VAD, wake-word, mic or barge-in code at all (checked 2026-08-13) |
 | mem0 / graphiti / letta (Apache-2.0) | extraction prompts, bi-temporal KG schema, core-block + sleep-time memory (Phases F/J) |
 | khoj (**AGPL — patterns only, NEVER lift code**) | ingest chunking/hash-diff, NL automations, notify-or-not gate (Phases F/I) |
 
@@ -288,7 +300,10 @@ before writing from scratch.
   source=`automation` tasks. Schedule kinds: daily/weekly/interval/once;
   local-time fields, UTC next_run_at; 'once' rows spend themselves
   (next_run_at NULL). Re-enable via toggle recomputes next_run_at so a stale
-  past-due row can't instant-fire. Empty/absent `automations:` config block
+  past-due row can't instant-fire — **false for `once`, the one kind where it
+  matters** (found 2026-08-13, unfixed): `set_automation_enabled` writes
+  next_run_at only when it is not None, and `next_run_iso` returns None for a
+  lapsed `once`, so the stale timestamp survives and it fires within 30s. Empty/absent `automations:` config block
   disables the whole feature (that's what keeps unit tests LLM-free).
 - **Notify gate**: 'done' automation/timer results run a `notify-gate` quick
   task (self-contained prompt: request + clipped result inlined)
@@ -397,7 +412,12 @@ before writing from scratch.
   `NEVER_GATE_TASK_TYPES` was unreachable dead code (with a passing test over
   it, because the test called `surfacing()` directly). Delivery now goes through
   `_deliver_notice`, the same `notify` event the inbox watcher uses.
-  **A divert is also no longer automatically `done`**: `try_divert` returns `ok`
+  **A divert is also no longer automatically `done`** — **but only for the parked
+  and denied cases** (corrected 2026-08-13): a missing app, a refused URL scheme
+  and an unknown verb still report `done`, because `run_desktop_intent` and
+  `media_command` hardcode it while `run_intent` returns failures as sentences.
+  That is what lets the parser's over-claiming swallow a request silently.
+  `try_divert` returns `ok`
   from the executor, so a parked confirmation (nobody watches the `queue` /
   `automation` sources — it just expires), a denied verb, or an unresolvable
   play settles `failed`. A *failed automation parse* now falls through to normal
@@ -712,6 +732,22 @@ before writing from scratch.
   tests fail against the pre-fix module**. `<!-- -->` comments are
   stripped from snippets (USER.md/MEMORY.md open with an editor instruction
   that otherwise eats the whole quote).
+- **…and it is STILL bypassable — by contractions** (found 2026-08-13, unfixed).
+  `_content_words` keeps `'` in the word charset, so `what's` survives as a
+  content word while `what` is a stopword — and FTS5's unicode61 tokenizer
+  *splits* on the apostrophe, so the probe matches any chunk containing "what's".
+  Briefs and episodes are Claude prose full of contractions, so **"what's the
+  airspeed velocity of a laden swallow?"** — the very example above, asked the
+  way a person actually asks it — anchors and returns three unrelated briefs.
+  `test_offline.py`'s `_tokens` models a tokenizer that *keeps* the apostrophe,
+  the opposite of FTS5, so it still cannot catch this. Fix: `[a-z0-9]{2,}` plus
+  the negative-contraction stems in STOPWORDS. Two measured traps for whoever
+  does it: a "snippet must share a content word" filter kills 11 of 18 good
+  snippets including the USER.md/Neovim hit, and a distance threshold is useless
+  (gibberish scores L2 0.9076, *better* than the good query's best hit at 0.9181).
+- **The BM25 leg of `/memory/search` itself has the same implicit-AND defect and
+  is still unfixed** — `db.fts_query` (db.py:1070) returns 0 rows for every
+  natural-language question, so "hybrid" search is pure KNN today.
 - The run still settles **failed** (the model call really did fail, and the
   cost/latency stats stay clean); the `done` SSE payload carries
   `degraded: true` so a client can label where the text came from.

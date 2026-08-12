@@ -1,8 +1,73 @@
 # STATE — read me first each session
 
-_Last updated: 2026-08-11 (session 29, end)_
+_Last updated: 2026-08-13 (session 30, end)_
 
-## Session 29, part 3 (2026-08-11): standing list swept — READ THIS FIRST
+## Session 30 (2026-08-13): full review against the reference repos — READ THIS FIRST
+
+User asked for a review of the codebase **in its entirety**, with subagents
+comparing against `references/` (all `git pull`ed first — 10 of 12 had upstream
+commits), spawned **one at a time** for usage reasons. Eight slices: dispatch
+core · memory/graph · personal OS · learning loop + areas · parsers/safety plane
+· voice · dashboard UI · ops/config/vault.
+
+**81 findings. Nothing was fixed.** Tree clean, 738 tests green throughout; only
+`context/` and the documentation corrections were written.
+
+The full report — tiered, with `file:line`, repros and a suggested order — is at
+`context/reviews/2026-08-13-full-codebase-review.md`. It is **uncommitted and
+gitignored on purpose**: it details a live escalation path and this repo is
+public, so it exists only on this machine (user's call, 2026-08-13). Commit it
+once the repo is private or that finding is fixed. Session log:
+`context/sessions/2026-08-13-1.md`.
+
+**The five that need a decision or a fix first:**
+
+1. **`vault/` is on a public GitHub repo.** 42 tracked files — `memory/USER.md`
+   (rewritten nightly from *every episode*), `MEMORY.md`, tasks, 36 briefs.
+   `"private": false`, re-confirmed by hand. `vault/inbox/` is **not** ignored,
+   and its README invites dropping exports, so a bank statement dropped there is
+   committed by the next `git add -A`. The briefs look deliberately committed,
+   so this is **your decision**: gitignore the personal subtrees, or make the
+   repo private. (`queue/` is the same class — `.processed/`/`.failed/` are
+   ignored *with a comment explaining why*, the live files aren't.)
+2. **`Edit(**)` survives the H2 sanitizer** (`areas.py:22-31`) —
+   `_is_privileged_tool` reads "contains a parenthesis" as "is scoped", and
+   doesn't know `MultiEdit`/`NotebookEdit`. Proved end to end: a reflection run
+   whose parent read attacker-controlled text writes an unscoped grant into a
+   SKILL.md; the next ordinary task — or the 07:30 brief timer — runs with
+   repo-wide write, which reaches `config.yaml` and buys real Bash after that.
+3. **Three ways Jarvis goes deaf while systemd reports healthy**, the worst
+   being that `--mode both` — the mode the service runs — can never execute its
+   own "exit so systemd restarts us" path (the wake thread pins the interpreter
+   forever). Only `--mode ptt` exits cleanly, which is presumably where the
+   2026-08-10 supervisor fix was tested.
+4. **Both nightly memory agents are told today is yesterday** — UTC `{{DATE}}`
+   against local `OnCalendar` at UTC+5:30, so 02:30 local fires at 21:00 UTC the
+   previous day. Every date in `USER.md`/`MEMORY.md` and every `kg_facts.valid_at`
+   lands a day early. `run_agent.py` uses *local* time for the same placeholder,
+   so the brief and the memory blocks disagree.
+5. **The desktop/media parsers claim ordinary English and file it `done`** —
+   `open tasks`, `run migrations`, `put on the kettle`, `play it by ear` — because
+   every executor failure is reported as success. `start server` resolves to the
+   Avahi SSH browser here.
+
+**Two quiet regressions**: the morning brief notification has been gone since
+**08-03** (the quiet path writes the file without submitting a task, so it never
+reaches the notify gate), and the dashboard task checkbox has **never** worked
+(`vault.toggle_task` writes the file back byte-identical and returns success —
+one `status` field, three parsers that disagree).
+
+**Deadline**: `backup_db.sh`'s retention (`-name 'mission-*.db' -mtime +14`)
+matches `mission-pre-purge-20260802T000402.db` — the recovery point taken before
+the knowledge-graph purge. **Eligible ~2026-08-17.**
+
+Also worth knowing: **a truncated backup passes `integrity_check`** (256KB, zero
+tables, reported `ok`) and nothing ever verifies one; and **openjarvis contains
+no VAD, wake-word, mic or barge-in code at all** — CLAUDE.md's reference table
+was wrong about it. What *is* worth lifting from it is its executor/error/
+loop-guard modules.
+
+## Session 29, part 3 (2026-08-11): standing list swept
 
 Session 29's volume work is **committed** on `feat/system-volume-phrasings`
 (branched off main at `a5f1fe8`). **736 tests.** Then, on the user's pick,
@@ -310,9 +375,17 @@ per query.
 **Everything planned is built.** Phases A–J are implemented and live under
 systemd; so are the unplanned additions (ask-screen, media control, desktop
 control T1, phone access + PWA, degraded mode, inbox watcher). Three
-whole-codebase reviews have been run and remediated (sessions 13, 26, 27) plus
-the standing-list sweeps in 28 and 29. **738 tests green**, `main` pushed to
+whole-codebase reviews have been run **and remediated** (sessions 13, 26, 27)
+plus the standing-list sweeps in 28 and 29. **738 tests green**, `main` pushed to
 origin at 2026-08-11.
+
+**A fourth review (session 30, 2026-08-13) has been run and NOT remediated** —
+81 findings, none fixed, in `context/reviews/2026-08-13-full-codebase-review.md`
+(local-only, see the session 30 block above).
+That is now the largest piece of open work, and it outranks K2. It also
+disproved several claims CLAUDE.md and the docs stated as fact; those were
+corrected in session 30, but treat any remaining "verified" claim in the
+operational notes as a hypothesis until re-checked.
 
 The only unbuilt item of substance is **K2** — computer-use T2 (window control
 via AT-SPI, which session 24 measured working after the session-20 spike
@@ -337,12 +410,33 @@ exists to gate yet).
 - All three long-running services now fail *visibly*: `StartLimitIntervalSec=300`
   / `StartLimitBurst=5` / `RestartSec=10`, so a crash-on-startup reaches
   `failed` instead of flapping as "activating" forever (2026-08-10/11).
-- **738 unit tests** green. `smoke_phase_a.sh` 7/7 and `smoke_phase_b.py` 12/12
-  as of session 25 — both spend real quota, so they are not run every session.
+  **Caveat found in session 30**: `mission-jarvis` can still hang instead of
+  exiting — in `--mode both` the supervisor's fatal path never terminates, so
+  PTT can be dead while the unit reports `active (running)`. And
+  `mission-tailscale-serve` has no `Restart=`, so a dispatcher that reaches
+  `failed` deactivates it via `Requires=` and restarting the dispatcher does
+  **not** bring it back — phone access dies silently.
+- **738 unit tests** green. `smoke_phase_a.sh` **8/8** (the script has 8 `ok()`
+  calls; "7/7" was stale) and `smoke_phase_b.py` 12/12 as of session 25 — both
+  spend real quota, so they are not run every session.
+- `doctor.sh` does **not** check `mission-jarvis` or `mission-dictate`, does not
+  check whether a timer's service failed on its last run, and does not look at
+  the backup at all (session 30).
 
 
 ## What the user still needs to do
 
+0. **Decide whether `vault/` belongs in a public repo — this one is time-sensitive**
+   (session 30). `github.com/ayushjrathod/jarvis` is public and 42 vault files
+   are tracked and pushed, including `memory/USER.md`, which the nightly
+   consolidation agent rewrites from every episode. `vault/inbox/` is not
+   ignored. Either gitignore the personal subtrees (keeping the READMEs) or make
+   the repo private; adding a gitignore does not unpublish what is already there.
+   Same call needed on `queue/`.
+0b. **Around 2026-08-17, `backup_db.sh` will delete
+   `mission-pre-purge-20260802T000402.db`** — the recovery point taken before
+   the knowledge-graph purge. Move it out of `data/backups/` or fix the
+   retention glob before then.
 1. **Reboot test — never run, and now the biggest unknown.** Phase E
    acceptance: reboot, then `journalctl --user -u 'mission-*' -b` should show
    clean startups. It matters specifically because a user service at boot has
