@@ -11,7 +11,7 @@ import contextlib
 import unittest
 from unittest import mock
 
-from dispatcher import desktop
+from dispatcher import desktop, spotify
 
 
 class TestDetect(unittest.TestCase):
@@ -36,19 +36,161 @@ class TestDetect(unittest.TestCase):
         self.assertGreater(i.delta, 0)
         self.assertLess(self.parse("computer volume down").delta, 0)
 
+    def test_system_volume_relative_phrasings(self):
+        """The qualified phrasings that fell through to a model until
+        2026-08-10. Each one costs a real `claude -p` call when it misses, so
+        the point of the widening is that none of these reach one."""
+        for s in ("turn up the system volume", "raise the system volume",
+                  "increase the master volume", "boost my computer volume",
+                  "make the computer louder", "master volume louder",
+                  "volume up on my computer", "make it louder on this machine",
+                  # the trailing-qualifier forms with a LEADING direction word,
+                  # which no pattern reached until the 2026-08-11 review
+                  "turn up the volume on my computer",
+                  "raise the volume on my pc", "increase the sound on my laptop",
+                  "crank up the system volume", "put the system volume up",
+                  "turn up my computer's volume"):
+            i = self.parse(s)
+            self.assertIsNotNone(i, s)
+            self.assertEqual(i.verb, "volume", s)
+            self.assertGreater(i.delta, 0, s)
+        for s in ("turn down my laptop sound", "lower the system volume",
+                  "decrease the system volume", "reduce my computer sound",
+                  "make my laptop quieter", "turn my laptop down",
+                  "turn the volume down on my laptop",
+                  "turn it down on the computer",
+                  "turn down the volume on my computer",
+                  "lower the volume on the laptop"):
+            i = self.parse(s)
+            self.assertIsNotNone(i, s)
+            self.assertLess(i.delta, 0, s)
+
+    def test_system_volume_absolute_phrasings(self):
+        for s, level in (("set my computer volume to 30", 0.3),
+                         ("change the master volume to 20%", 0.2),
+                         ("put the system volume at 65", 0.65),
+                         ("set the volume to 40 on my computer", 0.4)):
+            i = self.parse(s)
+            self.assertIsNotNone(i, s)
+            self.assertEqual((i.verb, i.number), ("volume", level), s)
+
+    def test_named_levels(self):
+        for s, level in (("system volume max", 1.0),
+                         ("set the system volume to maximum", 1.0),
+                         ("max out the system volume", 1.0),
+                         ("turn the system volume all the way up", 1.0),
+                         ("system volume half", 0.5),
+                         ("set the master volume to half", 0.5),
+                         ("system volume to a quarter", 0.25),
+                         ("set the system volume to zero", 0.0)):
+            i = self.parse(s)
+            self.assertIsNotNone(i, s)
+            self.assertEqual((i.verb, i.number), ("volume", level), s)
+
     def test_bare_volume_is_left_to_spotify(self):
         # spotify.detect owns "volume 40" (player volume) and its divert runs
         # first; without the system/master qualifier the two would fight.
-        for s in ("volume 40", "turn it up", "louder", "volume up"):
+        #
+        # The 2026-08-10 widening deliberately stopped at this line: "max
+        # volume" and "make it louder" stay unclaimed too, because splitting
+        # one sentence shape across two subsystems is the confusion the
+        # qualifier rule exists to prevent.
+        spotifys = ("volume 40", "turn it up", "louder", "quieter", "volume up",
+                    "set the volume to 30", "music up", "turn the music up")
+        for s in spotifys:
+            self.assertIsNone(self.parse(s), s)
+            # …and assert the other half of the invariant: these are not merely
+            # unclaimed, they are claimed by the parser that runs first.
+            self.assertIsNotNone(spotify.detect(s), s)
+        # Unclaimed by both, on purpose — see the docstring above.
+        for s in ("max volume", "half volume", "make it louder"):
             self.assertIsNone(self.parse(s), s)
 
+    def test_ordinary_english_is_not_a_volume_command(self):
+        # The relative patterns took on seven new leading verbs, all of which
+        # are ordinary English elsewhere.
+        for s in ("raise an exception", "lower my expectations",
+                  "turn the page", "increase the timeout",
+                  "what's the volume of a sphere", "drop the table"):
+            self.assertIsNone(self.parse(s), s)
+
+    def test_the_system_qualifier_is_what_keeps_them_apart(self):
+        """The above pins the new VERBS; this pins the QUALIFIER, which is a
+        different claim and the one the module's invariant rests on.
+
+        Reviewed 2026-08-11: without these, dropping the qualifier from every
+        relative pattern still passed the whole suite — the six sentences above
+        carry no audio noun, so they are rejected with or without it. These do
+        carry one, so they fail the moment the qualifier stops being required.
+        """
+        for s in ("raise the volume", "lower the sound", "drop the audio",
+                  "turn up the volume", "increase the volume",
+                  "make it quieter", "turn the sound up"):
+            self.assertIsNone(self.parse(s), s)
+
+    def test_every_direction_word_is_classified(self):
+        """`_DOWN_WORDS` is a denylist, so a direction word missing from it
+        turns the volume UP — on a verb whose policy is `allow`, i.e. with no
+        confirmation and nothing to notice. Pin the partition."""
+        words = set(desktop._ADV.split("|")) | set(desktop._VERB.split("|"))
+        self.assertEqual(words, desktop._UP_WORDS | desktop._DOWN_WORDS)
+        self.assertFalse(desktop._UP_WORDS & desktop._DOWN_WORDS)
+
+    def test_bare_noun_phrases_are_not_a_status_request(self):
+        """`machine`/`pc`/`speaker` qualify an audio noun but do not stand
+        alone in the "<thing> status" shape: "what is the machine state" is an
+        ordinary question about a state machine or a VM, and answering it with
+        the volume report would swallow it silently (found in review
+        2026-08-11)."""
+        for s in ("machine state", "the machine state", "my machine state",
+                  "what is the machine state", "pc status", "speaker state",
+                  "speakers status"):
+            self.assertIsNone(self.parse(s), s)
+            self.assertIsNone(self.parse(s + "?"), s + "?")
+        # …while the words that were always in the bare shape still work, and
+        # the new ones still qualify a noun.
+        for s in ("system status", "computer status", "what's the master state",
+                  "how loud is the machine", "is the pc muted",
+                  "what's my speaker volume"):
+            self.assertEqual(self.parse(s).verb, "status", s)
+
     def test_nonsense_volume_rejected(self):
+        # Above 100 routes normally rather than clamping to 100: far likelier
+        # to be a misheard sentence than a real request. Both absolute paths
+        # (leading and trailing qualifier) go through _level_of, so both are
+        # checked, as is the boundary itself.
         self.assertIsNone(self.parse("system volume 400"))
+        self.assertIsNone(self.parse("set my computer volume to 900"))
+        self.assertIsNone(self.parse("set the volume to 900 on my computer"))
+        self.assertIsNone(self.parse("system volume 101"))
+        self.assertEqual(self.parse("system volume 100").number, 1.0)
+
+    def test_trailing_politeness_is_stripped(self):
+        # Only the LEADING form was stripped, so "… please" reached a model.
+        self.assertEqual(self.parse("mute the computer please").verb, "mute")
+        self.assertEqual(self.parse("raise the system volume, please").verb,
+                         "volume")
 
     def test_mute(self):
         self.assertIs(self.parse("mute the system").on, True)
         self.assertIs(self.parse("unmute the audio").on, False)
         self.assertIs(self.parse("mute the speakers").on, True)
+
+    def test_mute_phrasings(self):
+        for s in ("mute my computer", "silence the system", "silence the audio",
+                  "turn the sound off", "turn off the system audio"):
+            i = self.parse(s)
+            self.assertIsNotNone(i, s)
+            self.assertEqual((i.verb, i.on), ("mute", True), s)
+        for s in ("unmute my computer", "turn the audio on",
+                  "turn on the system sound"):
+            i = self.parse(s)
+            self.assertIsNotNone(i, s)
+            self.assertEqual((i.verb, i.on), ("mute", False), s)
+
+    def test_bare_mute_is_left_to_spotify(self):
+        for s in ("mute", "unmute", "mute the music"):
+            self.assertIsNone(self.parse(s), s)
 
     def test_launch(self):
         i = self.parse("open firefox")
@@ -70,6 +212,15 @@ class TestDetect(unittest.TestCase):
     def test_status(self):
         self.assertEqual(self.parse("is the screen locked").verb, "status")
         self.assertEqual(self.parse("what's the system volume").verb, "status")
+
+    def test_status_phrasings(self):
+        # Read verbs are matched BEFORE the question-mark veto, so the
+        # interrogative form has to keep working with the "?" attached.
+        for s in ("is the system muted", "is the sound muted",
+                  "how loud is the computer", "what volume is the system at",
+                  "what's my system volume", "system state"):
+            self.assertEqual(self.parse(s).verb, "status", s)
+            self.assertEqual(self.parse(s + "?").verb, "status", s + "?")
 
     def test_open_url_needs_a_real_scheme_or_tld(self):
         # "open notes.md" used to become `xdg-open https://notes.md` — a local

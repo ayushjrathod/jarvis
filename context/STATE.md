@@ -1,8 +1,81 @@
 # STATE — read me first each session
 
-_Last updated: 2026-08-10 (session 28, end)_
+_Last updated: 2026-08-10 (session 29, end)_
 
-## Session 28 (2026-08-10): worked the standing list — READ THIS FIRST
+## Session 29 (2026-08-10): system volume phrasings widened — READ THIS FIRST
+
+User asked to "add system volume control". **It already existed** — computer-use
+T1 has had `volume`/`mute`/`status` over wpctl since session 20, live and
+policy `allow`. What was missing was *reach*: the parser knew four shapes, and
+everything else a person actually says — "turn **up** the system volume",
+"raise/lower the system volume", "volume up on my computer", "mute my computer"
+— fell through to a real `claude -p` call, ~$0.10-0.14 and ~3s to do what wpctl
+does instantly for nothing. I said so, offered four options, and the user chose
+**widen the phrasings**. Full detail: `context/sessions/2026-08-10-2.md`.
+**Tests 721 → 728, green.**
+
+- Parser-only change in `dispatcher/desktop.py` — no executor, service or
+  config change, `Intent` shapes unchanged, so the policy plane / confirm flow
+  / divert / SSE are all untouched.
+- Relative phrasings are now five patterns split by sentence shape
+  (`_VOL_REL_RES`): a *leading* direction word is a verb (raise/increase/boost/
+  lower/decrease/reduce/drop), a *trailing* one is an adverb (up/down/louder/
+  quieter/softer). Absolutes gained `NAMED_LEVELS` (max/full/half/quarter/zero,
+  "all the way up") and a trailing-qualifier form. Mute gained "silence …" and
+  "turn the sound off/on"; status gained "is the system muted", "how loud is
+  the computer", "what volume is the system at".
+- **The qualifier invariant held**: bare "max volume" / "half volume" / "make
+  it louder" are still NOT desktop commands, because bare "volume 40" is
+  Spotify's and splitting one sentence shape across two subsystems is exactly
+  what that rule prevents. Verified generatively — 8555 sentences the desktop
+  parser now claims, **zero** of which `spotify.detect` also claims.
+- Live: dispatcher restarted onto the new code (clean, no journal warnings);
+  `POST /desktop` ran all four new phrasings; `POST /task` mode=auto diverted
+  "raise the system volume" to `kind: desktop` with no task row and no Claude
+  call. **System volume captured and restored to its original 16%.**
+
+### Then a subagent review of that change, which found three real defects
+
+User asked for it explicitly. The reviewer verified by execution (grammar
+expansion, mutation testing, replay of 244 historical task texts). All fixed,
+**728 → 732 tests**:
+
+1. **"machine state" executed as a status command.** Adding `machine|pc|
+   speakers?` to `_SYS` made `_STATUS_RE`'s bare "<qualifier> status|state"
+   shape claim "machine state" / "pc status" / "what is the machine state" —
+   an ordinary question about a state machine or a VM, answered with the volume
+   report and filed done without ever reaching a model. The bare shape now uses
+   the narrower `_SYS_CORE`; the new words only ever qualify an audio noun.
+2. **My negative test pinned nothing, and STATE.md + CLAUDE.md both asserted it
+   did.** `test_ordinary_english_is_not_a_volume_command` ("raise an exception",
+   "lower my expectations") was meant to pin the qualifier rule — but none of
+   its inputs carries an audio noun, so they fail on the noun instead. Proven
+   by mutation: making the qualifier optional leaks "raise the volume" and the
+   suite **still passed**. Now pinned by
+   `test_the_system_qualifier_is_what_keeps_them_apart`, and I re-ran the
+   mutation to confirm it fails (it does, along with the older bare-volume
+   test). **Lesson worth keeping: a negative test proves nothing unless its
+   inputs can only fail for the reason being claimed.**
+3. **Coverage gap in the very thing the change was for.** The trailing-
+   qualifier form only worked with the noun *before* the direction word, so
+   "turn up the volume on my computer", "raise the volume on my pc" and
+   "lower the volume on the laptop" still cost a real `claude -p`. Two more
+   patterns added, plus `crank/bump/kick/dial up`, "put … up", the possessive
+   ("turn up my computer's volume") and a **trailing** "please" strip —
+   `_normalize` only ever stripped the leading form.
+
+Also from the review: `_DOWN_WORDS` is a denylist, so a direction word added
+and forgotten silently turns the volume **up** on an `allow`-policy verb —
+`_UP_WORDS` + a partition test now pin it. Re-verified after all fixes: 0
+Spotify collisions, `parse_answer` and the case-preserving args unaffected.
+
+**Offered and NOT built** (your call if you want them): a dashboard volume
+widget — there is no UI surface for desktop control at all today, only a typed/
+spoken command or `POST /desktop`; and giving the *system* the bare verbs, which
+would reverse media-first precedence so Spotify's volume needs "music volume
+40". Session 28's standing list is untouched.
+
+## Session 28 (2026-08-10): worked the standing list
 
 User asked to keep going on the remaining review findings, under a hard
 constraint: **no API key, no credits**. Everything is offline — source fixes plus

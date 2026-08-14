@@ -40,7 +40,7 @@ Every working session MUST:
 | — | Messages API backend | **built, then REMOVED 2026-07-27** — user is not funding an API key; subscription CLI only (recoverable at `ce93ea0`) |
 | K2 | Computer-use T2 (AT-SPI) / T3 (browser over CDP) | **not started** — T3 needs no new deps; offered and deferred twice |
 
-_Test count as of 2026-08-10: **721**, `.venv/bin/python -m unittest discover tests`.
+_Test count as of 2026-08-11: **732**, `.venv/bin/python -m unittest discover tests`.
 Acceptance: `scripts/smoke_phase_a.sh` 7/7._
 
 v2 (phases F–J: memory, learning loop, observability, personal OS, graph) is
@@ -706,6 +706,41 @@ before writing from scratch.
   "volume 40" (player volume) and the media divert runs first, so every desktop
   volume pattern demands system/master/computer — otherwise the two parsers
   fight over one sentence.
+- **…and the qualified phrasings were thin until 2026-08-10.** Only four shapes
+  parsed ("system volume 40", "set the system volume to N", "system volume
+  up/down", "turn the system volume up"); everything else a person actually says
+  — "turn **up** the system volume", "raise/lower/increase/boost the system
+  volume", "make the computer louder", "volume up on my computer", "mute my
+  computer" — fell through to a real `claude -p` call, i.e. ~$0.10-0.14 and ~3s
+  to do what wpctl does for free. The widening keeps the qualifier rule intact:
+  relative phrasings are five shapes (`_VOL_REL_RES`, split by sentence shape
+  because a leading direction word is a verb and a trailing one is an adverb),
+  absolutes gained named levels (`NAMED_LEVELS`: max/full/half/quarter/zero,
+  "all the way up"), and mute gained "silence …" + "turn the sound off/on".
+  Unqualified **"max volume" / "half volume" / "make it louder" are still left
+  alone on purpose** — claiming them while bare "volume 40" goes to Spotify
+  would split one sentence shape across two subsystems. `>100` still routes
+  normally instead of clamping (likelier a misheard sentence than a request).
+- **`machine`/`pc`/`speaker` qualify a noun but never stand alone** (review,
+  2026-08-11). Adding them to `_SYS` made `_STATUS_RE`'s bare
+  "<qualifier> status|state" shape match **"machine state"**, "pc status" and
+  "what is the machine state" — an ordinary question about a state machine or a
+  VM, answered with the volume report, filed done, never seen by a model. Same
+  silent-swallow family as "open the door". The bare shape now uses `_SYS_CORE`
+  (the words that were always in it); the wider `_SYS` only ever appears beside
+  an audio noun or the lock.
+- **`_DOWN_WORDS` is a denylist, so an unclassified direction word turns the
+  volume UP** — on a verb whose policy is `allow`, i.e. no confirmation and
+  nothing to notice. `_UP_WORDS` exists solely so a test can pin the partition
+  of `_ADV`/`_VERB`; keep both in step when adding a direction word.
+- **A negative test only pins what its inputs can actually exercise.** The
+  first cut of `test_ordinary_english_is_not_a_volume_command` ("raise an
+  exception", "lower my expectations") was written to pin the qualifier rule
+  and pinned nothing: none of its inputs carries an audio noun, so they fail on
+  the noun, not the qualifier — mutation-tested, the whole suite still passed
+  with the qualifier made optional. `test_the_system_qualifier_is_what_keeps_
+  them_apart` ("raise the volume", "lower the sound") is the one that kills
+  that mutant.
 - **Matching folds case; arguments must not** (fixed 2026-08-02). `_normalize`
   takes `fold=`, and the four arg-bearing patterns run `re.I` against the
   case-preserving string. Pulling the arg out of the folded one stored

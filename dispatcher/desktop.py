@@ -154,17 +154,127 @@ _PUNCT = " \t\n.!?,;:'\"-—"
 # "volume 40" belongs to spotify.detect (media player volume) and the media
 # divert runs first, so every pattern here demands an explicit system/master
 # qualifier. Without that the two parsers would fight over the same sentence.
-_SYS = r"(?:system|master|computer|desktop|laptop)"
+#
+# That invariant is why the widening on 2026-08-10 stopped where it did. The
+# phrasings that failed were the qualified ones — "turn up the system volume",
+# "raise the system volume", "volume up on my computer" all fell through to a
+# model — so those are now covered. The *un*qualified ones ("max volume",
+# "half volume", "make it louder") are deliberately still left alone: claiming
+# them here while bare "volume 40" goes to Spotify would split one sentence
+# shape across two subsystems, which is the exact confusion this rule prevents.
+# The narrow set, and the wider one. They are separate because `machine`, `pc`
+# and `speaker(s)` are safe only next to an audio noun: the bare
+# "<qualifier> status|state" shape in `_STATUS_RE` reads "machine state" and
+# "pc status" as a request for the volume/lock report, and "what is the machine
+# state" is an ordinary question about a state machine, a VM or a CI box. It
+# would be answered "system volume 16%, screen unlocked", filed done, and never
+# reach the model — the silent-swallow failure this module keeps re-learning
+# ("open the door" → launch an app called "the door"). So the bare shape keeps
+# the words that were always there, and the new ones only qualify a noun.
+_SYS_CORE = r"(?:system|master|computer|desktop|laptop)"
+_SYS = rf"(?:{_SYS_CORE}|machine|pc|speakers?)"
+# A determiner in front of the qualifier: "turn up MY computer volume".
+_DET = r"(?:the |my |this )?"
+# The qualifier as it appears directly before a noun, where English allows a
+# possessive: "turn up my computer's volume".
+_SYSP = rf"{_SYS}(?:'s)?"
+# The noun a volume phrase hangs off. `audio`/`sound` are system-side words on
+# their own (the shipped mute patterns have always taken them unqualified);
+# `volume` is the one Spotify also answers to, so it never appears without a
+# system qualifier next to it.
+_AUDIO = r"(?:audio|sound)"
+_NOUN = r"(?:volume|audio|sound)"
 
+# Levels that can be named instead of numbered. Absolute, so `_set_volume`
+# clamps them to 1.0 — "max" is 100%, not the 150% boost wpctl would allow.
+NAMED_LEVELS = {
+    "max": 1.0, "maximum": 1.0, "full": 1.0, "full blast": 1.0,
+    "all the way up": 1.0,
+    "half": 0.5, "halfway": 0.5, "quarter": 0.25, "a quarter": 0.25,
+    "min": 0.0, "minimum": 0.0, "zero": 0.0, "silent": 0.0,
+    "all the way down": 0.0,
+}
+# Longest alternative first, so "max" can't shadow "maximum".
+_NAMED = "(?P<name>%s)" % "|".join(
+    re.escape(w) for w in sorted(NAMED_LEVELS, key=len, reverse=True))
+_NUM = r"(?P<n>\d{1,3})\s*(?:%|percent)?"
+_VALUE = rf"(?:{_NUM}|{_NAMED})"
+
+# Absolute: "system volume 40", "set my computer volume to half",
+# "change the master volume to 20%".
 _VOL_SET_RE = re.compile(
-    rf"^(?:set (?:the )?)?{_SYS} volume (?:to |at )?(?P<n>\d{{1,3}})"
-    r"(?:\s*(?:%|percent))?$")
-_VOL_WORD_RE = re.compile(
-    rf"^(?:turn (?:the )?{_SYS} volume (?P<dir>up|down)"
-    rf"|{_SYS} volume (?P<dir2>up|down))$")
+    rf"^(?:(?:set|put|change|turn) )?{_DET}{_SYSP} {_NOUN} (?:to |at |on )?"
+    rf"{_VALUE}$")
+# The same thing with the qualifier trailing: "set the volume to 40 on my
+# computer".
+_VOL_SET_ON_RE = re.compile(
+    rf"^(?:set|put|change|turn) {_DET}{_NOUN} (?:to |at )?{_VALUE}"
+    rf" (?:on|for) {_DET}{_SYS}$")
+_VOL_MAX_RE = re.compile(rf"^max(?:imum)? out {_DET}{_SYSP} {_NOUN}$")
+
+# Relative. Split by sentence shape rather than crammed into one alternation,
+# because each shape wants a different slice of the direction vocabulary: a
+# leading word is a verb ("raise the …"), a trailing one is an adverb
+# ("… louder").
+_ADV = r"up|down|louder|quieter|softer"
+_VERB = r"raise|increase|boost|lower|decrease|reduce|drop"
+# "turn up" and its synonyms — a verb that needs a direction word after it.
+_HOIST = r"turn|crank|bump|kick|dial"
+_VOL_REL_RES = (
+    # "turn up the system volume", "crank up my laptop sound"
+    re.compile(rf"^(?:{_HOIST}) (?P<dir>up|down) {_DET}{_SYSP} {_NOUN}$"),
+    # "turn the system volume up", "system volume down", "master volume louder"
+    re.compile(rf"^(?:turn |put )?{_DET}{_SYSP} {_NOUN} (?P<dir>{_ADV})$"),
+    # "raise the system volume", "lower my computer volume"
+    re.compile(rf"^(?P<dir>{_VERB}) {_DET}{_SYSP} {_NOUN}$"),
+    # "make the computer louder", "turn my laptop down"
+    re.compile(rf"^(?:make|turn) {_DET}{_SYS} (?P<dir>{_ADV})$"),
+    # "volume up on my computer", "turn the volume up on my laptop",
+    # "make it louder on this machine"
+    re.compile(rf"^(?:turn |make )?(?:it |{_DET}{_NOUN} )?(?P<dir>{_ADV})"
+               rf" (?:on|for) {_DET}{_SYS}$"),
+    # The same trailing qualifier, but with the direction word LEADING —
+    # "turn up the volume on my computer", "raise the volume on my pc". The
+    # two shapes above can't reach these: one wants the noun before the
+    # direction, the other only takes an absolute value.
+    re.compile(rf"^(?:{_HOIST}) (?P<dir>up|down) {_DET}{_NOUN}"
+               rf" (?:on|for) {_DET}{_SYS}$"),
+    re.compile(rf"^(?P<dir>{_VERB}) {_DET}{_NOUN} (?:on|for) {_DET}{_SYS}$"),
+)
+# Every direction word that means quieter; anything else in `dir` means louder.
+#
+# A denylist, so a word added to `_VERB`/`_ADV` and forgotten here would
+# silently turn the volume UP on a verb whose policy is `allow` — no
+# confirmation, no way to notice. `tests/test_desktop.py` pins the partition
+# rather than trusting review to catch it.
+_DOWN_WORDS = frozenset(
+    {"down", "quieter", "softer", "lower", "decrease", "reduce", "drop"})
+_UP_WORDS = frozenset(
+    {"up", "louder", "raise", "increase", "boost"})
+
 _MUTE_RE = re.compile(
-    rf"^(?:(?P<un>un)?mute(?: the)? {_SYS}(?: volume| audio| sound)?"
-    rf"|(?P<un2>un)?mute (?:the )?(?:audio|sound|speakers))$")
+    rf"^(?:(?P<un>un)?mute {_DET}{_SYS}(?: {_NOUN})?"
+    rf"|(?P<un2>un)?mute {_DET}{_AUDIO})$")
+_SILENCE_RE = re.compile(rf"^silence {_DET}(?:{_SYS}|{_AUDIO})$")
+# "turn the sound off" / "turn off the system audio". Restricted to
+# audio/sound: "turn the volume off" would be a bare-volume phrasing, which
+# belongs to the media player by the rule at the top of this section.
+_SOUND_TOGGLE_RE = re.compile(
+    rf"^turn (?:(?P<off>off|on) {_DET}(?:{_SYS} )?{_AUDIO}"
+    rf"|{_DET}(?:{_SYS} )?{_AUDIO} (?P<off2>off|on))$")
+
+
+def _level_of(m: re.Match) -> float | None:
+    """The absolute level a `_VALUE` match asks for, or None if it isn't a real
+    request. Above 100 returns None rather than clamping: "system volume 400"
+    is far likelier to be a misheard sentence than an intent to deafen you, so
+    it goes back to normal routing instead of being executed."""
+    if m.groupdict().get("name"):
+        return NAMED_LEVELS[m.group("name")]
+    n = int(m.group("n"))
+    return n / 100.0 if n <= 100 else None
+
+
 _LOCK_RE = re.compile(
     r"^(?:lock(?: the)?(?: screen| session| computer| laptop| desktop)?"
     r"|lock it)$")
@@ -196,10 +306,16 @@ _CLIP_GET_RE = re.compile(
 _CLIP_SET_RE = re.compile(
     r"^(?:copy|put)\s+(?P<q>.+?)\s+(?:to|on|in)(?:to)? (?:my |the )?clipboard$",
     re.I)
+# `_SYS_CORE`, not `_SYS`, on the bare status/state shape — see the comment
+# there. Every other alternative names an audio noun or the lock, so the wider
+# qualifier set is unambiguous in them.
 _STATUS_RE = re.compile(
-    r"^(?:(?:what(?:'?s| is) the )?{s} (?:status|state)"
-    r"|is the screen locked"
-    r"|what(?:'?s| is) the {s} volume)$".format(s=_SYS))
+    rf"^(?:(?:what(?:'?s| is) )?{_DET}{_SYS_CORE} (?:status|state)"
+    rf"|is the screen locked"
+    rf"|what(?:'?s| is) {_DET}{_SYSP} {_NOUN}"
+    rf"|what {_NOUN} is {_DET}{_SYS} (?:at|on)"
+    rf"|how loud is {_DET}{_SYS}"
+    rf"|is {_DET}(?:{_SYS}|{_AUDIO}) muted)$")
 
 
 # -- shape tests for the two ambiguous branches ------------------------------
@@ -333,13 +449,17 @@ def _normalize(text: str, fold: bool = True) -> str:
     t = re.sub(r"\bhey jarvis\b[,\s]*", "", t, flags=re.I)
     t = re.sub(r"^(?:please|can you|could you|would you)\s+", "",
                t.strip(_PUNCT), flags=re.I)
+    # …and a TRAILING "please", which only the leading form was stripping —
+    # "mute the computer please" is the same command and was reaching a model.
+    t = re.sub(r"[,\s]+please$", "", t.strip(_PUNCT), flags=re.I)
     return t.strip(_PUNCT)
 
 
 def detect(text: str) -> Intent | None:
-    """Intent | None. Pure — no I/O, safe to call twice (main.py gates on it,
-    then the service re-parses). Returns None for anything that isn't an
-    unambiguous desktop command, so normal task routing is unaffected."""
+    """Intent | None. Pure — no I/O, safe to call twice (`Service.try_divert`
+    gates on it, then `run_desktop` re-parses). Returns None for anything that
+    isn't an unambiguous desktop command, so normal task routing is
+    unaffected."""
     t = _normalize(text)
     # Same string with the user's capitalization intact. Matching decisions are
     # made on `t`; every EXTRACTED argument comes from `raw`, because the arg is
@@ -369,16 +489,26 @@ def detect(text: str) -> Intent | None:
     m = _MUTE_RE.match(t)
     if m:
         return Intent("mute", on=not (m.group("un") or m.group("un2")))
-    m = _VOL_SET_RE.match(t)
+    if _SILENCE_RE.match(t):
+        return Intent("mute", on=True)
+    m = _SOUND_TOGGLE_RE.match(t)
     if m:
-        n = int(m.group("n"))
-        if n > 100:
-            return None            # "system volume 400" is not a real request
-        return Intent("volume", number=n / 100.0)
-    m = _VOL_WORD_RE.match(t)
-    if m:
-        up = (m.group("dir") or m.group("dir2")) == "up"
-        return Intent("volume", delta=VOLUME_STEP if up else -VOLUME_STEP)
+        return Intent("mute", on=(m.group("off") or m.group("off2")) == "off")
+
+    for rx in (_VOL_SET_RE, _VOL_SET_ON_RE):
+        m = rx.match(t)
+        if m:
+            level = _level_of(m)
+            if level is None:
+                return None        # "system volume 400" is not a real request
+            return Intent("volume", number=level)
+    if _VOL_MAX_RE.match(t):
+        return Intent("volume", number=1.0)
+    for rx in _VOL_REL_RES:
+        m = rx.match(t)
+        if m:
+            down = m.group("dir") in _DOWN_WORDS
+            return Intent("volume", delta=-VOLUME_STEP if down else VOLUME_STEP)
 
     # A dotted token that isn't a plausible web address ("notes.md",
     # "org.gnome.Nautilus") falls through to the app branch rather than being
