@@ -278,11 +278,13 @@ def chunk_pdf_file(file_label: str, path: Path) -> list[dict]:
     except ImportError as e:
         raise DepMissing(str(e))
     parts, ocr_budget = [], OCR_MAX_PAGES_PER_FILE
+    skipped_pages = 0
     with pymupdf.open(path) as doc:
         for page in doc:
             text = page.get_text().strip()
             if not text:
                 if ocr_budget <= 0:
+                    skipped_pages += 1
                     continue
                 ocr = _ocr(page.get_pixmap(dpi=150).tobytes("png"))
                 if ocr is None:  # no OCR dep: index the text pages we do have
@@ -293,6 +295,10 @@ def chunk_pdf_file(file_label: str, path: Path) -> list[dict]:
                 text = ocr.strip()
             if text:
                 parts.append(f"## page {page.number + 1}\n\n{text}")
+    if skipped_pages:
+        log.info("%s: %d textless page(s) beyond the %d-page OCR budget, "
+                 "not indexed", file_label, skipped_pages,
+                 OCR_MAX_PAGES_PER_FILE)
     return chunk_markdown(file_label, "\n\n".join(parts))
 
 

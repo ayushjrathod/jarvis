@@ -13,7 +13,7 @@ from unittest import mock
 from dispatcher import automations, notify, service
 from dispatcher.db import Database
 from dispatcher.ingest import (chunk_html, chunk_markdown, chunk_plaintext,
-                               html_to_markdown, ingest_vault)
+                               chunk_pdf_file, html_to_markdown, ingest_vault)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -209,6 +209,26 @@ class TestIngestDocs(unittest.TestCase):
         (self.root / "vault" / "inbox" / "x.docx").write_bytes(b"PK\x03\x04junk")
         stats = ingest_vault(self.db, self.root, ["vault"])
         self.assertEqual(stats["dep_gated"], 1)
+
+    @unittest.skipUnless(_installed("pymupdf"), "pymupdf not installed")
+    def test_ocr_budget_overrun_is_logged_not_silent(self):
+        # A 12-page textless PDF gets 10 OCR pages; the old code dropped
+        # pages 11-12 without one line of output though the budget's own
+        # comment promises otherwise.
+        import pymupdf
+        from dispatcher import ingest as ing_mod
+        doc = pymupdf.open()
+        for _ in range(12):
+            doc.new_page()
+        p = self.root / "vault" / "inbox" / "scan.pdf"
+        doc.save(p)
+        doc.close()
+        with mock.patch.object(ing_mod, "_ocr", return_value=""), \
+                self.assertLogs("dispatcher.ingest", level="INFO") as logs:
+            chunks = chunk_pdf_file("vault/inbox/scan.pdf", p)
+        self.assertEqual(chunks, [])
+        self.assertTrue(any("beyond the 10-page OCR budget" in m
+                            for m in logs.output), logs.output)
 
 
 class TestDetect(unittest.TestCase):
