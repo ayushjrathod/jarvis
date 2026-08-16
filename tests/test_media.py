@@ -98,7 +98,9 @@ class TestDetectVolume(unittest.TestCase):
         self.assertAlmostEqual(spotify.detect("set the volume to 75 percent").arg, 0.75)
 
     def test_clamped_above_100(self):
-        self.assertAlmostEqual(spotify.detect("volume 300").arg, 1.0)
+        # Was a clamp to full; now refused like desktop — likelier a
+        # misheard sentence than a request, and never worth full blast.
+        self.assertIsNone(spotify.detect("volume 300"))
 
     def test_relative(self):
         up, down = spotify.detect("turn it up"), spotify.detect("turn it down")
@@ -120,6 +122,19 @@ class TestDetectNegatives(unittest.TestCase):
                   "play a video of the talk", "play chess with me",
                   "play it by ear on the demo", "put on the kettle"):
             self.assertIsNone(spotify.detect(t), t)
+
+    def test_politeness_is_not_part_of_the_request(self):
+        i = spotify.detect("play jazz please")
+        self.assertEqual((i.action, i.query), ("play", "jazz"))
+        self.assertEqual(spotify.detect("pause please").action, "pause")
+        i = spotify.detect("please play some miles davis")
+        self.assertEqual((i.action, i.query), ("play", "miles davis"))
+
+    def test_absurd_volume_routes_instead_of_clamping(self):
+        # desktop refuses >100 as a probable mishearing; clamping to full
+        # would blast the player on a misheard sentence.
+        self.assertIsNone(spotify.detect("volume 400"))
+        self.assertEqual(spotify.detect("volume 40").arg, 0.4)
 
     def test_questions_go_to_claude(self):
         for t in ("what should I play this weekend?",

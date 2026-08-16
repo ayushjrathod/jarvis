@@ -164,7 +164,14 @@ _MUTE_RE = re.compile(r"^(?:mute|mute (?:the )?(?:music|spotify)|unmute)$")
 def _normalize(text: str) -> str:
     t = (text or "").lower().strip(_PUNCT)
     t = re.sub(r"\s+", " ", t)
-    return re.sub(r"\bhey jarvis\b[,\s]*", "", t).strip(_PUNCT)
+    t = re.sub(r"\bhey jarvis\b[,\s]*", "", t).strip(_PUNCT)
+    # Politeness parity with desktop._normalize: "play jazz please" searched
+    # for "jazz please", and "pause please" reached neither parser — a real
+    # claude -p for good manners.
+    t = re.sub(r"^(?:please|can you|could you|would you)\s+", "",
+               t.strip(_PUNCT))
+    t = re.sub(r"[,\s]+please$", "", t.strip(_PUNCT))
+    return t.strip(_PUNCT)
 
 
 def _looks_musical(text: str) -> bool:
@@ -211,7 +218,10 @@ def detect(text: str):
 
     m = _VOL_SET_RE.match(t)
     if m:
-        return Intent("volume", arg=min(100, int(m.group("n"))) / 100.0)
+        n = int(m.group("n"))
+        if n > 100:
+            return None  # probable mishearing, like desktop: route, don't clamp
+        return Intent("volume", arg=n / 100.0)
     m = _VOL_WORD_RE.match(t)
     if m:
         down = (m.group("dir") or m.group("dir2")) == "down" or t in ("quieter", "softer")
