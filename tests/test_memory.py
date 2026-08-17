@@ -145,6 +145,34 @@ class TestIngest(unittest.TestCase):
         self.assertEqual(self.db.search_entries("content"), [])
         self.assertEqual(self.db.vault_file_mtimes(), {})
 
+    def test_unsupported_formats_are_counted_not_celebrated(self):
+        # .csv/.eml have no chunker and were silently nobody's stat — while
+        # the inbox announced them searchable.
+        self.write("vault/inbox/expenses.csv", "a,b\n1,2\n")
+        self.write("vault/inbox/thread.eml", "Subject: hi\n")
+        stats = ingest.ingest_vault(self.db, self.root, ["vault"])
+        self.assertEqual(stats["unsupported"], 2)
+        self.assertEqual(stats["files_scanned"], 0)
+        self.assertEqual(stats["added"], 0)
+
+    def test_corrupt_file_records_mtime_and_stops_billing(self):
+        # A chunker that raises used to leave the mtime unrecorded, so the
+        # file re-paid full parsing on every reindex forever (up to 10 OCR
+        # pages per inbox arrival). Now the mtime is recorded with zero
+        # chunks: skipped until touched again.
+        def boom(rel, p):
+            raise RuntimeError("corrupt")
+
+        self.write("vault/inbox/scan.pdf", "%PDF-garbage")
+        with mock.patch.dict(ingest.CHUNKERS, {".pdf": boom}):
+            stats = ingest.ingest_vault(self.db, self.root, ["vault"])
+        self.assertEqual(stats["unparseable"], 1)
+        self.assertIn("vault/inbox/scan.pdf", self.db.vault_file_mtimes())
+        with mock.patch.dict(ingest.CHUNKERS, {".pdf": boom}):
+            again = ingest.ingest_vault(self.db, self.root, ["vault"])
+        self.assertEqual(again["files_changed"], 0)
+        self.assertEqual(again["unparseable"], 0)
+
     def test_hidden_files_skipped(self):
         self.write("vault/.obsidian/cache.md", "# H\nsecret\n")
         ingest.ingest_vault(self.db, self.root, ["vault"])

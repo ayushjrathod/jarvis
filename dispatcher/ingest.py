@@ -340,8 +340,9 @@ def ingest_vault(db: Database, root: Path, dirs: list[str]) -> dict:
     indexed = db.vault_file_mtimes()
     seen: set[str] = set()
     stats = {"files_scanned": 0, "files_changed": 0, "added": 0, "deleted": 0,
-             "dep_gated": 0}
+             "dep_gated": 0, "unsupported": 0, "unparseable": 0}
     gated_names: list[str] = []
+    unsupported_names: list[str] = []
     walked_prefixes: list[str] = []
     for d in dirs:
         base = root / d
@@ -359,6 +360,13 @@ def ingest_vault(db: Database, root: Path, dirs: list[str]) -> dict:
                 if p.suffix.lower() in DEP_GATED_EXTS:
                     stats["dep_gated"] += 1
                     gated_names.append(rel)
+                else:
+                    # .csv/.eml/.json/.zip and friends: no chunker, and until
+                    # now not even counted — the inbox announced "Indexed N
+                    # files — searchable now" over files that indexed nothing.
+                    stats["unsupported"] += 1
+                    if len(unsupported_names) < 5:
+                        unsupported_names.append(rel)
                 continue
             # stat() before anything is counted: a file that vanished between
             # the rglob and here must fall through to the prune pass below
@@ -396,7 +404,21 @@ def ingest_vault(db: Database, root: Path, dirs: list[str]) -> dict:
                 log.warning("ingest: skipping %s: %s", rel, e)
                 continue
             except Exception as e:  # one corrupt pdf/image must not end the walk
+                # ...but it must not bill us forever either. Until now a file
+                # whose chunker raised never recorded its mtime, so with the
+                # inbox reindexing the whole vault per arrival, one corrupt
+                # scanned PDF re-paid up to 10 OCR pages (~15s) per arrival,
+                # indefinitely, with files_changed at 0 hiding it. Record the
+                # mtime with zero chunks: skipped until touched again, and any
+                # stale entries for it are dropped rather than quoted forever.
+                # (DepMissing is separate above on purpose: a broken dep comes
+                # back, a corrupt file doesn't fix itself.)
                 log.warning("ingest: failed to parse %s: %s", rel, e)
+                added, deleted = db.replace_file_entries(rel, mtime, [])
+                stats["files_changed"] += 1
+                stats["added"] += added
+                stats["deleted"] += deleted
+                stats["unparseable"] += 1
                 continue
             stats["files_changed"] += 1
             stats["added"] += added
@@ -415,4 +437,8 @@ def ingest_vault(db: Database, root: Path, dirs: list[str]) -> dict:
         log.info("ingest: %d file(s) need PDF/OCR deps, not indexed: %s%s",
                  len(gated_names), ", ".join(gated_names[:5]),
                  "…" if len(gated_names) > 5 else "")
+    if unsupported_names:
+        log.info("ingest: %d unsupported file(s), not indexed: %s%s",
+                 stats["unsupported"], ", ".join(unsupported_names),
+                 "…" if stats["unsupported"] > 5 else "")
     return stats

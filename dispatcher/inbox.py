@@ -47,6 +47,37 @@ SUMMARIZE_PROMPT = (
 )
 
 
+def arrival_summary(arrived: list[str], stats: dict | None,
+                    skipped: int = 0) -> str:
+    """The honest one-liner for an inbox arrival, derived from the REINDEX —
+    never from the arrival list. The old code announced 'Indexed N files —
+    searchable now' over whatever landed, so a contract.docx/csv/eml that
+    indexed nothing was still celebrated, and a raised reindex still
+    notified success. stats=None means the reindex raised."""
+    what = arrived[0] if len(arrived) == 1 else f"{len(arrived)} files"
+    if stats is None:
+        return (f"Couldn't index {what} from your inbox — "
+                "will retry on the next pass.")
+    added = stats.get("added", 0)
+    if added > 0:
+        s = f"Indexed {what} from your inbox — searchable now."
+    else:
+        why = []
+        if stats.get("unsupported"):
+            why.append(f"{stats['unsupported']} unsupported format(s)")
+        if stats.get("dep_gated"):
+            why.append(f"{stats['dep_gated']} need PDF/OCR deps")
+        if stats.get("unparseable"):
+            why.append(f"{stats['unparseable']} couldn't be parsed")
+        detail = (" (" + ", ".join(why) + ")") if why else ""
+        s = (f"{what} from your inbox arrived but nothing new is searchable"
+             f"{detail}.")
+    if skipped:
+        s += (f" Summarizing {len(arrived) - skipped}; "
+              f"{skipped} skipped by the per-poll cap.")
+    return s
+
+
 def scan(directory: Path) -> dict[str, tuple[float, int]]:
     """{relative name: (mtime, size)} for regular files, README excluded.
     Missing directory scans as empty rather than raising — the inbox is a
@@ -152,13 +183,14 @@ async def watch(svc):
                     log.info("inbox: %d file(s) removed: %s", len(removed),
                              ", ".join(removed[:5]))
                 try:
-                    stats = await asyncio.to_thread(
+                    stats: dict | None = await asyncio.to_thread(
                         ingest.ingest_vault, svc.db, cfg.root,
                         cfg.memory.get("index_dirs", ["vault"]))
                     log.info("inbox reindex: %s", stats)
                     await asyncio.to_thread(embeddings.embed_missing, cfg, svc.db)
                 except Exception:
                     log.exception("inbox reindex failed")
+                    stats = None
 
                 # `arrived` only — a removal reindexes but is never announced.
                 # Without this guard a deleted file notified "Indexed 0 files
@@ -182,12 +214,7 @@ async def watch(svc):
                             "summarizing %s; skipped %s", summarize_cap,
                             ", ".join(todo) or "nothing", ", ".join(skipped))
                     if icfg.get("notify", True):
-                        what = (arrived[0] if len(arrived) == 1
-                                else f"{len(arrived)} files")
-                        summary = f"Indexed {what} from your inbox — searchable now."
-                        if skipped:
-                            summary += (f" Summarizing {len(todo)}; "
-                                        f"{len(skipped)} skipped by the per-poll cap.")
+                        summary = arrival_summary(arrived, stats, len(skipped))
                         await notify.send_desktop(summary)
                         await svc.hooks.fire({
                             "event": "notify", "task_id": None, "kind": "inbox",
