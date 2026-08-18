@@ -10,6 +10,21 @@ export default function AgentMonitor({ lastEvent, epoch }) {
   const [steps, setSteps] = useState({}); // task_id -> flat step list
 
   useEffect(() => {
+    seed();
+  }, [epoch]);
+
+  // Nothing reconciles a healthy stream: both loss paths above leave SSE up,
+  // so no reconnect fires and a row whose terminal event was dropped reads
+  // non-terminal until reload. While any visible row is non-terminal, poll
+  // /tasks lightly; the moment everything settles, the interval clears
+  // itself — no background churn on a quiet board.
+  useEffect(() => {
+    if (!rows.some((r) => !TERMINAL.has(r.status))) return;
+    const t = setInterval(seed, 5000);
+    return () => clearInterval(t);
+  });
+
+  function seed() {
     getJSON("/tasks?limit=15")
       .then((tasks) =>
         setRows(
@@ -25,7 +40,7 @@ export default function AgentMonitor({ lastEvent, epoch }) {
         )
       )
       .catch(() => {});
-  }, [epoch]);
+  }
 
   useEffect(() => {
     if (!lastEvent?.task_id) return;
