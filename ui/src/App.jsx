@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { subscribeEvents } from "./api.js";
 import { widgets } from "./widgets/index.js";
 import ConfirmBar from "./widgets/ConfirmBar.jsx";
@@ -19,7 +20,14 @@ export default function App() {
   useEffect(
     () =>
       subscribeEvents(
-        (ev) => setLastEvent(ev),
+        (ev) => {
+          // React 18 auto-batches same-tick updates, and Chrome dispatches
+          // every SSE event parsed from one network read synchronously — so
+          // done(A)+step(B) in one read rendered once and every widget only
+          // ever saw B: A stayed "running" forever on a healthy stream. One
+          // synchronous commit per event; steps are cheap renders.
+          flushSync(() => setLastEvent(ev));
+        },
         (status) => {
           setConn(status);
           // not on the first connect — the widgets' mount fetch is that seed
@@ -31,6 +39,22 @@ export default function App() {
       ),
     []
   );
+
+  // A healthy stream never reconnects, so `epoch` never bumps for anything
+  // the events above dropped before this fix — and for anything they drop in
+  // future. Coming back to the tab (or the network) re-seeds every widget.
+  useEffect(() => {
+    const reseed = () => setEpoch((n) => n + 1);
+    const onVis = () => {
+      if (document.visibilityState === "visible") reseed();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    window.addEventListener("online", reseed);
+    return () => {
+      document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener("online", reseed);
+    };
+  }, []);
 
   return (
     <div className="app">
