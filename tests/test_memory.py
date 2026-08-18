@@ -145,6 +145,28 @@ class TestIngest(unittest.TestCase):
         self.assertEqual(self.db.search_entries("content"), [])
         self.assertEqual(self.db.vault_file_mtimes(), {})
 
+    def test_natural_language_question_reaches_bm25(self):
+        # Finding 1.4: FTS5 implicit AND demanded every token — stopwords
+        # included — in one chunk, so search_entries returned 0 rows for any
+        # NL question and hybrid search was pure KNN. AND-first still wins
+        # where it hits; the OR leg only fires on a miss.
+        self.write("vault/memory/USER.md",
+                   "<!-- editor note -->\n\n## Tools\nMy preferred coding tool is Neovim.\n")
+        ingest.ingest_vault(self.db, self.root, ["vault"])
+        hits = self.db.search_entries("what is my preferred coding tool?")
+        self.assertTrue(any("Neovim" in h["raw"] for h in hits), hits)
+        # ...and exact-phrase behavior is unchanged where AND hits.
+        exact = self.db.search_entries("preferred coding tool Neovim")
+        self.assertTrue(exact)
+
+    def test_natural_language_question_reaches_episodes(self):
+        self.db.add_episode(None, "voice", "quick", None, "done",
+                            "remind me to water the plants",
+                            "Done, watering the fern every morning.")
+        hits = self.db.search_episodes("when do I water the plants?")
+        self.assertTrue(any("fern" in (h["user_text"] + h["assistant_text"])
+                            for h in hits), hits)
+
     def test_unsupported_formats_are_counted_not_celebrated(self):
         # .csv/.eml have no chunker and were silently nobody's stat — while
         # the inbox announced them searchable.

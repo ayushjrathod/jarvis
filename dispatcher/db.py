@@ -244,6 +244,23 @@ def fts_query_any(q: str) -> str:
     return " OR ".join(f'"{t}"' for t in terms if t)
 
 
+def _fts_with_fallback(c, sql: str, args: list, q: str):
+    """Run an AND-joined FTS query; on zero rows retry OR-joined.
+
+    FTS5 joins space-separated terms with implicit AND, so every
+    natural-language question ('what is my preferred coding tool') demanded
+    all its words — stopwords included — in one chunk and returned nothing,
+    leaving hybrid search as pure KNN. AND-first preserves exact behavior
+    wherever it hits; the OR leg only fires on a miss, where BM25 still ranks
+    the fullest match first."""
+    rows = c.execute(sql, args).fetchall()
+    if not rows:
+        any_match = fts_query_any(q)
+        if any_match and any_match != args[0]:
+            rows = c.execute(sql, [any_match, *args[1:]]).fetchall()
+    return rows
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -589,7 +606,7 @@ class Database:
         sql += " ORDER BY score LIMIT ?"
         args.append(limit)
         with self._conn() as c:
-            return [dict(r) for r in c.execute(sql, args).fetchall()]
+            return [dict(r) for r in _fts_with_fallback(c, sql, args, q)]
 
     # -- skill usage (Phase G) ---------------------------------------------
 
@@ -1112,4 +1129,4 @@ class Database:
         sql += " ORDER BY score LIMIT ?"
         args.append(limit)
         with self._conn() as c:
-            return [dict(r) for r in c.execute(sql, args).fetchall()]
+            return [dict(r) for r in _fts_with_fallback(c, sql, args, q)]
