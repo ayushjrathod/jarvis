@@ -489,17 +489,17 @@ class TestEpisodeClipping(unittest.TestCase):
 
     def test_under_budget_is_untouched(self):
         text = self._export(3, 50)
-        self.assertEqual(graph.clip_episodes(text, 100000), text)
+        self.assertEqual(graph.clip_episodes(text, 100000)[0], text)
 
     def test_keeps_the_newest_episodes_not_the_oldest(self):
         text = self._export(10, 400)
-        out = graph.clip_episodes(text, 1500)
+        out, _seen = graph.clip_episodes(text, 1500)
         self.assertLessEqual(len(out), 1500)
         self.assertIn("marker10", out)       # the newest survived
         self.assertNotIn("marker1 ", out)    # the oldest did not
 
     def test_clips_on_whole_episode_boundaries(self):
-        out = graph.clip_episodes(self._export(10, 400), 1500)
+        out, _seen = graph.clip_episodes(self._export(10, 400), 1500)
         blocks = out.split("## Episode ")[1:]
         self.assertTrue(blocks)
         for b in blocks:                     # no half-parsed episode survives
@@ -507,7 +507,7 @@ class TestEpisodeClipping(unittest.TestCase):
 
     def test_the_clip_is_announced_in_band_and_logged(self):
         with self.assertLogs("dispatcher.graph", level="WARNING") as cm:
-            out = graph.clip_episodes(self._export(10, 400), 1500)
+            out, _seen = graph.clip_episodes(self._export(10, 400), 1500)
         self.assertIn("older episode(s) omitted", out)
         self.assertTrue(any("over the" in m for m in cm.output))
 
@@ -515,14 +515,14 @@ class TestEpisodeClipping(unittest.TestCase):
         for budget in (400, 900, 1500, 3000):
             with self.subTest(budget=budget):
                 with self.assertLogs("dispatcher.graph", level="WARNING"):
-                    out = graph.clip_episodes(self._export(10, 400), budget)
+                    out, _seen = graph.clip_episodes(self._export(10, 400), budget)
                 self.assertLessEqual(len(out), budget)
 
     def test_a_single_oversized_episode_is_truncated_not_dropped(self):
         """Handing the extractor an empty <episodes> block would be worse than
         a truncated one."""
         with self.assertLogs("dispatcher.graph", level="WARNING"):
-            out = graph.clip_episodes(self._export(2, 5000), 900)
+            out, _seen = graph.clip_episodes(self._export(2, 5000), 900)
         self.assertLessEqual(len(out), 900)
         self.assertIn("marker2", out)          # the newest, truncated
         self.assertNotIn("marker1 ", out)
@@ -530,9 +530,21 @@ class TestEpisodeClipping(unittest.TestCase):
     def test_unrecognized_shape_still_keeps_the_recent_end(self):
         text = "oldest marker\n" + "y" * 5000 + "\nnewest marker"
         with self.assertLogs("dispatcher.graph", level="WARNING"):
-            out = graph.clip_episodes(text, 200)
+            out, seen = graph.clip_episodes(text, 200)
         self.assertIn("newest marker", out)
         self.assertNotIn("oldest marker", out)
+        self.assertEqual(seen, [])  # nothing parseable: mark nothing, retry
+
+    def test_clip_reports_which_episodes_survived(self):
+        # The service marks only these extracted: marking the full list
+        # orphaned ~178 of 200 episodes past the budget on every backlog.
+        _out, seen = graph.clip_episodes(self._export(10, 400), 1500)
+        for i in seen:
+            self.assertIn(f"marker{i} ", _out)
+        self.assertNotIn(1, seen)  # oldest dropped
+        self.assertIn(10, seen)  # newest kept
+        _out2, seen2 = graph.clip_episodes(self._export(3, 50), 100000)
+        self.assertEqual(seen2, [1, 2, 3])  # under budget: all seen
 
     def test_extraction_prompt_applies_the_clip(self):
         with self.assertLogs("dispatcher.graph", level="WARNING"):

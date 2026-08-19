@@ -17,7 +17,7 @@ from . import (automations, desktop, embeddings, graph, limits, memory, notify,
 from .areas import AreaRegistry
 from .classifier import classify
 from .config import Config
-from .db import Database
+from .db import Database, local_today
 from .events import EventBus
 from .hooks import HookRegistry
 
@@ -1172,7 +1172,10 @@ class Service:
         return bool((self.cfg.memory.get("graph") or {}).get("enabled"))
 
     def _today(self) -> str:
-        return datetime.now(timezone.utc).date().isoformat()
+        # Local wall clock, like db.local_today: the UTC version told the
+        # extractor and the reconciler yesterday at +5:30, same family as the
+        # consolidation {{DATE}} fix.
+        return local_today()
 
     async def graph_extract(self, episodes_text: str,
                             episode_ids: list[int]) -> dict | None:
@@ -1180,8 +1183,14 @@ class Service:
         JSON call, deterministic apply (graph.py). None = parse failure —
         the export file is still on disk for a manual replay."""
         candidates = graph.candidate_ids(self.db)  # the exact set the prompt shows
+        # Clip once HERE: the extractor only ever sees the clipped text, so
+        # only the surviving ids may be marked extracted or linked to facts.
+        # Marking the full list orphaned ~178 of 200 episodes past the budget
+        # on every backlog. extraction_prompt re-clips internally, which is a
+        # no-op on already-clipped text (no double warning).
+        clipped, seen = graph.clip_episodes(episodes_text)
         task = await self.create_task(
-            graph.extraction_prompt(self.db, episodes_text, self._today()),
+            graph.extraction_prompt(self.db, clipped, self._today()),
             "graph-extract", "quick", None, {"task_type": "graph-extract"},
             trusted=True)
         reply, status = await self._collect_quick(task)
@@ -1189,7 +1198,7 @@ class Service:
             if status != "done":
                 raise ValueError(f"extract task status {status}")
             counts = graph.apply_extraction(
-                self.db, graph.parse_reply(reply), episode_ids,
+                self.db, graph.parse_reply(reply), seen,
                 allowed_ids=candidates)
         except ValueError as e:
             log.warning("graph extraction failed: %s", e)
@@ -1198,7 +1207,7 @@ class Service:
         # rate-limited run leaves the episodes unmarked so the next pass
         # retries them, which is the same fail-toward-retry direction
         # `mark_episodes_unconsolidated` takes for the consolidation half.
-        self.db.mark_episodes_graph_extracted(episode_ids)
+        self.db.mark_episodes_graph_extracted(seen)
         await self.hooks.fire({"event": "graph", **counts})
         log.info("graph extraction: %s", counts)
         return counts
