@@ -361,6 +361,17 @@ class TestRunnerTransientRetry(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(mock_spawn.call_count, 1)
 
+    async def test_unexpected_crash_becomes_failed_not_raised(self):
+        # Finding 2.3: one stream-json line over STREAM_LIMIT raises ValueError
+        # out of the readline — that used to propagate, skipping finish_run
+        # and stranding the run row `running` forever.
+        cfg = _test_cfg()
+        with patch("dispatcher.runner._attempt",
+                   AsyncMock(side_effect=ValueError("5MiB line"))):
+            result = await run_once("do it", cfg, None, [], {}, "task1")
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("internal error", result["error"])
+
 
 class TestDeniedToolSurfacing(unittest.IsolatedAsyncioTestCase):
     """2026-07-21..23: the CLI denied the daily brief every Write, the model
@@ -905,6 +916,36 @@ class TestTrustBoundaryMetadata(unittest.TestCase):
         self.assertEqual(out["automation_id"], "kept")
         self.assertIs(out["notify"], False)
         self.assertEqual(out["task_type"], "memory-consolidate")
+
+
+class TestStrandedRunRow(unittest.IsolatedAsyncioTestCase):
+    """Finding 2.3, service half: whatever escapes between create_run and
+    finish_run must still close the books. run_once never raises anymore, but
+    the finally below is what guarantees it for every future crash shape."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        cfg = Config(root=Path(self.tmp.name))
+        cfg.db_path = Path(self.tmp.name) / "t.db"
+        from dispatcher.service import Service
+        self.svc = Service(cfg)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    async def test_crash_mid_attempt_settles_the_run_row(self):
+        task = self.svc.db.create_task("do a thing", "api", "agentic", None, {})
+        with patch("dispatcher.runner.run_once",
+                   AsyncMock(side_effect=ValueError("5MiB line"))):
+            await self.svc._run_agentic(task)
+        self.assertEqual(self.svc.db.get_task(task["id"])["status"], "failed")
+        with self.svc.db._conn() as c:
+            rows = c.execute("SELECT status, error FROM runs WHERE task_id=?",
+                             (task["id"],)).fetchall()
+        self.assertTrue(rows)
+        for r in rows:
+            self.assertEqual(r["status"], "failed")
+        self.assertTrue(any("crashed" in (r["error"] or "") for r in rows))
 
 
 class TestForgedConsolidation(unittest.IsolatedAsyncioTestCase):

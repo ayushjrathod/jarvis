@@ -96,6 +96,32 @@ async def run_once(text: str, cfg: Config, model: str | None, tools: list[str],
     spawn/timeout error). Returns normalized result fields incl. `steps`.
     resume_session_id continues an earlier CLI session (reflection forks ride
     the warm prompt cache); max_cost_usd overrides the default budget cap;
+    on_step is an async callback fired per timeline step as it happens. Never
+    raises (except CancelledError, which is BaseException and always
+    propagates): an unexpected crash inside _attempt used to skip finish_run
+    entirely, stranding the run row `running` forever while the task read
+    failed with no diagnosis. A crash is a failed result with the traceback
+    in the error, not an exception."""
+    try:
+        return await _run_with_retry(
+            text, cfg, model, tools, procs, task_id,
+            system_extra, resume_session_id, max_cost_usd, on_step)
+    except Exception as e:
+        log.exception("run_once crashed for task %s", task_id)
+        return {"status": "failed",
+                "error": f"internal error: {type(e).__name__}: {e}"}
+
+
+async def _run_with_retry(text: str, cfg: Config, model: str | None,
+                          tools: list[str],
+                          procs: dict, task_id: str, system_extra: str = "",
+                          resume_session_id: str | None = None,
+                          max_cost_usd: float | None = None,
+                          on_step=None) -> dict:
+    """One `claude -p` attempt (with one internal retry on a transient
+    spawn/timeout error). Returns normalized result fields incl. `steps`.
+    resume_session_id continues an earlier CLI session (reflection forks ride
+    the warm prompt cache); max_cost_usd overrides the default budget cap;
     on_step is an async callback fired per timeline step as it happens."""
     for attempt in (1, 2):
         try:

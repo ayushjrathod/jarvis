@@ -771,31 +771,51 @@ class Service:
         for attempt, model in attempts:
             label = model or "cli-default"
             run_id = self.db.create_run(task["id"], attempt, label)
-            if simulate and attempt == 1:
-                result = {"status": "refused", "stop_reason": "refusal",
-                          "error": "simulated refusal (metadata.simulate_refusal)"}
-            else:
-                result = await runner.run_once(
-                    task["text"], self.cfg, model, tools, self.procs, task["id"],
-                    system_extra=system_extra,
-                    resume_session_id=meta.get("resume_session_id"),
-                    max_cost_usd=meta.get("max_cost_usd"),
-                    on_step=on_step,
+            # Finding 2.3: run_id is local, so anything escaping between here
+            # and finish_run left runs.status='running' forever while the task
+            # read failed with no diagnosis (real trigger: one stream-json
+            # line over runner.STREAM_LIMIT raises ValueError out of the
+            # readline). run_once never raises anymore, but the books close
+            # HERE regardless — a run row is a fact about an attempt that
+            # started, and it always gets an ending.
+            settled = False
+            try:
+                if simulate and attempt == 1:
+                    result = {"status": "refused", "stop_reason": "refusal",
+                              "error": "simulated refusal (metadata.simulate_refusal)"}
+                else:
+                    result = await runner.run_once(
+                        task["text"], self.cfg, model, tools, self.procs, task["id"],
+                        system_extra=system_extra,
+                        resume_session_id=meta.get("resume_session_id"),
+                        max_cost_usd=meta.get("max_cost_usd"),
+                        on_step=on_step,
+                    )
+                # cancel() may have killed the subprocess and closed the books
+                # while run_once was returning; don't overwrite 'cancelled'
+                # with 'failed' (cancel_open_runs already settled this row).
+                current = self.db.get_task(task["id"])
+                if current and current["status"] == "cancelled":
+                    settled = True
+                    return
+                output_path = runner.guess_output_path(task["text"], self.cfg.root)
+                self.db.finish_run(
+                    run_id, result["status"],
+                    stop_reason=result.get("stop_reason"), cost_usd=result.get("cost_usd"),
+                    input_tokens=result.get("input_tokens"), output_tokens=result.get("output_tokens"),
+                    num_turns=result.get("num_turns"), session_id=result.get("session_id"),
+                    output_text=result.get("output_text"), error=result.get("error"),
+                    output_path=output_path,
                 )
-            # cancel() may have killed the subprocess and closed the books while
-            # run_once was returning; don't overwrite 'cancelled' with 'failed'
-            current = self.db.get_task(task["id"])
-            if current and current["status"] == "cancelled":
-                return
-            output_path = runner.guess_output_path(task["text"], self.cfg.root)
-            self.db.finish_run(
-                run_id, result["status"],
-                stop_reason=result.get("stop_reason"), cost_usd=result.get("cost_usd"),
-                input_tokens=result.get("input_tokens"), output_tokens=result.get("output_tokens"),
-                num_turns=result.get("num_turns"), session_id=result.get("session_id"),
-                output_text=result.get("output_text"), error=result.get("error"),
-                output_path=output_path,
-            )
+                settled = True
+            finally:
+                if not settled:
+                    try:
+                        self.db.finish_run(run_id, "failed",
+                                           error="internal error: attempt crashed "
+                                                 "before settling")
+                    except Exception:
+                        log.exception("run settle failed for run %s", run_id)
             try:
                 self.db.add_run_steps(run_id, result.get("steps") or [])
             except Exception:
