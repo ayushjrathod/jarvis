@@ -39,6 +39,8 @@ a about an and are as at be by can could did do does for from get give had has
 have how i if in is it me my of on or should so tell that the their them then
 there these this to was were what when where which who why will with would you
 your
+re ve ain don isn aren wasn weren hasn haven hadn doesn didn couldn wouldn
+shouldn mustn needn daren
 """.split())
 MIN_CONTENT_WORDS = 1
 # The anchor probes one content word at a time (see search_memory), so a
@@ -50,7 +52,13 @@ ANCHOR_TERMS = 8
 
 
 def _content_words(question: str) -> list[str]:
-    words = re.findall(r"[a-z0-9']{2,}", (question or "").lower())
+    # No apostrophe in the charset, on purpose (fixed 2026-08-19): FTS5's
+    # unicode61 tokenizer SPLITS on it, so keeping `'` made `what's` a content
+    # word while `what` is a stopword — and the probe matched any chunk
+    # containing "what's", which in Claude-written prose is nearly all of
+    # them. Split the same way: what's→what, don't→don, and the extra
+    # STOPWORDS above (don/isn/wasn/re/ve/…) catch the leftover stems.
+    words = re.findall(r"[a-z0-9]{2,}", (question or "").lower())
     return [w for w in words if w not in STOPWORDS]
 
 
