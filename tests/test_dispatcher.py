@@ -494,6 +494,27 @@ class TestDenialBlocksOutput(unittest.TestCase):
         self.assertTrue(runner.denial_could_block_output("permission denied"))
         self.assertTrue(runner.denial_could_block_output(""))
 
+    def test_consolidation_input_does_not_doom_the_verdict(self):
+        # Finding 2.2: the prompt names its INPUT first (written pre-submit,
+        # so always stale) and its outputs later — first-match made this
+        # permanently False for consolidations, force-failing good runs on a
+        # harmless denial and re-running the batch nightly.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "data" / "consolidation").mkdir(parents=True)
+            (root / "vault" / "memory").mkdir(parents=True)
+            export = root / "data" / "consolidation" / "x.md"
+            export.write_text("episodes")
+            old = time.time() - 600
+            os.utime(export, (old, old))
+            text = ("Step 1: read data/consolidation/x.md. Step 2: update "
+                    "vault/memory/MEMORY.md with what you learn.")
+            now = time.time() - 60
+            self.assertFalse(runner.wrote_declared_output(text, root, now))
+            (root / "vault" / "memory" / "MEMORY.md").write_text("blocks")
+            self.assertTrue(runner.wrote_declared_output(text, root, now))
+            self.assertIsNone(runner.wrote_declared_output("no paths", root, 0))
+
 
 
 class TestReapReader(unittest.IsolatedAsyncioTestCase):

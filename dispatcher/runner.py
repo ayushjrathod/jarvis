@@ -61,16 +61,23 @@ def wrote_declared_output(task_text: str, root, since: float) -> bool | None:
     """Did a prompt that names an output file ("write it to vault/briefs/x.md")
     actually produce it during this run? None when the prompt names no file.
 
-    mtime, not mere existence: re-running a brief on a day whose file already
-    exists must not mask a denial that stopped it being refreshed."""
-    m = OUTPUT_PATH_RE.search(task_text)
-    if not m:
+    ANY named file, not the first: the consolidation prompt names its INPUT
+    (data/consolidation/<stamp>.md, written before submit so its mtime always
+    predates the run) in step 1 and its outputs later — first-match made this
+    permanently False for that task type, so one harmless denial force-failed
+    a good run, rolled the episodes back, and re-ran the same batch every
+    night. mtime, not mere existence: re-running a brief on a day whose file
+    already exists must not mask a denial that stopped it being refreshed."""
+    paths = [m.group(0) for m in OUTPUT_PATH_RE.finditer(task_text)]
+    if not paths:
         return None
-    p = Path(root) / m.group(0)
-    try:
-        return p.stat().st_mtime >= since
-    except OSError:
-        return False
+    for rel in paths:
+        try:
+            if (Path(root) / rel).stat().st_mtime >= since:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 # Whitelist for the one-time transient retry below: a spawn error (CLI binary
