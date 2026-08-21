@@ -1014,9 +1014,24 @@ class Database:
             live = self._live_ids(c, "entries", [p[0] for p in pairs])
             rows = [p for p in pairs if p[0] in live]
             if rows:
-                c.executemany(
-                    "INSERT OR REPLACE INTO entries_vec (rowid, embedding) VALUES (?,?)",
-                    rows)
+                # OR IGNORE, not OR REPLACE: vec0 (sqlite-vec 0.1.9) RAISES on
+                # REPLACE — only UPDATE … WHERE rowid=? works. Two overlapping
+                # backfill passes (inbox arrival vs 15-min refresh) compute the
+                # same missing list, and the loser's whole executemany aborted
+                # on the first colliding rowid, rolling back non-colliding
+                # rows too. Measured further: this vec0 build raises even on
+                # the OR-IGNORE conflict path, so a residual collision falls
+                # back to per-row UPDATE — the one write vec0 honors. Either
+                # way the winner's vectors stand; same model, same content.
+                # (A model CHANGE re-embeds via reset, which deletes first.)
+                try:
+                    c.executemany(
+                        "INSERT OR IGNORE INTO entries_vec (rowid, embedding) VALUES (?,?)",
+                        rows)
+                except sqlite3.OperationalError:
+                    for rid, emb in rows:
+                        c.execute("UPDATE entries_vec SET embedding=? WHERE rowid=?",
+                                  (emb, rid))
 
     def add_episode_embeddings(self, pairs: list[tuple[int, bytes]]):
         if not pairs:
@@ -1025,9 +1040,15 @@ class Database:
             live = self._live_ids(c, "episodes", [p[0] for p in pairs])
             rows = [p for p in pairs if p[0] in live]
             if rows:
-                c.executemany(
-                    "INSERT OR REPLACE INTO episodes_vec (rowid, embedding) VALUES (?,?)",
-                    rows)
+                # OR IGNORE + UPDATE fallback — see add_entry_embeddings.
+                try:
+                    c.executemany(
+                        "INSERT OR IGNORE INTO episodes_vec (rowid, embedding) VALUES (?,?)",
+                        rows)
+                except sqlite3.OperationalError:
+                    for rid, emb in rows:
+                        c.execute("UPDATE episodes_vec SET embedding=? WHERE rowid=?",
+                                  (emb, rid))
 
     def sweep_orphan_vectors(self) -> int:
         """Delete vec rows whose backing entry/episode is gone (L3). vec0 tables

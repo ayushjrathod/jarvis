@@ -100,6 +100,36 @@ class TestVecStore(unittest.TestCase):
                              " WHERE rowid=?", (eid,)).fetchone()["n"]
         self.assertEqual(left, 0)
 
+    def test_overlapping_passes_do_not_raise_on_vec0(self):
+        # Finding 2.6: two backfill passes over the same missing list made the
+        # loser's whole executemany abort on the first colliding rowid — vec0
+        # RAISES on INSERT OR REPLACE — rolling back non-colliding rows too.
+        eid = self.ids["a"]
+        self.db.add_entry_embeddings([(eid, vec(0))])  # already embedded
+        with self.db._conn() as c:
+            n = c.execute("SELECT count(*) n FROM entries_vec"
+                          " WHERE rowid=?", (eid,)).fetchone()["n"]
+        self.assertEqual(n, 1)
+
+    def test_concurrent_inserts_do_not_raise(self):
+        import threading
+        eid = self.ids["b"]
+        errors = []
+
+        def hammer():
+            try:
+                for _ in range(20):
+                    self.db.add_entry_embeddings([(eid, vec(1))])
+            except Exception as e:  # noqa: BLE001 — the test IS the handler
+                errors.append(e)
+
+        threads = [threading.Thread(target=hammer) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+
 
 class TestOrphanVectorsDoNotEatResultSlots(unittest.TestCase):
     """A vec row whose backing entry is gone must not cost the caller a hit.

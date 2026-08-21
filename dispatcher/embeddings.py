@@ -25,6 +25,13 @@ DIM = 384  # bge-small; must match the vec0 column in db.py
 
 _engine = None
 _lock = threading.Lock()
+# Serializes whole backfill passes. Every caller runs embed_missing in a
+# thread (asyncio.to_thread), so a threading lock — not an asyncio one — is
+# the right shape: an inbox arrival landing mid-refresh used to run a second
+# pass over the same missing list, colliding rowids with the first. OR IGNORE
+# keeps the collision from raising, but without the lock both passes still
+# pay the full embed cost for the same rows.
+_backfill_lock = threading.Lock()
 
 
 def enabled(cfg: Config) -> bool:
@@ -63,6 +70,11 @@ def embed_missing(cfg: Config, db: Database, batch: int = 128) -> dict:
     stats = {"entries": 0, "episodes": 0, "orphans_swept": 0}
     if not (enabled(cfg) and db.vec_ok):
         return stats
+    with _backfill_lock:
+        return _embed_missing_inner(cfg, db, batch, stats)
+
+
+def _embed_missing_inner(cfg: Config, db: Database, batch: int, stats: dict) -> dict:
     # clear vectors whose entry/episode was deleted since the last pass, so a
     # reindexed-away chunk can't keep matching KNN queries (L3)
     stats["orphans_swept"] = db.sweep_orphan_vectors()
