@@ -167,6 +167,20 @@ class TestIngest(unittest.TestCase):
         self.assertTrue(any("fern" in (h["user_text"] + h["assistant_text"])
                             for h in hits), hits)
 
+    def test_episode_before_filter_is_inclusive_of_today(self):
+        # Finding 2.6: valid_at is a full ISO timestamp string-compared
+        # against a bare date, so before=<today> silently dropped today's
+        # episodes while keeping today's notes.
+        from datetime import date
+        self.db.add_episode(None, "voice", "quick", None, "done",
+                            "water the fern", "watering the fern done")
+        today = date.today().isoformat()
+        hits = self.db.search_episodes("fern", before=today)
+        self.assertTrue(any("fern" in (h["user_text"] + h["assistant_text"])
+                            for h in hits), hits)
+        hits = self.db.search_episodes("fern", after=today)
+        self.assertTrue(hits)
+
     def test_unsupported_formats_are_counted_not_celebrated(self):
         # .csv/.eml have no chunker and were silently nobody's stat — while
         # the inbox announced them searchable.

@@ -603,11 +603,15 @@ class Database:
             " WHERE episodes_fts MATCH ?"
         )
         args: list = [match]
+        # valid_at is a full ISO timestamp, the filters are bare dates:
+        # comparing raw strings made before=<today> silently drop today's
+        # episodes while keeping today's notes (entries filter on a bare
+        # date column and were always inclusive). Compare calendar days.
         if after:
-            sql += " AND e.valid_at >= ?"
+            sql += " AND substr(e.valid_at,1,10) >= ?"
             args.append(after)
         if before:
-            sql += " AND e.valid_at <= ?"
+            sql += " AND substr(e.valid_at,1,10) <= ?"
             args.append(before)
         sql += " ORDER BY score LIMIT ?"
         args.append(limit)
