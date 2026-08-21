@@ -5,10 +5,11 @@ apply. Vec tests skip when the sqlite-vec extension is unavailable."""
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
-from dispatcher import graph
+from dispatcher import embeddings, graph
 from dispatcher.db import Database, _rrf
 from dispatcher.ingest import chunk_markdown
 
@@ -129,6 +130,62 @@ class TestVecStore(unittest.TestCase):
         for t in threads:
             t.join()
         self.assertEqual(errors, [])
+
+
+class TestEmbeddingIdentity(unittest.TestCase):
+    """Finding 2.6: a different 384-dim model was accepted silently, so KNN
+    answered from an incompatible space with no error anywhere — and a
+    non-384-dim one failed every backfill while search kept serving stale
+    vectors."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.tmp.name) / "t.db")
+        if not self.db.vec_ok:
+            self.skipTest("sqlite-vec unavailable")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _cfg(self, model=embeddings.DEFAULT_MODEL):
+        cfg = mock.Mock()
+        cfg.embeddings = {"enabled": True, "model": model}
+        return cfg
+
+    def test_first_pass_stamps_identity_without_reset(self):
+        eid = self.db.add_episode("t", "voice", "quick", None, "done", "q", "a")
+        with mock.patch.object(embeddings, "embed_passages",
+                               return_value=[vec(7)]) as ep:
+            stats = embeddings.embed_missing(self._cfg(), self.db)
+        self.assertTrue(ep.called)
+        self.assertFalse(stats["model_reset"])
+        self.assertEqual(self.db.embedding_identity(),
+                         (embeddings.DEFAULT_MODEL, embeddings.DIM))
+        self.assertEqual(self.db.episodes_missing_embeddings(10), [])
+
+    def test_model_change_drops_and_rebuilds(self):
+        eid = self.db.add_episode("t", "voice", "quick", None, "done", "q", "a")
+        self.db.add_episode_embeddings([(eid, vec(7))])
+        self.db.set_embedding_identity("sentence-transformers/all-MiniLM-L6-v2",
+                                       embeddings.DIM)
+        with mock.patch.object(embeddings, "embed_passages",
+                               return_value=[vec(7)]):
+            with self.assertLogs("dispatcher.embeddings", level="WARNING") as logs:
+                stats = embeddings.embed_missing(self._cfg(), self.db)
+        self.assertTrue(stats["model_reset"])
+        self.assertTrue(any("model changed" in m for m in logs.output))
+        self.assertEqual(self.db.embedding_identity(),
+                         (embeddings.DEFAULT_MODEL, embeddings.DIM))
+        # rebuilt from source text, not coexisting
+        self.assertEqual(self.db.episodes_missing_embeddings(10), [])
+
+    def test_same_model_never_resets(self):
+        self.db.set_embedding_identity(embeddings.DEFAULT_MODEL, embeddings.DIM)
+        with mock.patch.object(embeddings, "embed_passages",
+                               return_value=[]) as ep:
+            stats = embeddings.embed_missing(self._cfg(), self.db)
+        self.assertFalse(stats["model_reset"])
+        self.assertFalse(ep.called)
 
 
 class TestOrphanVectorsDoNotEatResultSlots(unittest.TestCase):

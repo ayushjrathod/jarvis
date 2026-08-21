@@ -67,7 +67,7 @@ def embed_missing(cfg: Config, db: Database, batch: int = 128) -> dict:
     """Backfill vectors for entries/episodes that don't have one yet. Runs in
     a thread (CPU-bound); called at startup, after reindex, and on the
     refresh loop — cheap when nothing is new."""
-    stats = {"entries": 0, "episodes": 0, "orphans_swept": 0}
+    stats = {"entries": 0, "episodes": 0, "orphans_swept": 0, "model_reset": False}
     if not (enabled(cfg) and db.vec_ok):
         return stats
     with _backfill_lock:
@@ -75,6 +75,20 @@ def embed_missing(cfg: Config, db: Database, batch: int = 128) -> dict:
 
 
 def _embed_missing_inner(cfg: Config, db: Database, batch: int, stats: dict) -> dict:
+    model = (cfg.embeddings or {}).get("model", DEFAULT_MODEL)
+    have = db.embedding_identity()
+    if have != (model, DIM):
+        if have != (None, None):
+            # Same dims, different space: every KNN neighbor computed from
+            # here on would be wrong with no error anywhere. Drop and rebuild
+            # from source text rather than coexist.
+            dropped = db.reset_embeddings()
+            log.warning("embedding model changed %s -> %s; dropped %s vectors, "
+                        "re-embedding from source text", have, (model, DIM), dropped)
+            stats["model_reset"] = True
+        db.set_embedding_identity(model, DIM)
+    # clear vectors whose entry/episode was deleted since the last pass, so a
+    # reindexed-away chunk can't keep matching KNN queries (L3)
     # clear vectors whose entry/episode was deleted since the last pass, so a
     # reindexed-away chunk can't keep matching KNN queries (L3)
     stats["orphans_swept"] = db.sweep_orphan_vectors()

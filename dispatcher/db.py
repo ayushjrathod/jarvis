@@ -200,6 +200,12 @@ MIGRATIONS = [
     # extractor had already read successfully. NULL = never extracted, which is
     # where every pre-2026-08-11 episode starts.
     "ALTER TABLE episodes ADD COLUMN graph_extracted_at TEXT",
+    # Which embedding model wrote the vectors. A different 384-dim model
+    # (all-MiniLM-L6-v2) used to be accepted silently, coexisting in an
+    # incompatible space with no re-embed trigger — search answered from
+    # stale vectors every 15 minutes while logging backfill failure for a
+    # non-384-dim one. CREATE IF NOT EXISTS: runs clean on new and old DBs.
+    "CREATE TABLE IF NOT EXISTS embedding_meta (k TEXT PRIMARY KEY, v TEXT)",
 ]
 
 # Share of a candidate window reserved for the NEWEST active facts. Today's
@@ -1049,6 +1055,37 @@ class Database:
                     for rid, emb in rows:
                         c.execute("UPDATE episodes_vec SET embedding=? WHERE rowid=?",
                                   (emb, rid))
+
+    def embedding_identity(self) -> tuple[str | None, int | None]:
+        """(model, dim) that wrote the current vectors, (None, None) on a
+        fresh db. Vectors are raw model output — same dims, different space
+        means wrong neighbors with no error anywhere."""
+        try:
+            with self._conn() as c:
+                rows = dict(c.execute("SELECT k, v FROM embedding_meta").fetchall())
+        except sqlite3.OperationalError:
+            return None, None
+        dim = rows.get("dim")
+        return rows.get("model"), int(dim) if dim is not None else None
+
+    def set_embedding_identity(self, model: str, dim: int):
+        with self._conn() as c:
+            c.execute("INSERT OR REPLACE INTO embedding_meta (k, v) VALUES (?,?)",
+                      ("model", model))
+            c.execute("INSERT OR REPLACE INTO embedding_meta (k, v) VALUES (?,?)",
+                      ("dim", str(dim)))
+
+    def reset_embeddings(self) -> dict:
+        """Drop every vector (model change); the next backfill re-embeds from
+        source text. Returns what was dropped, for the log."""
+        with self._conn() as c:
+            out = {}
+            if self.vec_ok:
+                for table in ("entries_vec", "episodes_vec"):
+                    n = c.execute(f"SELECT count(*) n FROM {table}").fetchone()["n"]
+                    c.execute(f"DELETE FROM {table}")
+                    out[table] = n
+        return out
 
     def sweep_orphan_vectors(self) -> int:
         """Delete vec rows whose backing entry/episode is gone (L3). vec0 tables
