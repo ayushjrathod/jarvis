@@ -11,7 +11,7 @@ import logging
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 log = logging.getLogger("dispatcher.db")
@@ -269,6 +269,17 @@ def _fts_with_fallback(c, sql: str, args: list, q: str):
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _is_date(s) -> bool:
+    """A YYYY-MM-DD string (the valid_at shape), nothing else."""
+    if not isinstance(s, str) or len(s.strip()) != 10:
+        return False
+    try:
+        date.fromisoformat(s.strip())
+        return True
+    except ValueError:
+        return False
 
 
 def local_today() -> str:
@@ -791,15 +802,37 @@ class Database:
                           (fid, eid))
         return fid
 
-    def invalidate_facts(self, ids: list[int]) -> int:
+    def invalidate_facts(self, ids: list[int],
+                         superseded_at: str | None = None) -> int:
+        """Retire facts, keeping the bi-temporal columns distinct: invalid_at
+        is when the GRAPH learned it (now, record time); expired_at is when
+        the fact stopped being true in the WORLD — the superseding
+        knowledge's valid_at. The old code stamped both with now(), making
+        the columns redundant and losing history the schema says can't be
+        retrofitted. And a candidate NEWER than the superseding knowledge is
+        never killed by it: the model naming an id is a suggestion, and old
+        knowledge must not eat new (skips are logged, not silent)."""
         if not ids:
             return 0
+        exp = superseded_at if _is_date(superseded_at) else now()
         with self._conn() as c:
-            cur = c.execute(
-                f"UPDATE kg_facts SET invalid_at=?, expired_at=?"
+            rows = c.execute(
+                f"SELECT id, valid_at FROM kg_facts"
                 f" WHERE invalid_at IS NULL AND id IN"
                 f" ({','.join('?' * len(ids))})",
-                [now(), now(), *ids])
+                list(ids)).fetchall()
+            kill = [r["id"] for r in rows
+                    if r["valid_at"] is None or r["valid_at"] <= exp]
+            skipped = len(rows) - len(kill)
+            if skipped:
+                log.info("kg: kept %d candidate(s) newer than the superseding "
+                         "knowledge (%s)", skipped, exp)
+            if not kill:
+                return 0
+            cur = c.execute(
+                f"UPDATE kg_facts SET invalid_at=?, expired_at=?"
+                f" WHERE id IN ({','.join('?' * len(kill))})",
+                [now(), exp, *kill])
             return cur.rowcount
 
     def active_facts(self, limit: int = 80) -> list[dict]:

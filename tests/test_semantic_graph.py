@@ -279,6 +279,38 @@ class TestGraphStore(unittest.TestCase):
         self.assertTrue(self.db.search_facts("neovim", include_invalid=True))
         self.assertEqual(self.db.graph_counts()["facts_invalidated"], 1)
 
+    def test_invalidation_keeps_record_time_and_world_time_distinct(self):
+        old = self.db.add_fact("Ayra uses Vim.", ["Ayra"], valid_at="2026-07-01")
+        self.assertEqual(self.db.invalidate_facts([old], superseded_at="2026-07-18"), 1)
+        with self.db._conn() as c:
+            row = c.execute("SELECT invalid_at, expired_at FROM kg_facts WHERE id=?",
+                            (old,)).fetchone()
+        self.assertEqual(row["expired_at"], "2026-07-18")  # world time: the new fact
+        self.assertNotEqual(row["invalid_at"], "2026-07-18")  # record time: now-ish
+        self.assertTrue(row["invalid_at"] >= "2026-07-18")
+
+    def test_newer_knowledge_survives_older_supersession(self):
+        # The model naming an id is a suggestion: a candidate NEWER than the
+        # superseding knowledge must not be killed by it.
+        new = self.db.add_fact("Ayra uses Neovim.", ["Ayra"], valid_at="2026-08-01")
+        self.assertEqual(self.db.invalidate_facts([new], superseded_at="2026-07-18"), 0)
+        self.assertTrue(self.db.search_facts("neovim"))
+        undated = self.db.add_fact("Ayra edits text.", ["Ayra"])
+        self.assertEqual(self.db.invalidate_facts([undated], superseded_at="2026-07-18"), 1)
+
+    def test_extraction_threads_the_new_date_into_retirement(self):
+        old = self.db.add_fact("Ayra uses Vim.", ["Ayra"], valid_at="2026-07-01")
+        counts = graph.apply_extraction(self.db, {
+            "facts": [{"fact": "Ayra switched to Neovim.",
+                       "entities": ["Ayra", "Neovim"], "valid_at": "2026-07-18"}],
+            "invalidated_ids": [old],
+        }, episode_ids=[7])
+        self.assertEqual(counts, {"facts_added": 1, "invalidated": 1})
+        with self.db._conn() as c:
+            row = c.execute("SELECT expired_at FROM kg_facts WHERE id=?",
+                            (old,)).fetchone()
+        self.assertEqual(row["expired_at"], "2026-07-18")
+
     def test_one_hop_neighbors(self):
         f1 = self.db.add_fact("Ayra runs mission-control.", ["Ayra", "mission-control"])
         f2 = self.db.add_fact("mission-control runs on Arch.", ["mission-control", "Arch"])

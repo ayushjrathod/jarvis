@@ -220,6 +220,7 @@ def apply_extraction(db: Database, obj: dict, episode_ids: list[int],
     if allowed_ids is None:
         allowed_ids = candidate_ids(db, CANDIDATE_LIMIT)
     added, invalidated, duplicates = 0, 0, 0
+    added_dates: list[str] = []
     for item in obj.get("facts") or []:
         if added >= MAX_FACTS_PER_BATCH:
             break
@@ -238,10 +239,15 @@ def apply_extraction(db: Database, obj: dict, episode_ids: list[int],
         valid_at = _valid_date(item.get("valid_at"))
         db.add_fact(fact, names[:MAX_ENTITIES_PER_FACT], valid_at=valid_at,
                     episode_ids=episode_ids)
+        if valid_at:
+            added_dates.append(valid_at)
         added += 1
     ids = _allowed_invalidations(obj.get("invalidated_ids"), allowed_ids)
     if ids:
-        invalidated = db.invalidate_facts(ids)
+        # expired_at for the retired facts is the NEW knowledge's date, not
+        # now — and anything newer than it survives (see invalidate_facts).
+        superseded_at = max(added_dates) if added_dates else None
+        invalidated = db.invalidate_facts(ids, superseded_at=superseded_at)
     # Rotate the candidate window only now: selection has to stay stable across
     # candidate_ids() + extraction_prompt(), so the stamp happens once the
     # window has actually been used (db.candidate_facts).
