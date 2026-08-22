@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import random
 import sys
 import threading
@@ -420,12 +421,20 @@ class Jarvis:
         while PTT is alive; it costs one default-executor thread for the life
         of the process, which is cheap next to a silently dead hotkey.
         2026-08-10.
+
+        The exit is os._exit, not an exception (2026-08-22): raising here only
+        worked in --mode ptt, where every other task finishes and gather lets
+        the error out. In --mode both — the mode the service actually runs —
+        wake_loop is parked in a blocking to_thread capture that never
+        returns, so gather() never completes, asyncio.run() then hangs joining
+        the non-daemon worker, and the process lives on deaf with systemd
+        reporting active. _exit skips cleanup (no finally, no log flush);
+        that is the price of actually dying, and dying is the whole job.
         """
         await asyncio.to_thread(watcher.join)
-        raise RuntimeError(
-            f"PTT hotkey watcher exited ({watcher.error or 'no error recorded'}); "
-            "exiting so systemd restarts us"
-        )
+        log.error("PTT hotkey watcher exited (%s); exiting so systemd restarts us",
+                  watcher.error or "no error recorded")
+        os._exit(1)
 
     async def run(self):
         self.loop = asyncio.get_running_loop()

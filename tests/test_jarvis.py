@@ -1126,7 +1126,12 @@ class TestHotkeyWatcherSupervision(unittest.TestCase):
         self.assertIsInstance(w.error, OSError)
         self.assertTrue(any("watcher died" in line for line in caught.output))
 
-    def test_supervisor_raises_when_the_watcher_stops(self):
+    def test_supervisor_exits_the_process_when_the_watcher_stops(self):
+        # Was RuntimeError (2026-08-10): enough in --mode ptt, where every
+        # other task finishes and gather lets the error out — but in --mode
+        # both the wake capture never returns, gather never completes, and
+        # the process lives on deaf. os._exit(1) dies in every mode, which is
+        # what trips Restart=on-failure.
         app = _app()
         w = HotkeyWatcher("KEY_F9", lambda: None, lambda: None)
         w._watch = lambda: None   # "crashes" immediately, hardware never touched
@@ -1135,8 +1140,9 @@ class TestHotkeyWatcherSupervision(unittest.TestCase):
         async def scenario():
             await asyncio.wait_for(app._supervise_ptt(w), timeout=5)
 
-        with self.assertRaises(RuntimeError):
+        with mock.patch("jarvis.main.os._exit") as gone:
             asyncio.run(scenario())
+        gone.assert_called_once_with(1)
 
 
 class TestHotkeyPerDeviceState(unittest.TestCase):
