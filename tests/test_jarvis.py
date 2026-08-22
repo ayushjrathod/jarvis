@@ -1178,6 +1178,67 @@ class TestHotkeyPerDeviceState(unittest.TestCase):
         self.assertEqual(pressed, set())
 
 
+class TestHotkeyRescanMerge(unittest.TestCase):
+    """Finding 0.3c: the watcher rescanned only when its set EMPTIED, but the
+    set can never empty while ydotoold is up — so a replugged keyboard stayed
+    dead until a service restart, and one BlockingIOError dropped every
+    healthy board with it."""
+
+    class _Dev:
+        def __init__(self, fd, path):
+            self.fd, self.path, self.closed = fd, path, False
+
+        def close(self):
+            self.closed = True
+
+    def _watcher(self):
+        events = []
+        w = HotkeyWatcher("KEY_F9",
+                          lambda: events.append("press"),
+                          lambda: events.append("release"))
+        return w, events
+
+    def test_new_board_is_merged_in(self):
+        w, _ = self._watcher()
+        by_fd, pressed = {}, set()
+        new = self._Dev(9, "/dev/input/event9")
+        with mock.patch("jarvis.hotkey.find_keyboards", return_value=[new]):
+            self.assertEqual(w._merge_devices(by_fd, pressed), 1)
+        self.assertEqual(by_fd, {9: new})
+
+    def test_duplicate_open_is_closed_not_leaked(self):
+        w, _ = self._watcher()
+        watched = self._Dev(3, "/dev/input/event3")
+        dup = self._Dev(3, "/dev/input/event3")
+        by_fd = {3: watched}
+        with mock.patch("jarvis.hotkey.find_keyboards", return_value=[dup]):
+            self.assertEqual(w._merge_devices(by_fd, {}), 0)
+        self.assertEqual(by_fd, {3: watched})
+        self.assertTrue(dup.closed)
+        self.assertFalse(watched.closed)
+
+    def test_replugged_board_swaps_fd_and_releases_stuck_press(self):
+        w, events = self._watcher()
+        stale = self._Dev(3, "/dev/input/event3")
+        fresh = self._Dev(7, "/dev/input/event3")
+        by_fd, pressed = {3: stale}, {3}
+        with mock.patch("jarvis.hotkey.find_keyboards", return_value=[fresh]):
+            self.assertEqual(w._merge_devices(by_fd, pressed), 1)
+        self.assertEqual(by_fd, {7: fresh})
+        self.assertTrue(stale.closed)
+        self.assertEqual(events, ["release"])  # ended cleanly, never wedged
+        self.assertEqual(pressed, set())
+
+    def test_failed_rescan_leaves_the_set_untouched(self):
+        w, _ = self._watcher()
+        watched = self._Dev(3, "/dev/input/event3")
+        by_fd = {3: watched}
+        with mock.patch("jarvis.hotkey.find_keyboards",
+                         side_effect=OSError("wedged /dev/input")):
+            self.assertEqual(w._merge_devices(by_fd, set()), 0)
+        self.assertEqual(by_fd, {3: watched})
+
+
 class TestDispatcherBrainCancelClose(unittest.TestCase):
     """2026-08-10: the /cancel POST was guarded but the aclose() above it was
     not, so on a broken socket — exactly when cancelling matters — the
