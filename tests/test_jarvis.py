@@ -458,10 +458,13 @@ class _FakeOut:
     still gets closed (sounddevice's own context manager only closes in
     __exit__, which never runs when __enter__ raised)."""
 
-    def __init__(self, on_write=None, start_error=None):
+    def __init__(self, on_write=None, start_error=None, stop_error=None,
+                 close_error=None):
         self.writes: list = []
         self._on_write = on_write
         self._start_error = start_error
+        self._stop_error = stop_error
+        self._close_error = close_error
         self.started = False
         self.closed = False
 
@@ -471,10 +474,14 @@ class _FakeOut:
         self.started = True
 
     def stop(self):
+        if self._stop_error is not None:
+            raise self._stop_error
         self.started = False
 
     def close(self):
         self.closed = True
+        if self._close_error is not None:
+            raise self._close_error
 
     def write(self, data):
         self.writes.append(data)
@@ -562,6 +569,47 @@ class TestStreamLeakOnFailedStart(unittest.TestCase):
                 stream.__enter__()
         self.assertTrue(fake.closed)
         self.assertIsNone(stream._stream)  # and nothing left half-open on self
+
+
+class TestRecorderDeviceFailure(unittest.TestCase):
+    """Finding 0.3b: a capture-device error wedged the Recorder permanently —
+    stop() raised with _stream still set, so is_recording() stayed True
+    forever and the wake word spun in on_busy() for the life of the process;
+    start() leaked the native stream the same way MicStream did."""
+
+    def _recording(self, fake):
+        r = Recorder()
+        with mock.patch("jarvis.audio.sd.InputStream", return_value=fake):
+            r.start()
+        r._append(np.zeros((512, 1), dtype=np.int16))
+        return r
+
+    def test_start_failure_closes_and_leaves_nothing_half_open(self):
+        fake = _FakeOut(start_error=OSError("device busy"))
+        r = Recorder()
+        with mock.patch("jarvis.audio.sd.InputStream", return_value=fake):
+            with self.assertRaises(OSError):
+                r.start()
+        self.assertTrue(fake.closed)
+        self.assertIsNone(r._stream)
+        self.assertFalse(r.is_recording())
+
+    def test_stop_failure_returns_frames_and_clears(self):
+        fake = _FakeOut(stop_error=OSError("device unplugged"))
+        r = self._recording(fake)
+        with self.assertLogs("jarvis.audio", level="WARNING"):
+            out = r.stop()
+        self.assertEqual(len(out), 512)  # captured audio still valid
+        self.assertTrue(fake.closed)
+        self.assertIsNone(r._stream)
+        self.assertFalse(r.is_recording())
+
+    def test_close_failure_after_stop_failure_still_returns_frames(self):
+        fake = _FakeOut(stop_error=OSError("gone"), close_error=OSError("gone"))
+        r = self._recording(fake)
+        out = r.stop()  # must not raise: a notification cannot fail capture
+        self.assertEqual(len(out), 512)
+        self.assertIsNone(r._stream)
 
 
 class TestPlayAsyncLogsFailures(unittest.TestCase):

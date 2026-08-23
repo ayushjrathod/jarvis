@@ -84,18 +84,40 @@ class Recorder:
             def cb(indata, _frames, _time, _status):
                 self._append(indata)
 
-            self._stream = sd.InputStream(
+            stream = sd.InputStream(
                 samplerate=self.sample_rate, channels=1, dtype="int16", callback=cb
             )
-            self._stream.start()
+            try:
+                stream.start()
+            except BaseException:
+                # Same leak MicStream had: PortAudio allocates in __init__,
+                # so a failed start() strands a native stream unless we close
+                # it here. And _stream stays None — a half-open object must
+                # never read as recording.
+                stream.close()
+                raise
+            self._stream = stream
 
     def stop(self) -> np.ndarray:
         with self._lock:
-            if self._stream is None:
+            stream, self._stream = self._stream, None
+            if stream is None:
                 return np.zeros(0, dtype=np.int16)
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+            try:
+                stream.stop()
+            except Exception:
+                # Device unplugged mid-capture, PipeWire node died: the old
+                # code let this propagate with _stream still set, so
+                # is_recording() stayed True forever and the wake word spun
+                # in on_busy() for the life of the process. The frames
+                # captured so far are still valid — return them.
+                log.warning("recorder stop() failed; returning captured audio",
+                            exc_info=True)
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
             if not self._frames:
                 return np.zeros(0, dtype=np.int16)
             return np.concatenate(self._frames).flatten()
