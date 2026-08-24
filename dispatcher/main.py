@@ -13,6 +13,7 @@ import logging
 import mimetypes
 from collections.abc import Iterable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import uvicorn
@@ -98,6 +99,31 @@ class DesktopIn(BaseModel):
 class DesktopConfirmIn(BaseModel):
     confirm_id: str
     approve: bool = True
+
+
+def register_vault_routes(app: FastAPI, vault_dir: Path):
+    """Dashboard file endpoints (mechanical file I/O, no Claude). First group
+    out of create_app's 600-line body; the rest follow group by group."""
+
+    @app.get("/vault/tasks")
+    async def vault_tasks():
+        return vault.list_tasks(vault_dir)
+
+    @app.post("/vault/tasks/{filename}/toggle")
+    async def vault_toggle(filename: str):
+        try:
+            return vault.toggle_task(vault_dir, filename)
+        except FileNotFoundError:
+            raise HTTPException(404, "no such task file")
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    @app.get("/vault/brief")
+    async def vault_brief():
+        brief = vault.current_brief(vault_dir)
+        if not brief:
+            raise HTTPException(404, "no briefs yet")
+        return brief
 
 
 def create_app(cfg: Config | None = None) -> FastAPI:
@@ -278,28 +304,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         }
 
     # -- vault endpoints for the dashboard (mechanical file I/O, no Claude) --
-
-    vault_dir = cfg.root / "vault"
-
-    @app.get("/vault/tasks")
-    async def vault_tasks():
-        return vault.list_tasks(vault_dir)
-
-    @app.post("/vault/tasks/{filename}/toggle")
-    async def vault_toggle(filename: str):
-        try:
-            return vault.toggle_task(vault_dir, filename)
-        except FileNotFoundError:
-            raise HTTPException(404, "no such task file")
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-
-    @app.get("/vault/brief")
-    async def vault_brief():
-        brief = vault.current_brief(vault_dir)
-        if not brief:
-            raise HTTPException(404, "no briefs yet")
-        return brief
+    register_vault_routes(app, cfg.root / "vault")
 
     # -- memory endpoints (Phase F) -----------------------------------------
 
