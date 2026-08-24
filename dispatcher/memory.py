@@ -14,11 +14,10 @@ import json
 import logging
 from pathlib import Path
 
-import yaml
-
 from .areas import AreaRegistry
 from .config import Config
 from .db import Database, local_today, now
+from .queue_watcher import parse_task_file
 
 log = logging.getLogger("dispatcher.memory")
 
@@ -201,13 +200,9 @@ def build_consolidation(cfg: Config, db: Database) -> dict | None:
     export = _write_new(export, render_episodes(episodes))
 
     prompt_path = cfg.root / "areas" / "memory" / "agents" / "consolidate.md"
-    text = prompt_path.read_text()
-    meta = {}
-    if text.startswith("---"):
-        parts = text.split("---", 2)
-        if len(parts) == 3:
-            meta = yaml.safe_load(parts[1]) or {}
-            text = parts[2].strip()
+    # Same single frontmatter reader as areas and run_agent (parse_task_file):
+    # body for the prompt here, grants via AreaRegistry per the H2 comment.
+    meta, text = parse_task_file(prompt_path.read_text())
     rel = str(export.relative_to(cfg.root))
     text = text.replace("{{EPISODES_FILE}}", rel).replace("{{DATE}}", local_today())
 

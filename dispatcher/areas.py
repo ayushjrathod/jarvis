@@ -16,6 +16,8 @@ from pathlib import Path
 
 import yaml
 
+from .queue_watcher import parse_task_file
+
 log = logging.getLogger("dispatcher.areas")
 
 
@@ -142,17 +144,21 @@ def _parse_skill(path: Path, privileged: set = frozenset()) -> Area | None:
     # now drops out exactly like bad frontmatter already did (2026-08-10).
     try:
         text = path.read_text()
-        meta, body = {}, text
-        if text.startswith("---"):
-            parts = text.split("---", 2)
-            if len(parts) == 3:
-                meta = yaml.safe_load(parts[1]) or {}
-                body = parts[2].strip()
-    except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
+    except (OSError, UnicodeDecodeError) as e:
         log.warning("skipping unreadable area skill %s: %s", path, e)
         return None
-    if not isinstance(meta, dict):  # `---\n- a\n---` parses to a list
-        log.warning("skipping area skill %s: frontmatter is not a mapping", path)
+    try:
+        # One frontmatter reader for the whole dispatcher (parse_task_file):
+        # this used to be a fifth copy of the same split, and copies drift —
+        # the H2 bypass lived in exactly such a copy. strict=True keeps the
+        # stood-down contract below: a non-mapping frontmatter skips the area
+        # instead of loading a neutered skill.
+        meta, body = parse_task_file(text, strict=True)
+    except yaml.YAMLError as e:
+        log.warning("skipping area skill %s: bad frontmatter: %s", path, e)
+        return None
+    except ValueError as e:
+        log.warning("skipping area skill %s: %s", path, e)
         return None
 
     def phrases(key):

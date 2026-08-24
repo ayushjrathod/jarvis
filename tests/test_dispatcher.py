@@ -122,6 +122,14 @@ class TestQueueParsing(unittest.TestCase):
         self.assertEqual(meta["mode"], "auto")
         self.assertIn("---", body)
 
+    def test_non_mapping_frontmatter(self):
+        # Tolerant by default (queue/vault must survive hand-mangled files),
+        # strict on request (area manifests must not load neutered).
+        meta, body = parse_task_file("---\n- a\n- b\n---\nbody\n")
+        self.assertEqual((meta, body), ({}, "body"))
+        with self.assertRaises(ValueError):
+            parse_task_file("---\n- a\n- b\n---\nbody\n", strict=True)
+
 
 class TestRefusalDetection(unittest.TestCase):
     def test_variants(self):
