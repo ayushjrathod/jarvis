@@ -376,8 +376,10 @@ per query.
 systemd; so are the unplanned additions (ask-screen, media control, desktop
 control T1, phone access + PWA, degraded mode, inbox watcher). Three
 whole-codebase reviews have been run **and remediated** (sessions 13, 26, 27)
-plus the standing-list sweeps in 28 and 29. **738 tests green**, `main` pushed to
-origin at 2026-08-11.
+plus the standing-list sweeps in 28 and 29. **811 tests green** on the
+`history/aug-sep-backfill` branch (sessions 31–33 remediating the session-30
+review: vault cordon, Tier 0/1/2 fixes, deafness trilogy, ops), `main`
+pushed to origin at 2026-08-11.
 
 **A fourth review (session 30, 2026-08-13) has been run and NOT remediated** —
 81 findings, none fixed, in `context/reviews/2026-08-13-full-codebase-review.md`
@@ -416,7 +418,8 @@ exists to gate yet).
   `mission-tailscale-serve` has no `Restart=`, so a dispatcher that reaches
   `failed` deactivates it via `Requires=` and restarting the dispatcher does
   **not** bring it back — phone access dies silently.
-- **738 unit tests** green. `smoke_phase_a.sh` **8/8** (the script has 8 `ok()`
+- **811 unit tests** green (branch `history/aug-sep-backfill`, sessions 31–33).
+  `smoke_phase_a.sh` **8/8** (the script has 8 `ok()`
   calls; "7/7" was stale) and `smoke_phase_b.py` 12/12 as of session 25 — both
   spend real quota, so they are not run every session.
 - `doctor.sh` does **not** check `mission-jarvis` or `mission-dictate`, does not
