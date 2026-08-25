@@ -25,9 +25,23 @@ from pydantic import BaseModel
 from . import (automations, curator, desktop, embeddings, inbox, ingest, memory,
                queue_watcher, quick, spotify, stt, vault)
 from .config import Config
+from .db import Database
 from .service import Service, make_ack, resolve_screenshot
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+
+_log = logging.getLogger("dispatcher.main")
+
+
+async def _embed_missing(cfg: Config, db: Database):
+    """Best-effort vector backfill, shared by startup, the refresh loop and
+    POST /memory/reindex. Hoisted out of create_app with the memory routes."""
+    if not embeddings.enabled(cfg):
+        return
+    try:
+        await asyncio.to_thread(embeddings.embed_missing, cfg, db)
+    except Exception:
+        _log.exception("embedding backfill failed")
 
 # StaticFiles types the PWA manifest by extension. Python 3.14's stdlib already
 # maps .webmanifest, but older interpreters don't and would serve it as
@@ -126,19 +140,63 @@ def register_vault_routes(app: FastAPI, vault_dir: Path):
         return brief
 
 
+def register_memory_read_routes(app: FastAPI, svc: Service, cfg: Config):
+    """Search, reindex and blocks. Second group out of create_app; the write
+    paths (consolidate/reconcile) stay until their turn — they share the
+    serialization helper with the route."""
+
+    @app.get("/memory/search")
+    async def memory_search(q: str, limit: int = 10, scope: str = "all",
+                            file: str | None = None,
+                            after: str | None = None,
+                            before: str | None = None):
+        """Hybrid FTS5+vector search (RRF-fused) over the vault index and the
+        episode log; deterministic filters (file glob, after/before dates)
+        force the FTS-only path, khoj-style filters-before-vector. Degrades
+        to FTS-only without embeddings/sqlite-vec."""
+        qvec = None
+        if embeddings.enabled(cfg) and svc.db.vec_ok:
+            try:
+                qvec = await asyncio.to_thread(embeddings.embed_query, cfg, q)
+            except Exception:
+                _log.exception("query embedding failed; falling back to FTS")
+        out: dict = {}
+        if scope in ("all", "vault"):
+            out["entries"] = (
+                svc.db.search_entries(q, limit, file, after, before)
+                if (file or after or before)
+                else svc.db.search_entries_hybrid(q, qvec, limit))
+        if scope in ("all", "episodes"):
+            out["episodes"] = (
+                svc.db.search_episodes(q, limit, after, before)
+                if (after or before)
+                else svc.db.search_episodes_hybrid(q, qvec, limit))
+        if scope in ("all", "graph"):
+            facts = svc.db.search_facts(q, limit)
+            out["facts"] = facts
+            out["fact_neighbors"] = svc.db.fact_neighbors(
+                [f["id"] for f in facts], limit)
+        if not out:
+            raise HTTPException(400, "scope must be all|vault|episodes|graph")
+        return out
+
+    @app.post("/memory/reindex")
+    async def memory_reindex():
+        stats = await asyncio.to_thread(
+            ingest.ingest_vault, svc.db, cfg.root,
+            cfg.memory.get("index_dirs", ["vault"]))
+        await _embed_missing(cfg, svc.db)
+        return stats
+
+    @app.get("/memory/blocks")
+    async def memory_blocks():
+        return {"context": memory.blocks_context(cfg)}
+
 def create_app(cfg: Config | None = None) -> FastAPI:
     cfg = cfg or Config.load()
     svc = Service(cfg)
 
     log = logging.getLogger("dispatcher.main")
-
-    async def _embed_missing():
-        if not embeddings.enabled(cfg):
-            return
-        try:
-            await asyncio.to_thread(embeddings.embed_missing, cfg, svc.db)
-        except Exception:
-            log.exception("embedding backfill failed")
 
     async def _startup_reindex():
         try:
@@ -148,13 +206,13 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             log.info("vault reindex: %s", stats)
         except Exception:
             log.exception("startup vault reindex failed")
-        await _embed_missing()
+        await _embed_missing(cfg, svc.db)
 
     async def _embed_refresh_loop():
         interval = max(1, (cfg.embeddings or {}).get("refresh_minutes", 15)) * 60
         while True:
             await asyncio.sleep(interval)
-            await _embed_missing()
+            await _embed_missing(cfg, svc.db)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -305,55 +363,9 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
     # -- vault endpoints for the dashboard (mechanical file I/O, no Claude) --
     register_vault_routes(app, cfg.root / "vault")
+    register_memory_read_routes(app, svc, cfg)
 
-    # -- memory endpoints (Phase F) -----------------------------------------
-
-    @app.get("/memory/search")
-    async def memory_search(q: str, limit: int = 10, scope: str = "all",
-                            file: str | None = None,
-                            after: str | None = None,
-                            before: str | None = None):
-        """Hybrid FTS5+vector search (RRF-fused) over the vault index and the
-        episode log; deterministic filters (file glob, after/before dates)
-        force the FTS-only path, khoj-style filters-before-vector. Degrades
-        to FTS-only without embeddings/sqlite-vec."""
-        qvec = None
-        if embeddings.enabled(cfg) and svc.db.vec_ok:
-            try:
-                qvec = await asyncio.to_thread(embeddings.embed_query, cfg, q)
-            except Exception:
-                log.exception("query embedding failed; falling back to FTS")
-        out: dict = {}
-        if scope in ("all", "vault"):
-            out["entries"] = (
-                svc.db.search_entries(q, limit, file, after, before)
-                if (file or after or before)
-                else svc.db.search_entries_hybrid(q, qvec, limit))
-        if scope in ("all", "episodes"):
-            out["episodes"] = (
-                svc.db.search_episodes(q, limit, after, before)
-                if (after or before)
-                else svc.db.search_episodes_hybrid(q, qvec, limit))
-        if scope in ("all", "graph"):
-            facts = svc.db.search_facts(q, limit)
-            out["facts"] = facts
-            out["fact_neighbors"] = svc.db.fact_neighbors(
-                [f["id"] for f in facts], limit)
-        if not out:
-            raise HTTPException(400, "scope must be all|vault|episodes|graph")
-        return out
-
-    @app.post("/memory/reindex")
-    async def memory_reindex():
-        stats = await asyncio.to_thread(
-            ingest.ingest_vault, svc.db, cfg.root,
-            cfg.memory.get("index_dirs", ["vault"]))
-        await _embed_missing()
-        return stats
-
-    @app.get("/memory/blocks")
-    async def memory_blocks():
-        return {"context": memory.blocks_context(cfg)}
+    # -- memory write paths (consolidate/reconcile): next slice -------------
 
     @app.post("/memory/consolidate")
     async def memory_consolidate():
