@@ -259,6 +259,52 @@ def register_memory_write_routes(app: FastAPI, svc: Service, cfg: Config):
             return {"status": "graph_disabled"}
         return await svc.graph_reconcile()
 
+def register_automation_routes(app: FastAPI, svc: Service, cfg: Config):
+    """Standing automations. Fourth group out of create_app."""
+    # -- automation endpoints (Phase I) -------------------------------------
+
+    def _automation_view(row: dict) -> dict:
+        return {**row, "describe": automations.describe(automations.spec_from_row(row))}
+
+    @app.post("/automations")
+    async def create_automation(a: AutomationIn):
+        """NL request → one LLM parse → validated standing automation."""
+        if not a.request.strip():
+            raise HTTPException(400, "empty request")
+        # The scheduler only polls when the automations block is enabled; the
+        # old code returned 201 "Scheduled" over a row nothing would ever run.
+        if not (svc.cfg.automations or {}).get("enabled"):
+            raise HTTPException(409, "automations are disabled in config.yaml "
+                                     "(add an `automations:` block) — nothing "
+                                     "would run this row")
+        row, speech = await svc.create_automation_from_nl(a.request, a.source)
+        if not row:
+            raise HTTPException(422, speech)
+        return JSONResponse(status_code=201,
+                            content={**_automation_view(row), "speech": speech})
+
+    @app.get("/automations")
+    async def list_automations():
+        return [_automation_view(r) for r in svc.db.list_automations()]
+
+    @app.post("/automations/{automation_id}/toggle")
+    async def toggle_automation(automation_id: int):
+        row = svc.db.get_automation(automation_id)
+        if not row:
+            raise HTTPException(404, "no such automation")
+        enabling = not row["enabled"]
+        # recompute on re-enable: a stale past-due next_run_at must not fire
+        next_at = (automations.next_run_iso(automations.spec_from_row(row))
+                   if enabling else None)
+        svc.db.set_automation_enabled(automation_id, enabling, next_at)
+        return _automation_view(svc.db.get_automation(automation_id))
+
+    @app.delete("/automations/{automation_id}")
+    async def delete_automation(automation_id: int):
+        if not svc.db.delete_automation(automation_id):
+            raise HTTPException(404, "no such automation")
+        return {"automation_id": automation_id, "status": "deleted"}
+
 def create_app(cfg: Config | None = None) -> FastAPI:
     cfg = cfg or Config.load()
     svc = Service(cfg)
@@ -475,49 +521,8 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     async def ask_page():
         return _spa_index()
 
-    # -- automation endpoints (Phase I) -------------------------------------
+    register_automation_routes(app, svc, cfg)
 
-    def _automation_view(row: dict) -> dict:
-        return {**row, "describe": automations.describe(automations.spec_from_row(row))}
-
-    @app.post("/automations")
-    async def create_automation(a: AutomationIn):
-        """NL request → one LLM parse → validated standing automation."""
-        if not a.request.strip():
-            raise HTTPException(400, "empty request")
-        # The scheduler only polls when the automations block is enabled; the
-        # old code returned 201 "Scheduled" over a row nothing would ever run.
-        if not (svc.cfg.automations or {}).get("enabled"):
-            raise HTTPException(409, "automations are disabled in config.yaml "
-                                     "(add an `automations:` block) — nothing "
-                                     "would run this row")
-        row, speech = await svc.create_automation_from_nl(a.request, a.source)
-        if not row:
-            raise HTTPException(422, speech)
-        return JSONResponse(status_code=201,
-                            content={**_automation_view(row), "speech": speech})
-
-    @app.get("/automations")
-    async def list_automations():
-        return [_automation_view(r) for r in svc.db.list_automations()]
-
-    @app.post("/automations/{automation_id}/toggle")
-    async def toggle_automation(automation_id: int):
-        row = svc.db.get_automation(automation_id)
-        if not row:
-            raise HTTPException(404, "no such automation")
-        enabling = not row["enabled"]
-        # recompute on re-enable: a stale past-due next_run_at must not fire
-        next_at = (automations.next_run_iso(automations.spec_from_row(row))
-                   if enabling else None)
-        svc.db.set_automation_enabled(automation_id, enabling, next_at)
-        return _automation_view(svc.db.get_automation(automation_id))
-
-    @app.delete("/automations/{automation_id}")
-    async def delete_automation(automation_id: int):
-        if not svc.db.delete_automation(automation_id):
-            raise HTTPException(404, "no such automation")
-        return {"automation_id": automation_id, "status": "deleted"}
 
     # -- media endpoints ----------------------------------------------------
 
