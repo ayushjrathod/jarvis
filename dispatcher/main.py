@@ -192,6 +192,73 @@ def register_memory_read_routes(app: FastAPI, svc: Service, cfg: Config):
     async def memory_blocks():
         return {"context": memory.blocks_context(cfg)}
 
+def register_memory_write_routes(app: FastAPI, svc: Service, cfg: Config):
+    """Consolidate + reconcile. Third group out of create_app; the
+    serialization flag lives on app.state, so it rides along."""
+    # -- memory write paths (consolidate/reconcile): next slice -------------
+
+    @app.post("/memory/consolidate")
+    async def memory_consolidate():
+        """Export unconsolidated episodes and queue the consolidation agent.
+        Episodes are marked at hand-off; the export file in data/consolidation/
+        is the audit trail if the run then fails.
+
+        Serialized (2026-08-10): build-then-mark is a read-then-write with an
+        await in between, so two callers — the 02:30 timer and a manual POST,
+        or a double-fire — could both read the SAME unconsolidated set before
+        either marked it, and both would submit an agent run over it. Export
+        filenames no longer collide, but the duplicate *run* is the expensive
+        half. asyncio has no preemption, so a plain flag is a sufficient lock
+        here; a second caller is told nothing to do rather than made to wait,
+        because the first one already claimed every episode there was.
+        """
+        if getattr(app.state, "consolidating", False):
+            return {"status": "already_running"}
+        app.state.consolidating = True
+        try:
+            return await _consolidate()
+        finally:
+            app.state.consolidating = False
+
+    async def _consolidate():
+        job = memory.build_consolidation(cfg, svc.db)
+        if not job:
+            return {"status": "nothing_to_consolidate"}
+        svc.db.mark_episodes_consolidated(job["episode_ids"])
+        # carry episode_ids so a FAILED run can put them back in the pool (M6)
+        meta = {**job["metadata"], "episode_ids": job["episode_ids"]}
+        task = await svc.submit(job["text"], source="timer", mode="agentic",
+                                area="memory", metadata=meta,
+                                trusted=True)  # server spawn (consolidation agent)
+        # Graph extraction (Phase J2) runs in parallel with the
+        # block-consolidation agent, but over its OWN subset (2026-08-11): the
+        # graph marks episodes only on success, and a failed consolidation
+        # rolls `consolidated_at` back, so the next pass re-exports episodes
+        # the extractor already digested. Without this filter those facts are
+        # re-derived every retry — survivable only because `add_fact` rejects
+        # exact duplicates of an active fact, which is a guard, not a design.
+        try:
+            pending = svc.db.episodes_needing_graph(job["episode_ids"])
+            if pending:
+                svc.spawn_graph_extract(memory.render_episodes(pending),
+                                        [e["id"] for e in pending])
+            else:
+                _log.info("graph extract: nothing new in this batch")
+        except Exception:
+            _log.exception("graph extract spawn failed")
+        return JSONResponse(status_code=202, content={
+            "task_id": task["id"], "status": "queued",
+            "episodes": len(job["episode_ids"]), "export": job["export_path"],
+        })
+
+    @app.post("/memory/reconcile")
+    async def memory_reconcile():
+        """Weekly knowledge-graph reconciliation (mem0 ADD/UPDATE/DELETE
+        spirit): duplicates and contradicted facts get invalidated."""
+        if not svc.graph_enabled():
+            return {"status": "graph_disabled"}
+        return await svc.graph_reconcile()
+
 def create_app(cfg: Config | None = None) -> FastAPI:
     cfg = cfg or Config.load()
     svc = Service(cfg)
@@ -365,69 +432,8 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     register_vault_routes(app, cfg.root / "vault")
     register_memory_read_routes(app, svc, cfg)
 
-    # -- memory write paths (consolidate/reconcile): next slice -------------
+    register_memory_write_routes(app, svc, cfg)
 
-    @app.post("/memory/consolidate")
-    async def memory_consolidate():
-        """Export unconsolidated episodes and queue the consolidation agent.
-        Episodes are marked at hand-off; the export file in data/consolidation/
-        is the audit trail if the run then fails.
-
-        Serialized (2026-08-10): build-then-mark is a read-then-write with an
-        await in between, so two callers — the 02:30 timer and a manual POST,
-        or a double-fire — could both read the SAME unconsolidated set before
-        either marked it, and both would submit an agent run over it. Export
-        filenames no longer collide, but the duplicate *run* is the expensive
-        half. asyncio has no preemption, so a plain flag is a sufficient lock
-        here; a second caller is told nothing to do rather than made to wait,
-        because the first one already claimed every episode there was.
-        """
-        if getattr(app.state, "consolidating", False):
-            return {"status": "already_running"}
-        app.state.consolidating = True
-        try:
-            return await _consolidate()
-        finally:
-            app.state.consolidating = False
-
-    async def _consolidate():
-        job = memory.build_consolidation(cfg, svc.db)
-        if not job:
-            return {"status": "nothing_to_consolidate"}
-        svc.db.mark_episodes_consolidated(job["episode_ids"])
-        # carry episode_ids so a FAILED run can put them back in the pool (M6)
-        meta = {**job["metadata"], "episode_ids": job["episode_ids"]}
-        task = await svc.submit(job["text"], source="timer", mode="agentic",
-                                area="memory", metadata=meta,
-                                trusted=True)  # server spawn (consolidation agent)
-        # Graph extraction (Phase J2) runs in parallel with the
-        # block-consolidation agent, but over its OWN subset (2026-08-11): the
-        # graph marks episodes only on success, and a failed consolidation
-        # rolls `consolidated_at` back, so the next pass re-exports episodes
-        # the extractor already digested. Without this filter those facts are
-        # re-derived every retry — survivable only because `add_fact` rejects
-        # exact duplicates of an active fact, which is a guard, not a design.
-        try:
-            pending = svc.db.episodes_needing_graph(job["episode_ids"])
-            if pending:
-                svc.spawn_graph_extract(memory.render_episodes(pending),
-                                        [e["id"] for e in pending])
-            else:
-                log.info("graph extract: nothing new in this batch")
-        except Exception:
-            log.exception("graph extract spawn failed")
-        return JSONResponse(status_code=202, content={
-            "task_id": task["id"], "status": "queued",
-            "episodes": len(job["episode_ids"]), "export": job["export_path"],
-        })
-
-    @app.post("/memory/reconcile")
-    async def memory_reconcile():
-        """Weekly knowledge-graph reconciliation (mem0 ADD/UPDATE/DELETE
-        spirit): duplicates and contradicted facts get invalidated."""
-        if not svc.graph_enabled():
-            return {"status": "graph_disabled"}
-        return await svc.graph_reconcile()
 
     # -- ask-about-my-screen ------------------------------------------------
 
