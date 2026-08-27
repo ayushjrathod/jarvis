@@ -16,6 +16,14 @@ import unicodedata
 _CODE_BLOCK = re.compile(r"```.*?```|~~~.*?~~~", re.S)
 _INLINE_CODE = re.compile(r"`([^`]*)`")
 _LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+# Images keep their alt text (the meaningful half) and drop the URL; an
+# empty alt becomes "image" rather than silence. Reference-style links keep
+# the text the same way. All three run before _LINK, which would otherwise
+# match the bracket half and leave the "!" behind.
+_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]+\)")
+_REFLINK = re.compile(r"\[([^\]]+)\]\[[^\]]*\]")
+# Tag-like markup only (<b>, </div>): a bare "a < b" comparison must survive.
+_TAG = re.compile(r"</?[a-zA-Z][^>]*>")
 _URL = re.compile(r"https?://\S+")
 _HEADER = re.compile(r"^#{1,6}\s*", re.M)
 _EMPHASIS = re.compile(r"(\*{1,3}|~~|__)(?=\S)(.+?)(?<=\S)\1")
@@ -60,9 +68,26 @@ _CODE_OMITTED = "Code block omitted."
 _TRUNCATED = "The rest of the answer is too long to read out."
 
 
+def _strip_emoji(text: str) -> str:
+    """Drop Symbol-Other characters (emoji, ✅, ©-style dingbats): espeak
+    renders ✅ as 'white heavy check mark', and model replies routinely open
+    with one. Letters, digits and punctuation (incl. →, …, •) are untouched —
+    only the So category goes."""
+    return "".join(ch for ch in text if unicodedata.category(ch) != "So")
+
+
+def _image_alt(m: re.Match) -> str:
+    alt = m.group(1).strip()
+    return alt if alt else "image"
+
+
 def sanitize(text: str) -> str:
     """Make model output speakable. Idempotent, safe on plain prose."""
     text = _CODE_BLOCK.sub(" code block omitted. ", text)
+    text = _IMAGE.sub(_image_alt, text)
+    text = _REFLINK.sub(r"\1", text)
+    text = _TAG.sub(" ", text)
+    text = _strip_emoji(text)
     text = _INLINE_CODE.sub(r"\1", text)
     text = _LINK.sub(r"\1", text)
     text = _URL.sub(" a link ", text)

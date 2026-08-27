@@ -57,6 +57,19 @@ class TestSanitize(unittest.TestCase):
         self.assertEqual(sanitize("The capital of France is Paris."),
                          "The capital of France is Paris.")
 
+    def test_emoji_markup_and_images_are_not_spoken(self):
+        # Tier 3: ✅ reads as "white heavy check mark", <b> as
+        # "bee bold slash-bee", and ![diagram](x.png) keeps its "!" — while
+        # model replies routinely open with exactly this shape.
+        self.assertEqual(sanitize("✅ Done."), "Done.")
+        self.assertEqual(sanitize("a <b>bold</b> move"), "a bold move")
+        self.assertEqual(sanitize("see ![diagram](x.png) here"), "see diagram here")
+        self.assertEqual(sanitize("see ![](x.png) here"), "see image here")
+        self.assertEqual(sanitize("see [the docs][1] here"), "see the docs here")
+        # ...but real text survives: comparisons, arrows, identifiers.
+        self.assertEqual(sanitize("a < b and c > d"), "a < b and c > d")
+        self.assertEqual(sanitize("run backup_db.sh now"), "run backup_db.sh now")
+
 
 class TestSentenceChunker(unittest.TestCase):
     def test_stream_chunks_to_sentences(self):
