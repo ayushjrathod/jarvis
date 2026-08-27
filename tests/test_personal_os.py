@@ -325,6 +325,16 @@ class TestValidateSpec(unittest.TestCase):
             {"task_text": "x", "kind": "interval", "interval_minutes": 60})
         self.assertEqual(ok["interval_minutes"], 60)
 
+    def test_check_interval_fails_toward_default(self):
+        # Finding 2.7: a bare `check_interval_s:` parses as None and
+        # sleep(None) killed the fire-and-forget scheduler forever; 0 spun.
+        self.assertEqual(automations.check_interval_s(None), 30)
+        self.assertEqual(automations.check_interval_s({}), 30)
+        self.assertEqual(automations.check_interval_s({"check_interval_s": None}), 30)
+        self.assertEqual(automations.check_interval_s({"check_interval_s": 0}), 30)
+        self.assertEqual(automations.check_interval_s({"check_interval_s": -5}), 5)
+        self.assertEqual(automations.check_interval_s({"check_interval_s": 60}), 60)
+
     def test_once_must_be_future(self):
         with self.assertRaises(ValueError):
             automations.validate_spec(

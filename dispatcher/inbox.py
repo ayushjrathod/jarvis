@@ -166,7 +166,10 @@ async def watch(svc):
     # never start. Everything read up here has to fail toward a default.
     interval = max(5, icfg.get("check_interval_s") or DEFAULT_INTERVAL_S)
     summarize_cap = _summarize_cap(icfg.get("summarize_max_per_poll"))
-    directory = (cfg.root / icfg.get("dir", "vault/inbox")).resolve()
+    # Same blank-key shape as the scheduler's interval (fixed there
+    # 2026-08-27): a bare `dir:` parses as None and (root / None) is a
+    # TypeError before the first poll.
+    directory = (cfg.root / (icfg.get("dir") or "vault/inbox")).resolve()
     watcher = InboxWatcher()
     log.info("inbox watcher: %s every %ss", directory, interval)
 

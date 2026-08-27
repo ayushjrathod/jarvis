@@ -23,6 +23,18 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 log = logging.getLogger("dispatcher.automations")
 
+DEFAULT_CHECK_INTERVAL_S = 30
+
+
+def check_interval_s(acfg) -> int:
+    """Seconds between due-row polls. `or DEFAULT`, not `.get(key, DEFAULT)`
+    (the inbox learned this 2026-08-08): a bare `check_interval_s:` parses as
+    None, and `asyncio.sleep(None)` is a TypeError raised outside the loop's
+    try on a fire-and-forget task — one blank config line killed the whole
+    scheduler forever. Floored at 5 like the inbox: 0 means an 81k-query
+    busy-spin, not 'as fast as possible'."""
+    return max(5, (acfg or {}).get("check_interval_s") or DEFAULT_CHECK_INTERVAL_S)
+
 _ZONE = None
 
 
@@ -322,7 +334,7 @@ async def loop(svc):
     """Poll due rows into the dispatch path. One bad automation or one bad
     check never kills the loop."""
     from .db import now as db_now
-    interval = (getattr(svc.cfg, "automations", None) or {}).get("check_interval_s", 30)
+    interval = check_interval_s(getattr(svc.cfg, "automations", None))
     log.info("automations scheduler up (checking every %ss)", interval)
     while True:
         try:
