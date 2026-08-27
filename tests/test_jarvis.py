@@ -150,6 +150,28 @@ class TestChunkerFences(unittest.TestCase):
         self.assertEqual(c.feed("y = 2\n" * 10 + "``"), [])
         self.assertEqual(c.feed("`\nBack to prose. "), ["Back to prose."])
 
+    def test_tilde_fences_are_code_too(self):
+        # Models emit ~~~ blocks as often as ``` ones; espeak reading shell
+        # aloud is the same failure either way.
+        code = "\n".join(f"rm -rf /tmp/junk-{i}" for i in range(30))
+        text = f"Here is the script.\n~~~\n{code}\n~~~\nRun it carefully. "
+        c = SentenceChunker()
+        out = []
+        for delta in _stream(text):
+            out.extend(c.feed(delta))
+        out.extend(c.flush())
+        spoken = " ".join(out)
+        self.assertNotIn("rm -rf", spoken)
+        self.assertIn("code block omitted", spoken.lower())
+        self.assertIn("Run it carefully.", spoken)
+
+    def test_tilde_closer_split_across_deltas(self):
+        c = SentenceChunker(max_code=60)
+        out = c.feed("~~~\n" + "x = 1\n" * 40)
+        self.assertEqual(out, ["Code block omitted."])
+        self.assertEqual(c.feed("y = 2\n" * 10 + "~~"), [])
+        self.assertEqual(c.feed("~\nBack to prose. "), ["Back to prose."])
+
     def test_unclosed_fence_at_flush_is_not_spoken(self):
         # cancelled reply / dropped SSE mid-block: the pair never completes
         c = SentenceChunker()
