@@ -116,6 +116,10 @@ class SentenceChunker:
         self._max_total = max_total
         self._spoken = 0
         self._dropping = False  # inside a runaway block, discarding to its closer
+        # Trailing "`"s of a fenceless dropping delta. Token boundaries split
+        # inside the 3-char closer routinely (`` `` `` then `` ` ``), so the
+        # partition below must see the carry + the new delta together.
+        self._carry = ""
 
     # -- fence bookkeeping ---------------------------------------------------
     # A position sits inside a ``` pair iff an odd number of fences precede it;
@@ -149,11 +153,16 @@ class SentenceChunker:
         out: list[str] = []
         if self._dropping:
             # mid-runaway-block: everything up to the closing fence is code we
-            # already announced as omitted, so it never reaches the buffer
-            _code, fence, tail = delta.partition(_FENCE)
+            # already announced as omitted, so it never reaches the buffer —
+            # but the closer may be SPLIT across deltas, so partition the
+            # carry + delta together. A 3-backtick run would have matched
+            # already, so at most 2 carry forward.
+            _code, fence, tail = (self._carry + delta).partition(_FENCE)
             if not fence:
+                m = re.search(r"`+$", delta)
+                self._carry = (m.group(0)[-2:] if m else "")
                 return out
-            self._dropping, delta = False, tail
+            self._dropping, self._carry, delta = False, "", tail
         self._buf += delta
         while True:
             if self._fence_open():
@@ -188,7 +197,7 @@ class SentenceChunker:
 
     def flush(self) -> list[str]:
         out: list[str] = []
-        rest, self._buf, self._dropping = self._buf, "", False
+        rest, self._buf, self._dropping, self._carry = self._buf, "", False, ""
         if rest.count(_FENCE) % 2 == 1:
             # the stream ended mid-block (cancelled reply, dropped SSE): the
             # unpaired fence means sanitize() would hand the code to the TTS

@@ -139,6 +139,17 @@ class TestChunkerFences(unittest.TestCase):
         self.assertEqual(out3, ["Back to prose."])
         self.assertNotIn("x = 1", " ".join(out + out2 + out3))
 
+    def test_closer_split_across_deltas_still_ends_the_drop(self):
+        # Token boundaries split inside the 3-char closer routinely: the old
+        # partition matched each delta in isolation, so `` `` `` + `` ` ``
+        # never completed and every later delta was thrown away (zero spoken
+        # chunks after a runaway block, verified live).
+        c = SentenceChunker(max_code=60)
+        out = c.feed("```\n" + "x = 1\n" * 40)
+        self.assertEqual(out, ["Code block omitted."])
+        self.assertEqual(c.feed("y = 2\n" * 10 + "``"), [])
+        self.assertEqual(c.feed("`\nBack to prose. "), ["Back to prose."])
+
     def test_unclosed_fence_at_flush_is_not_spoken(self):
         # cancelled reply / dropped SSE mid-block: the pair never completes
         c = SentenceChunker()
