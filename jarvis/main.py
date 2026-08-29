@@ -276,6 +276,15 @@ class Jarvis:
 
     async def _flush_notices(self):
         while self.pending_notices:
+            # busy is HELD here (end of handle_utterance), so busyness means
+            # capture specifically: the user is already re-asking. Speaking
+            # now talks straight over the new utterance — leave the queue for
+            # the next quiet moment instead. Bounded upstream (notices_loop
+            # caps), so waiting cannot grow it here.
+            if self.recorder.is_recording() or self._capture_busy.is_set():
+                log.info("deferring %d notice(s) while capturing",
+                         len(self.pending_notices))
+                return
             if not await self.say(self.pending_notices.pop(0)):
                 # Barging in on notice 1 used to be followed instantly by
                 # notices 2 and 3, because say()'s result was discarded. An

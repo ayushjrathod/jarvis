@@ -1367,6 +1367,19 @@ class TestNoticesRespectCapture(unittest.TestCase):
                 asyncio.run(asyncio.wait_for(app.notices_loop(), timeout=0.5))
         self.assertEqual(app.pending_notices, ["done thing"])
 
+    def test_flush_defers_while_capturing_and_speaks_when_quiet(self):
+        app = _app()
+        app.pending_notices = ["one", "two"]
+        app.say = mock.AsyncMock(return_value=True)
+        with mock.patch.object(app.recorder, "is_recording", return_value=True):
+            asyncio.run(app._flush_notices())
+        self.assertEqual(app.pending_notices, ["one", "two"])
+        app.say.assert_not_awaited()
+        with mock.patch.object(app.recorder, "is_recording", return_value=False):
+            asyncio.run(app._flush_notices())
+        self.assertEqual(app.pending_notices, [])
+        self.assertEqual(app.say.await_count, 2)
+
 
 class TestDispatcherBrainCancelClose(unittest.TestCase):
     """2026-08-10: the /cancel POST was guarded but the aclose() above it was
