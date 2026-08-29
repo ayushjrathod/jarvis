@@ -1072,6 +1072,45 @@ class TestPttBargeDuringTranscription(unittest.TestCase):
         self.assertTrue(app.barge_request.is_set())
         self.assertTrue(app.player.interrupt.is_set())  # playback stopped too
 
+    def test_key_down_stops_but_does_not_spend_the_run(self):
+        # The cancel used to fire here, so a stray tap destroyed the answer
+        # with the run already spent. Key-down now only stops + records;
+        # the spend happens at release, for real utterances.
+        app = _app()
+        app.brain.cancel = mock.AsyncMock()
+
+        async def scenario():
+            async with app.busy:
+                self.assertTrue(app._ptt_barge())
+            return True
+
+        asyncio.run(scenario())
+        app.brain.cancel.assert_not_awaited()
+
+    def test_cancel_inflight_reaches_the_brain_from_any_thread(self):
+        # Key release runs on the watcher thread: the cancel must be
+        # scheduled onto the event loop, never awaited inline, never raising.
+        app = _app()
+        app.brain.cancel = mock.AsyncMock()
+        app.loop = mock.Mock()
+        submitted = []
+
+        def fake_submit(coro, loop):
+            submitted.append(loop)
+            coro.close()  # never run: scheduling is what is pinned
+            return mock.Mock()
+
+        with mock.patch.object(asyncio, "run_coroutine_threadsafe",
+                               side_effect=fake_submit):
+            self.assertTrue(app._cancel_inflight())
+        self.assertEqual(submitted, [app.loop])
+        app.brain.cancel.assert_not_awaited()
+
+    def test_cancel_inflight_without_a_loop_reports_false(self):
+        app = _app()
+        app.loop = None
+        self.assertFalse(app._cancel_inflight())
+
 
 class TestWakeBusyPredicate(unittest.TestCase):
     """2026-08-10: capture_after_wake's gate was `busy.locked` alone, which is

@@ -290,11 +290,13 @@ class Jarvis:
     def _ptt_barge(self) -> bool:
         """PTT pressed while an interaction is in flight = explicit barge-in.
 
-        Stops playback (speak_sentences then cancels the in-flight dispatcher
-        call) so the new utterance isn't queued behind a long reply, AND
-        records the request in `barge_request` — player.interrupt alone is
-        erased by the next resume(), which is how a press during the STT
-        window used to be swallowed. Kept out of the on_press closure so it is
+        Stops playback and records the request in `barge_request` —
+        player.interrupt alone is erased by the next resume(), which is how a
+        press during the STT window used to be swallowed. The in-flight call
+        itself is cancelled at key RELEASE (see on_release), once the press
+        proves to be a real utterance and not a stray tap: cancelling on
+        key-down spent the run for a <250ms Right-Ctrl brush whose audio was
+        then discarded anyway. Kept out of the on_press closure so it is
         testable without a mic or a hotkey device.
         """
         if not self.busy.locked():
@@ -302,6 +304,20 @@ class Jarvis:
         self.barge_request.set()
         if self.player is not None:
             self.player.stop()
+        return True
+
+    def _cancel_inflight(self) -> bool:
+        """Cancel the in-flight dispatcher call from any thread. Key release
+        runs on the watcher thread, so run_coroutine_threadsafe is the seam;
+        a missing/closed loop reports False instead of raising — cancelling
+        must never fail capture."""
+        loop = getattr(self, "loop", None)
+        if loop is None:
+            return False
+        try:
+            asyncio.run_coroutine_threadsafe(self.brain.cancel(), loop)
+        except RuntimeError:
+            return False
         return True
 
     def _busy_for_wake(self) -> bool:
@@ -334,6 +350,15 @@ class Jarvis:
             audio = self.recorder.stop()
             if self.cfg.ptt_beep_ms > 0:  # lower tone = "got it, thinking"
                 play_beep_async(ms=self.cfg.ptt_beep_ms, freq=660.0)
+            if (len(audio) >= self.cfg.sample_rate // 4
+                    and self.busy.locked()):
+                # A REAL utterance released while a stale reply still runs:
+                # end it instead of queueing behind it. The cancel used to
+                # fire on key-DOWN, so a <250ms stray tap (Right-Ctrl is an
+                # ordinary modifier) destroyed the answer with the run already
+                # spent — while the tap audio itself was then discarded. Taps
+                # never reach here; the VAD barge covers mid-utterance stalls.
+                self._cancel_inflight()
             self.loop.call_soon_threadsafe(self.ptt_audio.put_nowait, audio)
 
         if self.cfg.ptt_key == self.cfg.trigger_key:
