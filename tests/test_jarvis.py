@@ -1291,6 +1291,44 @@ class TestHotkeyRescanMerge(unittest.TestCase):
         self.assertEqual(by_fd, {3: watched})
 
 
+class TestNoticesRespectCapture(unittest.TestCase):
+    """Tier 3: completion notices used `busy.locked()`, which covers neither
+    PTT capture nor wake phase-2 — so a notice talked straight over the user
+    answering. notices_loop now gates on _busy_for_wake()."""
+
+    def test_phase2_capture_marks_busy_and_clears(self):
+        app = _app()
+        seen = {}
+
+        def fake_capture(*a, **k):
+            seen["busy"] = app._busy_for_wake()
+            return None
+
+        fake_mic = mock.Mock()
+        fake_mic.read = mock.Mock(return_value=None)
+        fake_mic.__enter__ = mock.Mock(return_value=fake_mic)
+        fake_mic.__exit__ = mock.Mock(return_value=False)
+        with mock.patch("jarvis.main.MicStream", return_value=fake_mic), \
+                mock.patch("jarvis.main.capture_after_wake",
+                           side_effect=fake_capture):
+            app._wake_capture_once()
+        self.assertTrue(seen["busy"])
+        self.assertFalse(app._capture_busy.is_set())
+
+    def test_notice_queues_while_ptt_captures(self):
+        app = _app()
+
+        async def one_notice():
+            yield mock.Mock(text="done thing")
+            await asyncio.sleep(60)
+
+        app.brain = mock.Mock(notices=one_notice)
+        with mock.patch.object(app.recorder, "is_recording", return_value=True):
+            with self.assertRaises(asyncio.TimeoutError):
+                asyncio.run(asyncio.wait_for(app.notices_loop(), timeout=0.5))
+        self.assertEqual(app.pending_notices, ["done thing"])
+
+
 class TestDispatcherBrainCancelClose(unittest.TestCase):
     """2026-08-10: the /cancel POST was guarded but the aclose() above it was
     not, so on a broken socket — exactly when cancelling matters — the

@@ -81,6 +81,11 @@ class Jarvis:
         self.barge_request = threading.Event()
         self.ptt_audio: asyncio.Queue = asyncio.Queue()
         self.pending_notices: list[str] = []
+        # Set while wake-mode phase-2 capture runs (after "hey jarvis", before
+        # endpointing): completion notices must not talk over the user
+        # answering. busy alone doesn't cover it — phase 2 holds no lock —
+        # and neither does the recorder (wake capture uses MicStream).
+        self._capture_busy = threading.Event()
 
     # -- startup ------------------------------------------------------------
 
@@ -307,9 +312,11 @@ class Jarvis:
         the same microphone. So in --mode both (what mission-jarvis ships)
         holding PTT and saying "hey jarvis, …" had capture_after_wake answer
         the utterance, and the PTT release answered the same audio again.
-        2026-08-10.
+        2026-08-10. Wake phase-2 capture (2026-08-29) is the third leg: it
+        holds no lock and uses MicStream, not the Recorder.
         """
-        return self.busy.locked() or self.recorder.is_recording()
+        return (self.busy.locked() or self.recorder.is_recording()
+                or self._capture_busy.is_set())
 
     def start_ptt(self):
         """Hold-to-talk on `ptt_key`: press = listen, release = ask.
@@ -382,19 +389,30 @@ class Jarvis:
                 elif self.cfg.wake_beep_ms > 0:
                     play_beep_async(ms=self.cfg.wake_beep_ms)
 
-            return capture_after_wake(
-                mic.read, self.wake, self.vad, self.cfg,
-                prebuffer_frames=prebuffer_frames,
-                is_busy=self._busy_for_wake, on_busy=on_busy,
-                on_wake=on_wake,
-                # mic.read uses a ~1s timeout, so seconds-of-silence ≈ None count
-                none_limit=self.cfg.mic_lost_after_s,
-            )
+            # Phase-2 capture holds no lock, so mark it: completion notices
+            # check _busy_for_wake before speaking, and without this flag
+            # they talk over the user answering.
+            self._capture_busy.set()
+            try:
+                return capture_after_wake(
+                    mic.read, self.wake, self.vad, self.cfg,
+                    prebuffer_frames=prebuffer_frames,
+                    is_busy=self._busy_for_wake, on_busy=on_busy,
+                    on_wake=on_wake,
+                    # mic.read uses a ~1s timeout, so seconds-of-silence ≈ None count
+                    none_limit=self.cfg.mic_lost_after_s,
+                )
+            finally:
+                self._capture_busy.clear()
 
     async def notices_loop(self):
         async for ev in self.brain.notices():
             try:
-                if self.busy.locked():
+                # Capture-busyness, not just busy: a notice arriving while the
+                # user holds PTT or answers the wake word used to talk straight
+                # over them (both use `busy.locked()` paths that don't cover
+                # capture). Queued notices wait for the next quiet moment.
+                if self._busy_for_wake():
                     if len(self.pending_notices) >= MAX_PENDING_NOTICES:
                         # bounded on purpose: the newest completion is the one
                         # worth hearing, and the dashboard keeps them all
