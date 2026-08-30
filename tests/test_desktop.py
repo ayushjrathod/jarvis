@@ -524,6 +524,34 @@ class TestIntentOutcome(unittest.TestCase):
                 desktop.Intent("lock"), "voice"))
         self.assertEqual(out["status"], "done")
 
+    def test_answering_elsewhere_retires_the_banner(self):
+        # A voice "yeah" spends the id, but the dashboard banner only removes
+        # rows it answers itself — without confirm_resolved it kept offering
+        # Yes on the spent id for the full TTL.
+        svc = _Svc({"enabled": True, "confirm_timeout_s": 120})
+        svc.pending_desktop["cid1"] = {
+            "intent": desktop.Intent("lock"), "source": "voice",
+            "expires": 9999999999.0,
+        }
+        with mock.patch.object(desktop, "run_intent_ok",
+                               return_value=(True, "Locked.")):
+            out = asyncio.run(svc.confirm_desktop("cid1", True))
+        self.assertEqual(out["status"], "done")
+        ev = svc.hooks.fire.await_args.args[0]
+        self.assertEqual(ev["event"], "confirm_resolved")
+        self.assertEqual(ev["confirm_id"], "cid1")
+        self.assertTrue(ev["approved"])
+
+        svc.pending_desktop["cid2"] = {
+            "intent": desktop.Intent("lock"), "source": "voice",
+            "expires": 9999999999.0,
+        }
+        out = asyncio.run(svc.confirm_desktop("cid2", False))
+        self.assertEqual(out["status"], "declined")
+        ev = svc.hooks.fire.await_args.args[0]
+        self.assertEqual((ev["event"], ev["approved"]),
+                         ("confirm_resolved", False))
+
 
 class TestScreenLocked(unittest.TestCase):
     """Lock state comes from the session bus, not `loginctl show-session self`:

@@ -1140,9 +1140,18 @@ class Service:
                     "speech": "That request already expired."}
         if not approve:
             log.info("desktop: user declined %s", entry["intent"].verb)
-            return {"status": "declined", "speech": "Okay, skipping it."}
+            await self.hooks.fire({"event": "confirm_resolved",
+                                   "confirm_id": confirm_id, "approved": False})
+            return {"status": "declined",
+                    "speech": "Okay, skipping it."}
         ok, speech = await asyncio.to_thread(desktop.run_intent_ok, entry["intent"])
         log.info("desktop: confirmed %s -> %s", entry["intent"].verb, speech[:80])
+        # A voice "yeah" spends the id, but the dashboard banner only removes
+        # rows it answers itself or that time out — without this event it kept
+        # offering Yes on the spent id for the full TTL (same shape as the
+        # 2026-08-11 stale-banner fix, reached by the other channel).
+        await self.hooks.fire({"event": "confirm_resolved",
+                               "confirm_id": confirm_id, "approved": True})
         return {"status": "done" if ok else "failed", "speech": speech}
 
     def _expire_desktop_confirms(self):

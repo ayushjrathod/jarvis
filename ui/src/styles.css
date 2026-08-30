@@ -314,7 +314,12 @@ table.docs-table td.ep code { font-size: 0.85rem; }
 /* Proactive announcements (notify gate, inbox watcher, diverts). These reach
    the browser as SSE `notify` events and, before 2026-08-08, were rendered
    nowhere — so on the phone the whole feature was invisible. */
-.notices { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem; }
+.notices {
+  display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem;
+  /* Same reasoning as .confirmbar above: the proactive feature the PWA
+  exists for must not scroll away on the phone. */
+  position: sticky; top: 0; z-index: 20;
+}
 .notice-row {
   display: flex;
   align-items: center;
@@ -339,7 +344,13 @@ table.docs-table td.ep code { font-size: 0.85rem; }
 }
 .notice-row button:hover { border-color: var(--accent); color: var(--fg); }
 
-.confirmbar { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem; }
+.confirmbar {
+  display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem;
+  /* Blocking question, not a readout: at phone widths, scrolled down, a
+  confirm event used to render a row off-screen and shove the scroll position.
+  Sticky keeps it visible wherever the user is. */
+  position: sticky; top: 0; z-index: 20;
+}
 .confirm-row {
   display: flex;
   align-items: center;

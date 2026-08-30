@@ -77,7 +77,8 @@ export async function postTask(text, { onDelta, source = "ui", mode, metadata } 
 
 const EVENT_NAMES = ["queued", "started", "done", "failed", "refused", "cancelled",
                      "requeued", "step", "notify", "notify_skipped",
-                     "automation", "automation_created", "confirm"];
+                     "automation", "automation_created", "confirm",
+                     "confirm_resolved"];
 
 // Backoff for re-opening a stream EventSource gave up on. Capped, because the
 // dispatcher restarting is the common case and should recover in a second or
