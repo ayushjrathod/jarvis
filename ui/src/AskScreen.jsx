@@ -15,6 +15,12 @@ export default function AskScreen() {
   const [busy, setBusy] = useState(false);
   const [exchanges, setExchanges] = useState([]); // [{id, q, a, err}]
   const [recState, setRecState] = useState("idle"); // idle | recording | transcribing
+  // A question is seconds, not minutes: cap a recording at two minutes so a
+  // forgotten-open mic can't hold a 25MB transcribe lock against every other
+  // /stt call (or the user's quota of patience). Auto-stop uploads whatever
+  // was captured through the normal path.
+  const MIC_MAX_MS = 120000;
+  const recTimerRef = useRef(null);
   const inputRef = useRef(null);
   const recRef = useRef(null);
   const startingRef = useRef(false); // set before the getUserMedia await
@@ -64,6 +70,7 @@ export default function AskScreen() {
 
   async function toggleMic() {
     if (recRef.current) {
+      clearTimeout(recTimerRef.current);
       recRef.current.stop(); // onstop below does the rest
       return;
     }
@@ -78,6 +85,7 @@ export default function AskScreen() {
       const chunks = [];
       rec.ondataavailable = (e) => chunks.push(e.data);
       rec.onstop = async () => {
+        clearTimeout(recTimerRef.current);
         stream.getTracks().forEach((t) => t.stop());
         recRef.current = null;
         setRecState("transcribing");
@@ -100,6 +108,9 @@ export default function AskScreen() {
       };
       rec.start();
       recRef.current = rec;
+      recTimerRef.current = setTimeout(() => {
+        if (recRef.current) recRef.current.stop();
+      }, MIC_MAX_MS);
       setRecState("recording");
     } catch (err) {
       setExchanges((xs) => [...xs, { id: nextId.current++, q: "(mic)", a: "", err: err.message }]);
