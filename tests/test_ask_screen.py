@@ -118,6 +118,16 @@ class TestEndpoints(unittest.TestCase):
             r = self.client.post("/stt", content=b"x" * 500)
         self.assertEqual(r.status_code, 413)
 
+    def test_stt_chunked_body_aborts_early(self):
+        # The cap used to be checked only after the whole body was collected,
+        # so a chunked upload with no Content-Length buffered unboundedly.
+        # Now the stream aborts mid-body and STT is never touched.
+        with patch("dispatcher.main.MAX_STT_BYTES", 200), \
+                patch("dispatcher.stt.get_stt") as stt:
+            r = self.client.post("/stt", content=(b"x" * 100 for _ in range(10)))
+        self.assertEqual(r.status_code, 413)
+        stt.assert_not_called()
+
     def test_cross_origin_post_rejected(self):
         # M1: a state-changing request from another site's page is refused
         r = self.client.post("/stt", content=b"x" * 500,

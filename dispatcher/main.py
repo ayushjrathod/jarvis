@@ -486,13 +486,21 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     @app.post("/stt")
     async def transcribe(request: Request):
         """Raw-body audio upload (webm/opus from MediaRecorder, or wav) →
-        transcript. Raw body on purpose: python-multipart isn't a dep."""
+        transcript. Raw body on purpose: python-multipart isn't a dep. Read
+        as a stream with a running total: the old code collected every chunk
+        first and THEN checked the size, so the cap bounded nothing on the
+        chunked path it claimed to — a lying Content-Length meant unbounded
+        memory before the 413."""
         declared = request.headers.get("content-length")
         if declared and declared.isdigit() and int(declared) > MAX_STT_BYTES:
             raise HTTPException(413, "audio too large")
-        data = await request.body()
-        if len(data) > MAX_STT_BYTES:  # chunked upload with no Content-Length
-            raise HTTPException(413, "audio too large")
+        chunks, total = [], 0
+        async for piece in request.stream():
+            total += len(piece)
+            if total > MAX_STT_BYTES:
+                raise HTTPException(413, "audio too large")
+            chunks.append(piece)
+        data = b"".join(chunks)
         if len(data) < 100:
             raise HTTPException(400, "no audio")
         try:
