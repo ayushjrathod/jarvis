@@ -305,6 +305,57 @@ def register_automation_routes(app: FastAPI, svc: Service, cfg: Config):
             raise HTTPException(404, "no such automation")
         return {"automation_id": automation_id, "status": "deleted"}
 
+def _spa_index(root: Path) -> FileResponse:
+    """Serve the SPA shell for a non-'/' page. The StaticFiles mount below
+    only falls back to index.html for directories, so every client-routed
+    path needs its own route."""
+    index = root / "ui" / "dist" / "index.html"
+    if not index.is_file():
+        raise HTTPException(404, "ui not built")
+    return FileResponse(index, media_type="text/html")
+
+def register_screen_routes(app: FastAPI, svc: Service, cfg: Config):
+    """Ask-about-my-screen: STT upload, screenshot serving, popup shell."""
+    # -- ask-about-my-screen ------------------------------------------------
+
+    @app.post("/stt")
+    async def transcribe(request: Request):
+        """Raw-body audio upload (webm/opus from MediaRecorder, or wav) →
+        transcript. Raw body on purpose: python-multipart isn't a dep. Read
+        as a stream with a running total: the old code collected every chunk
+        first and THEN checked the size, so the cap bounded nothing on the
+        chunked path it claimed to — a lying Content-Length meant unbounded
+        memory before the 413."""
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > MAX_STT_BYTES:
+            raise HTTPException(413, "audio too large")
+        chunks, total = [], 0
+        async for piece in request.stream():
+            total += len(piece)
+            if total > MAX_STT_BYTES:
+                raise HTTPException(413, "audio too large")
+            chunks.append(piece)
+        data = b"".join(chunks)
+        if len(data) < 100:
+            raise HTTPException(400, "no audio")
+        try:
+            text = await asyncio.to_thread(stt.get_stt(cfg).transcribe_bytes, data)
+        except Exception as e:
+            raise HTTPException(422, f"could not decode audio: {e}")
+        return {"text": text}
+
+    @app.get("/screenshots/{name}")
+    async def screenshot(name: str):
+        p = resolve_screenshot(cfg, name)
+        if not p:
+            raise HTTPException(404, "no such screenshot")
+        return FileResponse(p, media_type="image/png")
+
+
+    @app.get("/ask")
+    async def ask_page():
+        return _spa_index(cfg.root)
+
 def create_app(cfg: Config | None = None) -> FastAPI:
     cfg = cfg or Config.load()
     svc = Service(cfg)
@@ -481,53 +532,8 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     register_memory_write_routes(app, svc, cfg)
 
 
-    # -- ask-about-my-screen ------------------------------------------------
+    register_screen_routes(app, svc, cfg)
 
-    @app.post("/stt")
-    async def transcribe(request: Request):
-        """Raw-body audio upload (webm/opus from MediaRecorder, or wav) →
-        transcript. Raw body on purpose: python-multipart isn't a dep. Read
-        as a stream with a running total: the old code collected every chunk
-        first and THEN checked the size, so the cap bounded nothing on the
-        chunked path it claimed to — a lying Content-Length meant unbounded
-        memory before the 413."""
-        declared = request.headers.get("content-length")
-        if declared and declared.isdigit() and int(declared) > MAX_STT_BYTES:
-            raise HTTPException(413, "audio too large")
-        chunks, total = [], 0
-        async for piece in request.stream():
-            total += len(piece)
-            if total > MAX_STT_BYTES:
-                raise HTTPException(413, "audio too large")
-            chunks.append(piece)
-        data = b"".join(chunks)
-        if len(data) < 100:
-            raise HTTPException(400, "no audio")
-        try:
-            text = await asyncio.to_thread(stt.get_stt(cfg).transcribe_bytes, data)
-        except Exception as e:
-            raise HTTPException(422, f"could not decode audio: {e}")
-        return {"text": text}
-
-    @app.get("/screenshots/{name}")
-    async def screenshot(name: str):
-        p = resolve_screenshot(cfg, name)
-        if not p:
-            raise HTTPException(404, "no such screenshot")
-        return FileResponse(p, media_type="image/png")
-
-    def _spa_index() -> FileResponse:
-        """Serve the SPA shell for a non-'/' page. The StaticFiles mount below
-        only falls back to index.html for directories, so every client-routed
-        path needs its own route."""
-        index = cfg.root / "ui" / "dist" / "index.html"
-        if not index.is_file():
-            raise HTTPException(404, "ui not built")
-        return FileResponse(index, media_type="text/html")
-
-    @app.get("/ask")
-    async def ask_page():
-        return _spa_index()
 
     register_automation_routes(app, svc, cfg)
 
@@ -634,7 +640,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     async def docs_page():
         """Human docs (guide + API reference). NOT /docs — that's FastAPI's
         Swagger UI, which stays where it is."""
-        return _spa_index()
+        return _spa_index(cfg.root)
 
     # serve the built dashboard, if present (mounted last: API routes win)
     ui_dist = cfg.root / "ui" / "dist"
