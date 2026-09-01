@@ -378,6 +378,38 @@ def register_media_routes(app: FastAPI, svc: Service, cfg: Config):
         _require_media()
         return await asyncio.to_thread(spotify.state, cfg)
 
+def register_desktop_routes(app: FastAPI, svc: Service, cfg: Config):
+    """Computer-use T1 verbs, confirm plane included."""
+    # -- desktop control (computer-use T1) ----------------------------------
+
+    def _require_computer():
+        if not (cfg.computer or {}).get("enabled"):
+            raise HTTPException(503, "desktop control is disabled in config.yaml")
+
+    @app.post("/desktop")
+    async def desktop_command(d: DesktopIn):
+        """Same handler the POST /task divert uses, for the UI and scripts.
+        A verb whose policy is 'confirm' returns needs_confirmation + a
+        confirm_id rather than acting; answer it at /desktop/confirm."""
+        _require_computer()
+        if not d.command.strip():
+            raise HTTPException(400, "empty command")
+        return await svc.desktop_command(d.command, d.source)
+
+    @app.post("/desktop/confirm")
+    async def desktop_confirm(c: DesktopConfirmIn):
+        _require_computer()
+        return await svc.confirm_desktop(c.confirm_id, c.approve)
+
+    @app.get("/desktop/verbs")
+    async def desktop_verbs():
+        """What this tier can do and under what policy — the honest surface
+        for the dashboard and for anyone wondering why a verb refused."""
+        _require_computer()
+        return {"verbs": {v: desktop.policy(cfg.computer, v)
+                          for v in sorted(desktop.ALL_VERBS)},
+                "pending": len(svc.pending_desktop)}
+
 def create_app(cfg: Config | None = None) -> FastAPI:
     cfg = cfg or Config.load()
     svc = Service(cfg)
@@ -563,35 +595,8 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     register_media_routes(app, svc, cfg)
 
 
-    # -- desktop control (computer-use T1) ----------------------------------
+    register_desktop_routes(app, svc, cfg)
 
-    def _require_computer():
-        if not (cfg.computer or {}).get("enabled"):
-            raise HTTPException(503, "desktop control is disabled in config.yaml")
-
-    @app.post("/desktop")
-    async def desktop_command(d: DesktopIn):
-        """Same handler the POST /task divert uses, for the UI and scripts.
-        A verb whose policy is 'confirm' returns needs_confirmation + a
-        confirm_id rather than acting; answer it at /desktop/confirm."""
-        _require_computer()
-        if not d.command.strip():
-            raise HTTPException(400, "empty command")
-        return await svc.desktop_command(d.command, d.source)
-
-    @app.post("/desktop/confirm")
-    async def desktop_confirm(c: DesktopConfirmIn):
-        _require_computer()
-        return await svc.confirm_desktop(c.confirm_id, c.approve)
-
-    @app.get("/desktop/verbs")
-    async def desktop_verbs():
-        """What this tier can do and under what policy — the honest surface
-        for the dashboard and for anyone wondering why a verb refused."""
-        _require_computer()
-        return {"verbs": {v: desktop.policy(cfg.computer, v)
-                          for v in sorted(desktop.ALL_VERBS)},
-                "pending": len(svc.pending_desktop)}
 
     # -- learning endpoints (Phase G) ---------------------------------------
 
