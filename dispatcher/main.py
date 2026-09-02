@@ -356,6 +356,28 @@ def register_screen_routes(app: FastAPI, svc: Service, cfg: Config):
     async def ask_page():
         return _spa_index(cfg.root)
 
+def register_media_routes(app: FastAPI, svc: Service, cfg: Config):
+    """Spotify transport + search, direct for UI and scripts."""
+    # -- media endpoints ----------------------------------------------------
+
+    def _require_media():
+        if not (cfg.media or {}).get("enabled"):
+            raise HTTPException(503, "media control is disabled in config.yaml")
+
+    @app.post("/media")
+    async def media_command(m: MediaIn):
+        """Same handler the POST /task divert uses, for the UI and scripts."""
+        _require_media()
+        if not m.command.strip():
+            raise HTTPException(400, "empty command")
+        out = await svc.media_command(m.command, m.source)
+        return {"speech": out["speech"], "status": out["status"]}
+
+    @app.get("/media/state")
+    async def media_state():
+        _require_media()
+        return await asyncio.to_thread(spotify.state, cfg)
+
 def create_app(cfg: Config | None = None) -> FastAPI:
     cfg = cfg or Config.load()
     svc = Service(cfg)
@@ -538,25 +560,8 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     register_automation_routes(app, svc, cfg)
 
 
-    # -- media endpoints ----------------------------------------------------
+    register_media_routes(app, svc, cfg)
 
-    def _require_media():
-        if not (cfg.media or {}).get("enabled"):
-            raise HTTPException(503, "media control is disabled in config.yaml")
-
-    @app.post("/media")
-    async def media_command(m: MediaIn):
-        """Same handler the POST /task divert uses, for the UI and scripts."""
-        _require_media()
-        if not m.command.strip():
-            raise HTTPException(400, "empty command")
-        out = await svc.media_command(m.command, m.source)
-        return {"speech": out["speech"], "status": out["status"]}
-
-    @app.get("/media/state")
-    async def media_state():
-        _require_media()
-        return await asyncio.to_thread(spotify.state, cfg)
 
     # -- desktop control (computer-use T1) ----------------------------------
 
