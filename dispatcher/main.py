@@ -535,6 +535,48 @@ def register_task_routes(app: FastAPI, svc: Service):
             raise HTTPException(409, "task missing or already finished")
         return {"task_id": task_id, "status": "cancelled"}
 
+def register_obs_routes(app: FastAPI, svc: Service, cfg: Config):
+    """Events, stats, step timelines, health."""
+    @app.get("/events")
+    async def events():
+        async def gen():
+            q = svc.bus.subscribe()
+            try:
+                yield ": connected\n\n"
+                while True:
+                    try:
+                        ev = await asyncio.wait_for(q.get(), timeout=25)
+                        yield sse(ev.get("event", "update"), ev)
+                    except asyncio.TimeoutError:
+                        yield ": ping\n\n"
+            finally:
+                svc.bus.unsubscribe(q)
+
+        return StreamingResponse(gen(), media_type="text/event-stream")
+
+    @app.get("/stats")
+    async def stats(days: int = 7):
+        """Observability aggregates (Phase H): task counts, success rate,
+        cost, quick-path latency, recent reflections."""
+        return svc.db.stats_summary(days)
+
+    @app.get("/task/{task_id}/steps")
+    async def task_steps(task_id: str):
+        task = svc.db.get_task(task_id)
+        if not task:
+            raise HTTPException(404, "no such task")
+        return {r["id"]: svc.db.get_run_steps(r["id"]) for r in task["runs"]}
+
+    @app.get("/health")
+    async def health():
+        return {
+            "status": "ok",
+            "db": str(cfg.db_path),
+            "queue_dir": str(cfg.queue_dir),
+            "quick_backend": quick.BACKEND,
+            "running_tasks": len(svc.bg),
+        }
+
 def create_app(cfg: Config | None = None) -> FastAPI:
     cfg = cfg or Config.load()
     svc = Service(cfg)
@@ -592,45 +634,8 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     register_task_routes(app, svc)
 
 
-    @app.get("/events")
-    async def events():
-        async def gen():
-            q = svc.bus.subscribe()
-            try:
-                yield ": connected\n\n"
-                while True:
-                    try:
-                        ev = await asyncio.wait_for(q.get(), timeout=25)
-                        yield sse(ev.get("event", "update"), ev)
-                    except asyncio.TimeoutError:
-                        yield ": ping\n\n"
-            finally:
-                svc.bus.unsubscribe(q)
+    register_obs_routes(app, svc, cfg)
 
-        return StreamingResponse(gen(), media_type="text/event-stream")
-
-    @app.get("/stats")
-    async def stats(days: int = 7):
-        """Observability aggregates (Phase H): task counts, success rate,
-        cost, quick-path latency, recent reflections."""
-        return svc.db.stats_summary(days)
-
-    @app.get("/task/{task_id}/steps")
-    async def task_steps(task_id: str):
-        task = svc.db.get_task(task_id)
-        if not task:
-            raise HTTPException(404, "no such task")
-        return {r["id"]: svc.db.get_run_steps(r["id"]) for r in task["runs"]}
-
-    @app.get("/health")
-    async def health():
-        return {
-            "status": "ok",
-            "db": str(cfg.db_path),
-            "queue_dir": str(cfg.queue_dir),
-            "quick_backend": quick.BACKEND,
-            "running_tasks": len(svc.bg),
-        }
 
     # -- vault endpoints for the dashboard (mechanical file I/O, no Claude) --
     register_vault_routes(app, cfg.root / "vault")
