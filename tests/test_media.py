@@ -158,6 +158,20 @@ class TestDetectMaybe(unittest.TestCase):
     def test_music_shaped_but_unparsed(self):
         self.assertIs(spotify.detect("i want to listen to some music now"), MAYBE)
 
+    def test_maybe_needs_a_leading_verb_and_a_query(self):
+        # Finding 2.9: a music word plus a play verb ANYWHERE matched
+        # meeting-talk and spent a media-parse call just to eat the request.
+        for t in ("did you hear the album dropped today",
+                  "listen to what the user said about the playlist feature",
+                  "i need to hear the song from that meeting",
+                  "hear me out about the band name",
+                  "we need to hear the album today"):
+            self.assertIsNone(spotify.detect(t), t)
+        for t in ("play something chill",
+                  "put on something to focus to",
+                  "play that song from the batman movie"):
+            self.assertIs(spotify.detect(t), MAYBE, t)
+
 
 # one natural sentence per VETO entry; the covers-everything test below keeps
 # this honest when someone adds an idiom to the tuple

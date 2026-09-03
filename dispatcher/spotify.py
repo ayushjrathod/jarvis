@@ -105,6 +105,13 @@ VETO = (
 # here, so it is exactly the rule that must not overreach.
 _VETO_RE = re.compile("|".join(rf"\b{re.escape(v)}\b" for v in VETO))
 
+# A MAYBE remainder that asks nothing playable: interrogatives,
+# auxiliaries and pronouns open a clause ("what the user said", "me out"),
+# not a query. Demonstratives ("that song from ...") stay playable.
+_NON_QUERY_START = re.compile(
+    r"^(what|who|whom|whose|how|when|where|why|whether|if|"
+    r"did|does|do|is|are|was|were|can|could|would|should|will|"
+    r"i|you|we|they|he|she|it|me|my|your|our|their|him|her|us|them)\b")
 # words that make a sentence music-ish for the MAYBE fallback. Word boundaries
 # for the same reason, and with more at stake (fixed 2026-08-08): the old test
 # accepted a bare substring too, so "band" ⊂ "abandoned", "tune" ⊂ "fortune"
@@ -239,8 +246,16 @@ def detect(text: str):
         type_, q = _classify_query(q)
         return Intent("play", query=q, type=type_)
 
-    # music-shaped but unparsed ("put on something for focusing")
-    if _looks_musical(t) and re.search(r"\b(play|put on|listen to|hear)\b", t):
+    # music-shaped but unparsed ("put on something for focusing"): the verb
+    # must LEAD, as in every strict pattern above — a music word plus a play
+    # verb ANYWHERE matched meeting-talk ("did you hear the album dropped
+    # today", "i need to hear the song from that meeting") and spent a real
+    # media-parse call just to eat the request. And the remainder must read
+    # like a query, not a clause: "listen to what the user said" and "hear me
+    # out" start right but ask nothing playable.
+    m = re.match(r"^(?:i want to\s+|i'd like to\s+|i'd love to\s+|i want\s+)?"
+                 r"(play|put on|listen to|hear)\b\s*(?P<q>.*)$", t)
+    if m and _looks_musical(t) and not _NON_QUERY_START.match(m.group("q")):
         return MAYBE
     return None
 
