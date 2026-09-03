@@ -458,60 +458,8 @@ def register_learning_routes(app: FastAPI, svc: Service, cfg: Config):
         await svc.hooks.fire({"event": "curated", **report})
         return report
 
-def create_app(cfg: Config | None = None) -> FastAPI:
-    cfg = cfg or Config.load()
-    svc = Service(cfg)
-
-    log = logging.getLogger("dispatcher.main")
-
-    async def _startup_reindex():
-        try:
-            stats = await asyncio.to_thread(
-                ingest.ingest_vault, svc.db, cfg.root,
-                cfg.memory.get("index_dirs", ["vault"]))
-            log.info("vault reindex: %s", stats)
-        except Exception:
-            log.exception("startup vault reindex failed")
-        await _embed_missing(cfg, svc.db)
-
-    async def _embed_refresh_loop():
-        interval = max(1, (cfg.embeddings or {}).get("refresh_minutes", 15)) * 60
-        while True:
-            await asyncio.sleep(interval)
-            await _embed_missing(cfg, svc.db)
-
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        watcher = asyncio.create_task(queue_watcher.watch(svc))
-        reindex = (asyncio.create_task(_startup_reindex())
-                   if cfg.memory.get("reindex_on_start", True) else None)
-        scheduler = (asyncio.create_task(automations.loop(svc))
-                     if (cfg.automations or {}).get("enabled") else None)
-        embedder = (asyncio.create_task(_embed_refresh_loop())
-                    if embeddings.enabled(cfg) else None)
-        inbox_watcher = (asyncio.create_task(inbox.watch(svc))
-                         if (cfg.inbox or {}).get("enabled") else None)
-        yield
-        for t in (watcher, reindex, scheduler, embedder, inbox_watcher):
-            if t:
-                t.cancel()
-        await svc.shutdown()
-
-    app = FastAPI(title="mission-control dispatcher", lifespan=lifespan)
-    app.state.service = svc
-
-    @app.middleware("http")
-    async def guard_origin(request: Request, call_next):
-        """Lightweight CSRF guard (M1): a state-changing request from a browser
-        page on some other origin is rejected; local clients (no Origin, or a
-        loopback/self Origin) pass through untouched."""
-        if request.method in _GUARDED_METHODS:
-            origin = request.headers.get("origin")
-            if origin and not _origin_is_local(origin, (cfg.host, *cfg.public_hosts)):
-                return JSONResponse(status_code=403,
-                                    content={"detail": "cross-origin request rejected"})
-        return await call_next(request)
-
+def register_task_routes(app: FastAPI, svc: Service):
+    """Submit, fetch, list, cancel. The dispatch core stays addressable."""
     @app.post("/task")
     async def post_task(t: TaskIn):
         # Deterministic diverts (standing automation → media → desktop) live on
@@ -586,6 +534,63 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         if not ok:
             raise HTTPException(409, "task missing or already finished")
         return {"task_id": task_id, "status": "cancelled"}
+
+def create_app(cfg: Config | None = None) -> FastAPI:
+    cfg = cfg or Config.load()
+    svc = Service(cfg)
+
+    log = logging.getLogger("dispatcher.main")
+
+    async def _startup_reindex():
+        try:
+            stats = await asyncio.to_thread(
+                ingest.ingest_vault, svc.db, cfg.root,
+                cfg.memory.get("index_dirs", ["vault"]))
+            log.info("vault reindex: %s", stats)
+        except Exception:
+            log.exception("startup vault reindex failed")
+        await _embed_missing(cfg, svc.db)
+
+    async def _embed_refresh_loop():
+        interval = max(1, (cfg.embeddings or {}).get("refresh_minutes", 15)) * 60
+        while True:
+            await asyncio.sleep(interval)
+            await _embed_missing(cfg, svc.db)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        watcher = asyncio.create_task(queue_watcher.watch(svc))
+        reindex = (asyncio.create_task(_startup_reindex())
+                   if cfg.memory.get("reindex_on_start", True) else None)
+        scheduler = (asyncio.create_task(automations.loop(svc))
+                     if (cfg.automations or {}).get("enabled") else None)
+        embedder = (asyncio.create_task(_embed_refresh_loop())
+                    if embeddings.enabled(cfg) else None)
+        inbox_watcher = (asyncio.create_task(inbox.watch(svc))
+                         if (cfg.inbox or {}).get("enabled") else None)
+        yield
+        for t in (watcher, reindex, scheduler, embedder, inbox_watcher):
+            if t:
+                t.cancel()
+        await svc.shutdown()
+
+    app = FastAPI(title="mission-control dispatcher", lifespan=lifespan)
+    app.state.service = svc
+
+    @app.middleware("http")
+    async def guard_origin(request: Request, call_next):
+        """Lightweight CSRF guard (M1): a state-changing request from a browser
+        page on some other origin is rejected; local clients (no Origin, or a
+        loopback/self Origin) pass through untouched."""
+        if request.method in _GUARDED_METHODS:
+            origin = request.headers.get("origin")
+            if origin and not _origin_is_local(origin, (cfg.host, *cfg.public_hosts)):
+                return JSONResponse(status_code=403,
+                                    content={"detail": "cross-origin request rejected"})
+        return await call_next(request)
+
+    register_task_routes(app, svc)
+
 
     @app.get("/events")
     async def events():
