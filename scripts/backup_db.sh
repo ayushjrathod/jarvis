@@ -29,4 +29,16 @@ mv -f "$PART" "$NEW"
 # the pre-purge recovery point (mission-pre-purge-*.db), our only rollback
 # before a knowledge-graph purge — is never auto-deleted.
 find data/backups -name 'mission-[0-9]*.db' -mtime +14 -delete
+# The "nightly backup" used to cover SQLite only: data/spotify.json (the only
+# unrecoverable local secret — credentials, no Premium needed to replace, but
+# no way to re-derive) and config.yaml (every grant, budget and timer the box
+# runs on) died with the disk. Tiny files, same verified dir, same retention
+# story by date suffix; mode 600 on the secret. ~/.claude-per (login +
+# sessions) and data/models stay out deliberately — machine-scale, and the
+# login re-derives via device flow.
+DAY=$(date +%F)
+[ -f data/spotify.json ] && install -m 600 data/spotify.json "data/backups/spotify-$DAY.json"
+[ -f config.yaml ] && cp config.yaml "data/backups/config-$DAY.yaml"
+find data/backups -name 'spotify-[0-9]*.json' -mtime +14 -delete
+find data/backups -name 'config-[0-9]*.yaml' -mtime +14 -delete
 echo "backup written: data/backups/mission-$(date +%F).db"
