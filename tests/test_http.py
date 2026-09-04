@@ -1114,5 +1114,37 @@ class TestLearnRoute(HTTPTestCase):
         self.assertEqual(json.loads(row["metadata"])["task_type"], "learn")
 
 
+class TestUICacheHeaders(HTTPTestCase):
+    """Tier 3: heuristic freshness served a month-old shell with zero
+    requests. Hashed assets are immutable; the shell always revalidates."""
+
+    def setUp(self):
+        self._dist_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dist_tmp.cleanup)
+        # Minimal stand-in bundle, created BEFORE the app (the static mount
+        # checks is_dir at startup). Tests the headers, not the build.
+        dist = Path(self._dist_tmp.name) / "ui" / "dist"
+        (dist / "assets").mkdir(parents=True)
+        (dist / "index.html").write_text("<html></html>")
+        (dist / "assets" / "index-abc123.js").write_text("console.log(1)")
+        self.cfg_overrides = {"root": Path(self._dist_tmp.name)}
+        super().setUp()
+
+    def test_hashed_assets_are_immutable(self):
+        r = self.client.get("/assets/index-abc123.js")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("immutable", r.headers.get("cache-control", ""))
+
+    def test_shell_is_never_cached(self):
+        for path in ("/", "/ask?shot=x"):
+            r = self.client.get(path)
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.headers.get("cache-control"), "no-cache")
+
+    def test_api_and_events_pass_through_untouched(self):
+        r = self.client.get("/health")
+        self.assertNotIn("immutable", r.headers.get("cache-control", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

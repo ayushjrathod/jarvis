@@ -312,7 +312,9 @@ def _spa_index(root: Path) -> FileResponse:
     index = root / "ui" / "dist" / "index.html"
     if not index.is_file():
         raise HTTPException(404, "ui not built")
-    return FileResponse(index, media_type="text/html")
+    # Same no-cache as the middleware gives "/": these URLs serve the shell.
+    return FileResponse(index, media_type="text/html",
+                        headers={"Cache-Control": "no-cache"})
 
 def register_screen_routes(app: FastAPI, svc: Service, cfg: Config):
     """Ask-about-my-screen: STT upload, screenshot serving, popup shell."""
@@ -630,6 +632,25 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                 return JSONResponse(status_code=403,
                                     content={"detail": "cross-origin request rejected"})
         return await call_next(request)
+
+    @app.middleware("http")
+    async def cache_ui(request: Request, call_next):
+        """Cache headers the static mount doesn't set. Starlette sends only
+        ETag + Last-Modified, and heuristic freshness (10% of file age)
+        served a 30-day-old index.html with zero requests — the phone PWA
+        launching by navigation is exactly the victim, and the service worker
+        then guarantees the matching old bundle. Hashed /assets/* are
+        immutable by construction (Vite); the shell itself is always
+        revalidated. API and SSE responses pass through untouched."""
+        resp = await call_next(request)
+        if request.method == "GET" and resp.status_code == 200:
+            path = request.url.path
+            if path.startswith("/assets/"):
+                resp.headers["Cache-Control"] = (
+                    "public, max-age=31536000, immutable")
+            elif path == "/" or path.endswith(".html"):
+                resp.headers["Cache-Control"] = "no-cache"
+        return resp
 
     register_task_routes(app, svc)
 
