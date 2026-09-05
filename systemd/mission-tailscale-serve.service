@@ -4,7 +4,14 @@ Description=Mission Control — Tailscale Serve (HTTPS front door for the dispat
 # daemon up and the dispatcher listening on loopback first.
 After=network-online.target tailscaled.service mission-dispatcher.service
 Wants=network-online.target
-Requires=mission-dispatcher.service
+# Wants, NOT Requires, the dispatcher (2026-09-04): every dispatcher restart
+# stops-and-starts serve first, which is benign — but since the 2026-08-10
+# StartLimit change `failed` is a state the dispatcher can actually reach,
+# and under Requires that deactivated serve while restarting the dispatcher
+# did NOT bring it back. Phone access died silently. Under Wants the proxy
+# rides out the outage (502s, then recovers with the dispatcher) and no
+# intervention is ever needed.
+Wants=mission-dispatcher.service
 
 [Service]
 Type=oneshot

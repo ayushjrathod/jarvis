@@ -1120,6 +1120,15 @@ class TestSystemdUnits(unittest.TestCase):
             delay = int(re.search(r"RestartSec=(\d+)", text).group(1))
             self.assertLess(burst * delay, interval, unit.name)
 
+    def test_serve_rides_out_dispatcher_outages(self):
+        # Finding Tier 3: Requires= on the serve unit deactivated phone access
+        # whenever the dispatcher reached `failed` — reachable since the
+        # StartLimit change — and restarting the dispatcher never brought it
+        # back. Wants keeps the proxy up through the outage.
+        text = (self.UNITS / "mission-tailscale-serve.service").read_text()
+        self.assertNotIn("Requires=mission-dispatcher.service", text)
+        self.assertIn("Wants=mission-dispatcher.service", text)
+
 
 if __name__ == "__main__":
     unittest.main()
