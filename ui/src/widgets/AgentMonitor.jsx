@@ -3,15 +3,31 @@ import { getJSON } from "../api.js";
 
 const TERMINAL = new Set(["done", "failed", "cancelled"]);
 
+// Server-internal plumbing: after a nightly cycle the window fills with
+// these and the user's own tasks scroll away. Hidden by default, one click
+// to audit. Matches the sources the dispatch path actually emits (see
+// memory.should_capture's exclusion list for the same family).
+const INTERNAL_SOURCES = new Set([
+  "automation-parse", "notify-gate", "media-parse",
+  "graph-extract", "graph-reconcile", "reflection", "automation",
+]);
+
 // Live task/agent activity: seeded from /tasks, updated by /events SSE.
 export default function AgentMonitor({ lastEvent, epoch }) {
   const [rows, setRows] = useState([]);
+  const [showSystem, setShowSystem] = useState(false);
   const [expanded, setExpanded] = useState(() => new Set());
   const [steps, setSteps] = useState({}); // task_id -> flat step list
 
   useEffect(() => {
     seed();
   }, [epoch]);
+
+  // Toggling the filter re-seeds at the matching width.
+  useEffect(() => {
+    seed();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showSystem]);
 
   // Nothing reconciles a healthy stream: both loss paths above leave SSE up,
   // so no reconnect fires and a row whose terminal event was dropped reads
@@ -25,7 +41,8 @@ export default function AgentMonitor({ lastEvent, epoch }) {
   });
 
   function seed() {
-    getJSON("/tasks?limit=15")
+    // Fetch wide when hiding plumbing so the visible window stays full.
+    getJSON(showSystem ? "/tasks?limit=15" : "/tasks?limit=40")
       .then((tasks) =>
         setRows(
           tasks.map((t) => ({
@@ -93,9 +110,16 @@ export default function AgentMonitor({ lastEvent, epoch }) {
   }
 
   if (!rows.length) return <p className="empty">Nothing yet.</p>;
+  const visible = (showSystem ? rows : rows.filter((r) => !INTERNAL_SOURCES.has(r.source))).slice(0, 15);
   return (
+    <>
+    <label className="sys-toggle">
+      <input type="checkbox" checked={showSystem}
+             onChange={(e) => setShowSystem(e.target.checked)} />
+      system tasks
+    </label>
     <ul className="monitor">
-      {rows.map((r) => {
+      {visible.map((r) => {
         const open = expanded.has(r.task_id);
         return (
           <li key={r.task_id} className={open ? "open" : ""}>
@@ -179,5 +203,6 @@ export default function AgentMonitor({ lastEvent, epoch }) {
         );
       })}
     </ul>
+    </>
   );
 }

@@ -418,13 +418,15 @@ class Database:
         out["runs"] = [dict(r) for r in runs]
         return out
 
-    def list_tasks(self, status=None, kind=None, limit=50) -> list[dict]:
+    def list_tasks(self, status=None, kind=None, limit=50, source=None) -> list[dict]:
         q, args = "SELECT * FROM tasks", []
         conds = []
         if status:
             conds.append("status=?"), args.append(status)
         if kind:
             conds.append("kind=?"), args.append(kind)
+        if source:
+            conds.append("source=?"), args.append(source)
         if conds:
             q += " WHERE " + " AND ".join(conds)
         q += " ORDER BY created_at DESC LIMIT ?"

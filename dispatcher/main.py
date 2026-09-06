@@ -527,8 +527,9 @@ def register_task_routes(app: FastAPI, svc: Service):
         return task
 
     @app.get("/tasks")
-    async def list_tasks(status: str | None = None, kind: str | None = None, limit: int = 50):
-        return svc.db.list_tasks(status, kind, limit)
+    async def list_tasks(status: str | None = None, kind: str | None = None,
+                         limit: int = 50, source: str | None = None):
+        return svc.db.list_tasks(status, kind, limit, source)
 
     @app.post("/task/{task_id}/cancel")
     async def cancel(task_id: str):

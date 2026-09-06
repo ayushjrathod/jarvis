@@ -64,6 +64,15 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(got["runs"], [])
         self.assertEqual(len(self.db.list_tasks()), 1)
 
+    def test_list_tasks_filters_by_source(self):
+        # Tier 3: the monitor drowns in plumbing without a source filter.
+        self.db.create_task("user question", "api", "quick")
+        self.db.create_task("gate verdict", "notify-gate", "quick")
+        self.assertEqual(len(self.db.list_tasks()), 2)
+        only = self.db.list_tasks(source="notify-gate")
+        self.assertEqual([t["source"] for t in only], ["notify-gate"])
+        self.assertEqual(self.db.list_tasks(source="api")[0]["text"], "user question")
+
     def test_refusal_two_run_flow(self):
         task = self.db.create_task("borderline task", "queue", "agentic")
         r1 = self.db.create_run(task["id"], 1, "claude-fable-5")
