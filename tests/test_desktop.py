@@ -604,6 +604,37 @@ class TestWindowVerbs(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("no window matching", speech)
 
+    def test_window_sentences_belong_to_no_other_parser(self):
+        # Generative version of the qualifier invariant: every window command
+        # the desktop parser claims must be claimed by nothing else (media
+        # runs first), and the window-talk it refuses must not leak in
+        # through a neighbor.
+        apps = ["firefox", "nautilus", "terminal", "vlc", "obsidian"]
+        lists = ["what windows are open", "list my windows",
+                 "show me open windows", "which windows are open",
+                 "are any windows open", "what is open"]
+        n = 0
+        for s in lists:
+            for variant in (s, "please " + s, s + " please"):
+                i = desktop.detect(variant)
+                self.assertIsNotNone(i, variant)
+                self.assertEqual(i.verb, "windows")
+                self.assertIsNone(spotify.detect(variant), variant)
+                n += 1
+        for app in apps:
+            for s in (f"focus {app}", f"switch to {app}",
+                      f"bring {app} to front"):
+                i = desktop.detect(s)
+                self.assertIsNotNone(i, s)
+                self.assertEqual((i.verb, i.arg), ("focus", app))
+                self.assertIsNone(spotify.detect(s), s)
+                n += 1
+        self.assertGreater(n, 30)
+        for s in ("open the window", "close the window",
+                  "look out the window", "clean the windows"):
+            self.assertIsNone(desktop.detect(s), s)
+            self.assertIsNone(spotify.detect(s), s)
+
 
 class TestScreenLocked(unittest.TestCase):
     """Lock state comes from the session bus, not `loginctl show-session self`:
