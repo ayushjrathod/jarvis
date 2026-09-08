@@ -604,6 +604,19 @@ class TestWindowVerbs(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("no window matching", speech)
 
+    def test_parked_focus_answers_by_voice(self):
+        # The confirm plane is verb-agnostic, but focus is the first new
+        # confirm verb since open/clipboard_get: prove a bare yeah spends it.
+        svc = _Svc({"enabled": True, "confirm_timeout_s": 120})
+        parked = asyncio.run(svc.desktop_command("switch to firefox", "voice"))
+        self.assertEqual(parked["status"], "needs_confirmation")
+        with mock.patch.object(
+                desktop, "run_intent_ok",
+                return_value=(True, 'Focused "firefox".')):
+            done = asyncio.run(svc.desktop_command("yeah", "voice"))
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(svc.pending_desktop, {})
+
     def test_window_sentences_belong_to_no_other_parser(self):
         # Generative version of the qualifier invariant: every window command
         # the desktop parser claims must be claimed by nothing else (media
