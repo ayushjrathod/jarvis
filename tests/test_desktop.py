@@ -553,6 +553,58 @@ class TestIntentOutcome(unittest.TestCase):
                          ("confirm_resolved", False))
 
 
+class TestWindowVerbs(unittest.TestCase):
+    """K2 T2: window list (allow) and focus (confirm) over AT-SPI. The list
+    shapes name windows beside a listing verb; ordinary window-talk
+    ("open/close the window", "look out the window") matches nothing, by the
+    same qualifier discipline as the volume parser."""
+
+    def test_list_shapes_parse(self):
+        for s in ("what windows are open", "list my windows",
+                  "show me open windows", "which windows are open",
+                  "are any windows open", "what is open"):
+            with self.subTest(s=s):
+                i = desktop.detect(s)
+                self.assertIsNotNone(i, s)
+                self.assertEqual(i.verb, "windows")
+
+    def test_ordinary_window_talk_is_not_a_command(self):
+        for s in ("open the window", "close the window",
+                  "look out the window", "windows update", "open windows",
+                  "focus the window", "switch to it", "raise the volume"):
+            with self.subTest(s=s):
+                i = desktop.detect(s)
+                self.assertTrue(i is None or i.verb in ("launch", "volume"), s)
+
+    def test_focus_shapes_parse_with_target(self):
+        i = desktop.detect("switch to firefox")
+        self.assertEqual((i.verb, i.arg), ("focus", "firefox"))
+        i = desktop.detect("bring nautilus to front")
+        self.assertEqual((i.verb, i.arg), ("focus", "nautilus"))
+
+    def test_focus_policy_is_confirm_list_is_allow(self):
+        cfg = {"enabled": True}
+        self.assertEqual(desktop.policy(cfg, "windows"), "allow")
+        self.assertEqual(desktop.policy(cfg, "focus"), "confirm")
+
+    def test_list_executor_reports_honestly(self):
+        with mock.patch("dispatcher.windows.list_windows",
+                        return_value=[{"app": "a", "title": "T"}]):
+            out = desktop.run_intent(desktop.Intent("windows"))
+        self.assertIn("T", out)
+        with mock.patch("dispatcher.windows.list_windows", return_value=[]):
+            out = desktop.run_intent(desktop.Intent("windows"))
+        self.assertIn("No windows", out)
+
+    def test_focus_miss_is_failed_not_done(self):
+        import dispatcher.windows as _w
+        with mock.patch("dispatcher.windows.focus_window",
+                        side_effect=_w.WindowError("no window matching")):
+            ok, speech = desktop.run_intent_ok(desktop.Intent("focus", arg="x"))
+        self.assertFalse(ok)
+        self.assertIn("no window matching", speech)
+
+
 class TestScreenLocked(unittest.TestCase):
     """Lock state comes from the session bus, not `loginctl show-session self`:
     the dispatcher is a systemd user service, which belongs to

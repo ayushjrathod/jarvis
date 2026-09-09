@@ -66,9 +66,9 @@ LAUNCH_SETTLE_S = 2.0    # how long we wait to see a launched app show up
 LAUNCH_POLL_S = 0.1
 
 # Verbs that only read state. Everything else changes something.
-READ_VERBS = frozenset({"status", "clipboard_get"})
+READ_VERBS = frozenset({"status", "clipboard_get", "windows"})
 ALL_VERBS = READ_VERBS | frozenset(
-    {"volume", "mute", "lock", "launch", "open", "clipboard_set"})
+    {"volume", "mute", "lock", "launch", "open", "clipboard_set", "focus"})
 
 # See the module docstring for why these are the defaults.
 DEFAULT_POLICY = {
@@ -78,8 +78,10 @@ DEFAULT_POLICY = {
     "lock": "allow",
     "launch": "allow",
     "clipboard_set": "allow",
+    "windows": "allow",
     "clipboard_get": "confirm",
     "open": "confirm",
+    "focus": "confirm",
 }
 
 OPEN_SCHEMES = frozenset({"http", "https", "file", ""})
@@ -113,6 +115,10 @@ class Intent:
             return f"turn the system volume {'up' if self.delta > 0 else 'down'}"
         if self.verb == "mute":
             return {True: "mute", False: "unmute", None: "toggle mute"}[self.on]
+        if self.verb == "windows":
+            return "list open windows"
+        if self.verb == "focus":
+            return f'focus "{self.arg}"'
         return self.verb.replace("_", " ")
 
 
@@ -318,6 +324,29 @@ _STATUS_RE = re.compile(
     rf"|is {_DET}(?:{_SYS}|{_AUDIO}) muted)$")
 
 
+# Window verbs (K2 T2, 2026-09-08). The list shapes all name windows beside a
+# listing verb or an open-state question — "open the window", "close the
+# window", "look out the window" and "windows update" match none of them, by
+# the same qualifier discipline that keeps the volume parser honest. Focus
+# takes any argument EXCEPT a bare generic ("focus the window" is prose, not
+# a target); misses fail honestly at the executor, which names no match.
+_WINDOW_LIST_RE = re.compile(
+    r"^(?:(?:what|which) windows are open"
+    r"|(?:list|show)(?: me)?(?: my| the| all| open)? windows"
+    r"|are (?:there )?any windows open"
+    r"|what(?:'?s| is) open(?: right now)?)$")
+_WINDOW_FOCUS_RES = (
+    # No "raise": it collides with volume phrasing ("raise the volume" has no
+    # system qualifier, so it reaches this branch) — three verbs suffice.
+    re.compile(r"^(?:focus|switch to)\s+(?P<q>.+)$"),
+    re.compile(r"^bring\s+(?P<q>.+?)\s+to\s+(?:the\s+)?(?:front|foreground|forward)$"),
+)
+_WINDOW_GENERIC_ARGS = frozenset({
+    "the window", "a window", "this window", "that window", "it", "that",
+    "this", "them", "windows",
+})
+
+
 # -- shape tests for the two ambiguous branches ------------------------------
 #
 # Both are pure and lexical, because detect() may not do I/O: it cannot ask
@@ -477,6 +506,8 @@ def detect(text: str) -> Intent | None:
         return Intent("clipboard_get")
     if _STATUS_RE.match(t):
         return Intent("status")
+    if _WINDOW_LIST_RE.match(t):
+        return Intent("windows")
     if asking:
         return None
 
@@ -509,6 +540,17 @@ def detect(text: str) -> Intent | None:
         if m:
             down = m.group("dir") in _DOWN_WORDS
             return Intent("volume", delta=-VOLUME_STEP if down else VOLUME_STEP)
+
+    for rx in _WINDOW_FOCUS_RES:
+        m = rx.match(t)
+        if m:
+            target = m.group("q").strip(_PUNCT)
+            # A bare generic is prose, not a target ("focus the window" about
+            # a state machine, "switch to it" mid-conversation). Misses with a
+            # REAL name fail honestly at the executor instead of here.
+            if target and target not in _WINDOW_GENERIC_ARGS:
+                return Intent("focus", arg=target)
+            return None
 
     # A dotted token that isn't a plausible web address ("notes.md",
     # "org.gnome.Nautilus") falls through to the app branch rather than being
@@ -927,7 +969,26 @@ _EXECUTORS = {
     "clipboard_get": lambda i: _clipboard_get(),
     "clipboard_set": _clipboard_set,
     "status": lambda i: _status(),
+    "windows": lambda i: _list_windows(),
+    "focus": lambda i: _focus_window(i),
 }
+
+
+def _list_windows() -> str:
+    from . import windows as _windows
+    wins = _windows.list_windows()
+    if not wins:
+        return "No windows found."
+    return "Open windows: " + "; ".join(
+        f'{w["title"]} ({w["app"]})' for w in wins)
+
+
+def _focus_window(intent: Intent) -> str:
+    from . import windows as _windows
+    try:
+        return _windows.focus_window(intent.arg)
+    except _windows.WindowError as e:
+        raise DesktopError(str(e)) from None
 
 
 def run_intent_ok(intent: Intent) -> tuple[bool, str]:
