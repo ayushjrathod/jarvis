@@ -5,12 +5,14 @@ import Brief from "./Brief.jsx";
 import CommandBox from "./CommandBox.jsx";
 import Stats from "./Stats.jsx";
 import Tasks from "./Tasks.jsx";
+import Volume from "./Volume.jsx";
 
 export const widgets = [
   { id: "command", title: "Command", area: null, Component: CommandBox },
   { id: "brief", title: "Today's brief", area: "tasks", Component: Brief },
   { id: "tasks", title: "Tasks", area: "tasks", Component: Tasks },
   { id: "agents", title: "Agent activity", area: null, Component: AgentMonitor },
+  { id: "volume", title: "System volume", area: null, Component: Volume },
   { id: "automations", title: "Automations", area: null, Component: Automations },
   { id: "stats", title: "Observability", area: null, Component: Stats },
 ];

@@ -96,6 +96,8 @@ pre.brief {
 }
 
 ul.tasks, ul.monitor { list-style: none; margin: 0; padding: 0; }
+.volume-buttons { display: flex; gap: 0.5rem; }
+.volume-buttons button { min-width: 3rem; padding: 0.5rem 0.75rem; }
 .sys-toggle { display: inline-flex; gap: 0.4rem; align-items: center; color: var(--dim); font-size: 0.85rem; margin-bottom: 0.5rem; }
 ul.tasks li { padding: 0.3rem 0; border-bottom: 1px solid var(--border); }
 ul.tasks li:last-child { border-bottom: none; }
