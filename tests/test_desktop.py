@@ -553,6 +553,64 @@ class TestIntentOutcome(unittest.TestCase):
                          ("confirm_resolved", False))
 
 
+class TestTabVerbs(unittest.TestCase):
+    """K2 T3: browser tab list (allow) and switch (confirm). The tab
+    qualifier keeps every tier apart: switch-to-tab never reaches window
+    focus, switch-to-app never reaches tabs, and bare "open tabs" reaches
+    neither (tabs is not an app name)."""
+
+    def test_list_shapes_parse(self):
+        for s in ("what tabs are open", "list tabs",
+                  "show me my browser tabs", "which chrome tabs are open",
+                  "are any tabs open"):
+            with self.subTest(s=s):
+                i = desktop.detect(s)
+                self.assertIsNotNone(i, s)
+                self.assertEqual(i.verb, "tabs")
+
+    def test_activate_shapes_parse_with_target(self):
+        for s, want in (("switch to tab gmail", "gmail"),
+                        ("go to tab calendar", "calendar"),
+                        ("open tab youtube", "youtube"),
+                        ("focus tab docs", "docs"),
+                        ("activate tab mail", "mail"),
+                        ("bring tab chat to front", "chat")):
+            with self.subTest(s=s):
+                i = desktop.detect(s)
+                self.assertIsNotNone(i, s)
+                self.assertEqual((i.verb, i.arg), ("activate_tab", want))
+
+    def test_tiers_do_not_claim_each_other(self):
+        self.assertEqual(desktop.detect("switch to firefox").verb, "focus")
+        self.assertIsNone(desktop.detect("open tabs"))
+        self.assertIsNone(desktop.detect("list tasks"))
+        self.assertIsNone(desktop.detect("switch to it"))
+
+    def test_tab_policy_is_allow_and_confirm(self):
+        cfg = {"enabled": True}
+        self.assertEqual(desktop.policy(cfg, "tabs"), "allow")
+        self.assertEqual(desktop.policy(cfg, "activate_tab"), "confirm")
+
+    def test_service_runs_browser_verbs_with_config(self):
+        import dispatcher.browser as _b
+        svc = _Svc({"enabled": True, "confirm_timeout_s": 120})
+        with mock.patch("dispatcher.browser.list_tabs",
+                        return_value=[{"id": "a", "title": "Mail", "url": "u"}]):
+            out = asyncio.run(svc.run_desktop_intent(
+                desktop.Intent("tabs"), "voice"))
+        self.assertEqual(out["status"], "done")
+        self.assertIn("Mail", out["speech"])
+        parked = asyncio.run(svc.run_desktop_intent(
+            desktop.Intent("activate_tab", arg="mail"), "voice"))
+        self.assertEqual(parked["status"], "needs_confirmation")
+        with mock.patch("dispatcher.browser.activate_tab",
+                        side_effect=_b.BrowserError("no debuggable browser")):
+            out = asyncio.run(svc.confirm_desktop(
+                parked["confirm_id"], True))
+        self.assertEqual(out["status"], "failed")
+        self.assertIn("debuggable", out["speech"])
+
+
 class TestWindowVerbs(unittest.TestCase):
     """K2 T2: window list (allow) and focus (confirm) over AT-SPI. The list
     shapes name windows beside a listing verb; ordinary window-talk
@@ -858,7 +916,8 @@ class _Svc:
         self.pending_desktop = {}
         self.hooks = mock.Mock(fire=mock.AsyncMock())
         for name in ("desktop_command", "run_desktop_intent", "confirm_desktop",
-                     "pending_desktop_for", "_expire_desktop_confirms"):
+                     "pending_desktop_for", "_expire_desktop_confirms",
+                     "_run_browser_intent"):
             setattr(self, name, getattr(Service, name).__get__(self))
 
 

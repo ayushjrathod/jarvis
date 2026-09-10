@@ -1126,9 +1126,29 @@ class Service:
         # run_intent_ok, not run_intent: the executor never raises, so the
         # sentence alone cannot tell success from failure — and a failed
         # launch ("open tasks" parsed as launch 'tasks') used to settle done.
-        ok, speech = await asyncio.to_thread(desktop.run_intent_ok, intent)
+        if intent.verb in ("tabs", "activate_tab"):
+            ok, speech = await asyncio.to_thread(self._run_browser_intent, intent)
+        else:
+            ok, speech = await asyncio.to_thread(desktop.run_intent_ok, intent)
         log.info("desktop: ran %s -> %s", intent.verb, speech[:80])
         return {"status": "done" if ok else "failed", "speech": speech}
+
+    def _run_browser_intent(self, intent) -> tuple[bool, str]:
+        """Browser-tier verbs need the debug port from config, which the
+        desktop executor signature doesn't carry — so they run here, with the
+        same (acted, sentence) contract as run_intent_ok."""
+        from . import browser
+        try:
+            if intent.verb == "tabs":
+                tabs = browser.list_tabs(self.cfg)
+                if not tabs:
+                    return True, ("No browser tabs found — launch chromium "
+                                  "with --remote-debugging-port=9222.")
+                return True, ("Open tabs: " + "; ".join(
+                    f'{t["title"]}' for t in tabs))
+            return True, browser.activate_tab(self.cfg, intent.arg)
+        except browser.BrowserError as e:
+            return False, f"Sorry — {e}."
 
     async def confirm_desktop(self, confirm_id: str, approve: bool) -> dict:
         """Answer a parked desktop confirmation. Unknown/expired ids are
@@ -1144,7 +1164,11 @@ class Service:
                                    "confirm_id": confirm_id, "approved": False})
             return {"status": "declined",
                     "speech": "Okay, skipping it."}
-        ok, speech = await asyncio.to_thread(desktop.run_intent_ok, entry["intent"])
+        if entry["intent"].verb in ("tabs", "activate_tab"):
+            ok, speech = await asyncio.to_thread(
+                self._run_browser_intent, entry["intent"])
+        else:
+            ok, speech = await asyncio.to_thread(desktop.run_intent_ok, entry["intent"])
         log.info("desktop: confirmed %s -> %s", entry["intent"].verb, speech[:80])
         # A voice "yeah" spends the id, but the dashboard banner only removes
         # rows it answers itself or that time out — without this event it kept

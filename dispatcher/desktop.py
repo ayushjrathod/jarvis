@@ -66,9 +66,10 @@ LAUNCH_SETTLE_S = 2.0    # how long we wait to see a launched app show up
 LAUNCH_POLL_S = 0.1
 
 # Verbs that only read state. Everything else changes something.
-READ_VERBS = frozenset({"status", "clipboard_get", "windows"})
+READ_VERBS = frozenset({"status", "clipboard_get", "windows", "tabs"})
 ALL_VERBS = READ_VERBS | frozenset(
-    {"volume", "mute", "lock", "launch", "open", "clipboard_set", "focus"})
+    {"volume", "mute", "lock", "launch", "open", "clipboard_set", "focus",
+     "activate_tab"})
 
 # See the module docstring for why these are the defaults.
 DEFAULT_POLICY = {
@@ -79,9 +80,11 @@ DEFAULT_POLICY = {
     "launch": "allow",
     "clipboard_set": "allow",
     "windows": "allow",
+    "tabs": "allow",
     "clipboard_get": "confirm",
     "open": "confirm",
     "focus": "confirm",
+    "activate_tab": "confirm",
 }
 
 OPEN_SCHEMES = frozenset({"http", "https", "file", ""})
@@ -119,6 +122,10 @@ class Intent:
             return "list open windows"
         if self.verb == "focus":
             return f'focus "{self.arg}"'
+        if self.verb == "tabs":
+            return "list browser tabs"
+        if self.verb == "activate_tab":
+            return f'switch to the "{self.arg}" tab'
         return self.verb.replace("_", " ")
 
 
@@ -346,6 +353,19 @@ _WINDOW_GENERIC_ARGS = frozenset({
     "this", "them", "windows",
 })
 
+# Browser tabs (K2 T3, 2026-09-10). Same qualifier discipline as windows:
+# only sentences naming tabs reach this tier — "switch to firefox" stays a
+# window focus, "list tasks" stays tasks. Bare generics are prose.
+_TAB_LIST_RE = re.compile(
+    r"^(?:(?:what|which) (?:browser |chrome |chromium )?tabs are open"
+    r"|(?:list|show)(?: me)?(?: my| the| all| open)? (?:browser |chrome |chromium )?tabs"
+    r"|are (?:there )?any tabs open)$")
+_TAB_ACTIVATE_RES = (
+    re.compile(r"^(?:switch to|go to|open|focus|activate) (?:the )?tab (?P<q>.+)$"),
+    re.compile(r"^bring (?:the )?tab (?P<q>.+?) to (?:the )?front$"),
+)
+_TAB_GENERIC_ARGS = frozenset({"it", "that", "this", "a tab", "the tab", "them"})
+
 
 # -- shape tests for the two ambiguous branches ------------------------------
 #
@@ -361,6 +381,9 @@ _NOT_APP_WORDS = frozenset({
     "the", "a", "an", "my", "our", "your", "this", "that", "these", "those",
     "all", "some", "another", "again", "it", "them", "up", "for",
     "with", "from", "on", "in", "of", "and", "to", "please",
+    # Tier nouns, never app names (2026-09-10): "open tabs" is a tab-list
+    # request misheard by the launch branch, not an app called "tabs".
+    "tab", "tabs",
 })
 
 
@@ -508,6 +531,8 @@ def detect(text: str) -> Intent | None:
         return Intent("status")
     if _WINDOW_LIST_RE.match(t):
         return Intent("windows")
+    if _TAB_LIST_RE.match(t):
+        return Intent("tabs")
     if asking:
         return None
 
@@ -540,6 +565,16 @@ def detect(text: str) -> Intent | None:
         if m:
             down = m.group("dir") in _DOWN_WORDS
             return Intent("volume", delta=-VOLUME_STEP if down else VOLUME_STEP)
+
+    # Tab-activate before window-focus: "switch to tab gmail" names a tab,
+    # and the more specific qualifier wins. Window-focus owns the bare shape.
+    for rx in _TAB_ACTIVATE_RES:
+        m = rx.match(t)
+        if m:
+            target = m.group("q").strip(_PUNCT)
+            if target and target not in _TAB_GENERIC_ARGS:
+                return Intent("activate_tab", arg=target)
+            return None
 
     for rx in _WINDOW_FOCUS_RES:
         m = rx.match(t)
