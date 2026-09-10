@@ -259,6 +259,7 @@ export const guide = [
             ["a desktop command refuses", "its policy is deny in the computer.policy block; GET /desktop/verbs lists every verb and its current setting"],
             ["“<app> didn't start” or “I can't reach your desktop session”", "the dispatcher was started before your graphical session and has no display to launch into. It borrows one from the systemd user manager; scripts/doctor.sh reports whether the manager has one, and a restart from inside the desktop session fixes it"],
             ["a file in vault/inbox/ isn't searchable", "give it a minute (the watcher waits for it to stop changing), then check the journal for “inbox”"],
+            ["phone POSTs rejected by the origin guard", "open GET /debug/host from the phone over Tailscale and paste the host value into security.public_hosts"],
           ],
         },
       },
@@ -284,6 +285,7 @@ export const endpoints = [
       { method: "GET", path: "/events", summary: "Live server-sent event feed powering the dashboard.", params: "—", returns: "SSE: queued, started, done, failed, refused, cancelled, requeued, step, notify, automation, confirm, confirm_resolved" },
       { method: "GET", path: "/stats", summary: "Tasks by status, cost per source, success rate, quick-path latency, recent reflections.", params: "days (default 7)", returns: "stats object" },
       { method: "GET", path: "/health", summary: "Liveness plus a snapshot of the running configuration.", params: "—", returns: "{status, …}" },
+      { method: "GET", path: "/debug/host", summary: "Echo the Host/Origin headers as seen here — open from the phone to learn what Tailscale Serve forwards.", params: "—", returns: "{host, origin}" },
     ],
   },
   {

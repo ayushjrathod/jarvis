@@ -1114,6 +1114,15 @@ class TestLearnRoute(HTTPTestCase):
         self.assertEqual(json.loads(row["metadata"])["task_type"], "learn")
 
 
+class TestDebugHost(HTTPTestCase):
+    def test_reports_host_and_origin_as_seen(self):
+        r = self.client.get("/debug/host", headers={"host": "box.tail.ts.net"})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["host"], "box.tail.ts.net")
+        self.assertIsNone(body["origin"])
+
+
 class TestUICacheHeaders(HTTPTestCase):
     """Tier 3: heuristic freshness served a month-old shell with zero
     requests. Hashed assets are immutable; the shell always revalidates."""

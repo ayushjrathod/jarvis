@@ -580,6 +580,20 @@ def register_obs_routes(app: FastAPI, svc: Service, cfg: Config):
             "running_tasks": len(svc.bg),
         }
 
+    @app.get("/debug/host")
+    async def debug_host(request: Request):
+        """Report the Host (and Origin) headers as this server sees them.
+
+        Exists for exactly one job: the Host-header check the origin guard
+        needs — open this URL from the phone over Tailscale Serve and paste
+        the `host` value into security.public_hosts. Echoes only what the
+        caller's own request carried; no server internals.
+        """
+        return {
+            "host": request.headers.get("host"),
+            "origin": request.headers.get("origin"),
+        }
+
 def create_app(cfg: Config | None = None) -> FastAPI:
     cfg = cfg or Config.load()
     svc = Service(cfg)
