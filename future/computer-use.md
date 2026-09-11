@@ -302,3 +302,33 @@ dangerous-tool arming. Hermes / NousResearch (MIT) — SOM capture vocabulary,
 element-token staleness, background/no-focus-steal contract, tool-level block
 list, "when NOT to use" scoping. Add the attribution comments at lift time and
 extend the reuse table in CLAUDE.md.
+
+---
+
+## 9. UPDATE 2026-09-08..11 (sessions 35–36): T2 + T3 land with zero new deps
+
+Q2 (dep approvals) is moot — neither tier needed its dependency after all.
+
+- **T2 shipped**: `dispatcher/windows.py` enumerates apps, window/frame/dialog
+  roles and titles over blocking jeepney straight at `org.a11y.Bus`
+  (GetAddress → registry bus → GetChildren/GetRoleName/Name props). Verbs
+  `windows` (allow) and `focus` (confirm) in the desktop safety plane; focus
+  matches case-insensitively, names candidates on ambiguity, fails speakably
+  on a miss. Live-verified against the real bus (4 windows). Deliberately
+  NOT built: close-by-action and click-by-name — GrabFocus is verified, the
+  rest of the action surface is not, and an unverified click verb is exactly
+  the "reports success" failure §5 warns about.
+- **T3 shipped, two slices**: `dispatcher/browser.py` lists and activates
+  tabs over the DevTools HTTP endpoints (plain httpx, no WebSocket framing);
+  `dispatcher/cdp.py` is a ~150-line stdlib-socket WS client (handshake,
+  masked frames, id-matched calls) for `Runtime.evaluate`, which powers the
+  `read_tab` verb (confirm — page text reaches model context, so quoted-data
+  posture). Verbs `tabs` (allow), `activate_tab` + `read_tab` (confirm). The
+  tab qualifier keeps all three tiers apart (window focus owns the bare
+  "switch to X"). Live-verified against headless chromium (list + activate +
+  read). Deliberately NOT built: page *actions* (click/type via evaluate) —
+  same unverified-verb rule; the evaluate seam is proven, the actions are not.
+- Parser discipline held throughout: every new shape came with its
+  qualifier test and a generative no-other-parser-claims-it suite (the
+  raise/volume collision was caught live during wiring and `raise` is not a
+  focus verb because of it).
