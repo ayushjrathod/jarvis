@@ -66,10 +66,12 @@ LAUNCH_SETTLE_S = 2.0    # how long we wait to see a launched app show up
 LAUNCH_POLL_S = 0.1
 
 # Verbs that only read state. Everything else changes something.
+# (read_tab is NOT here: page text lands in model context, so it confirms
+# like open — a page is third-party input, not local state.)
 READ_VERBS = frozenset({"status", "clipboard_get", "windows", "tabs"})
 ALL_VERBS = READ_VERBS | frozenset(
     {"volume", "mute", "lock", "launch", "open", "clipboard_set", "focus",
-     "activate_tab"})
+     "activate_tab", "read_tab"})
 
 # See the module docstring for why these are the defaults.
 DEFAULT_POLICY = {
@@ -85,6 +87,7 @@ DEFAULT_POLICY = {
     "open": "confirm",
     "focus": "confirm",
     "activate_tab": "confirm",
+    "read_tab": "confirm",
 }
 
 OPEN_SCHEMES = frozenset({"http", "https", "file", ""})
@@ -126,6 +129,8 @@ class Intent:
             return "list browser tabs"
         if self.verb == "activate_tab":
             return f'switch to the "{self.arg}" tab'
+        if self.verb == "read_tab":
+            return f'read the "{self.arg}" tab'
         return self.verb.replace("_", " ")
 
 
@@ -365,6 +370,10 @@ _TAB_ACTIVATE_RES = (
     re.compile(r"^bring (?:the )?tab (?P<q>.+?) to (?:the )?front$"),
 )
 _TAB_GENERIC_ARGS = frozenset({"it", "that", "this", "a tab", "the tab", "them"})
+_TAB_READ_RE = re.compile(
+    r"^(?:read (?:the |this |that |my )?tab(?P<q1> .*?)?"
+    r"|what(?:'?s| is) (?:on|in) (?:the |this |that |my )?tab(?P<q2> .*?)?"
+    r"|what does (?:the |this |that )?tab say)$")
 
 
 # -- shape tests for the two ambiguous branches ------------------------------
@@ -533,6 +542,10 @@ def detect(text: str) -> Intent | None:
         return Intent("windows")
     if _TAB_LIST_RE.match(t):
         return Intent("tabs")
+    m = _TAB_READ_RE.match(t)
+    if m:
+        target = (m.group("q1") or m.group("q2") or "").strip(_PUNCT)
+        return Intent("read_tab", arg=target)
     if asking:
         return None
 

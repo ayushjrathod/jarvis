@@ -70,14 +70,10 @@ def list_tabs(cfg) -> list[dict]:
     return out
 
 
-def activate_tab(cfg, query: str) -> str:
-    """Switch to the tab whose title or URL best matches `query`."""
+def _match(tabs: list[dict], query: str) -> dict:
     q = (query or "").strip().lower()
     if not q:
-        raise BrowserError("switch to which tab?")
-    tabs = list_tabs(cfg)
-    if not tabs:
-        raise BrowserError("no browser tabs found (is it running debuggable?)")
+        raise BrowserError("which tab?")
     hits = [t for t in tabs
             if q in t["title"].lower() or q in t["url"].lower()]
     if not hits:
@@ -85,5 +81,63 @@ def activate_tab(cfg, query: str) -> str:
     if len(hits) > 1:
         names = ", ".join(sorted({h["title"] for h in hits})[:5])
         raise BrowserError(f"which tab? {names}")
-    _get(cfg, f"/json/activate/{hits[0]['id']}", expect_json=False)
-    return f'Switched to "{hits[0]["title"]}".'
+    return hits[0]
+
+
+def activate_tab(cfg, query: str) -> str:
+    """Switch to the tab whose title or URL best matches `query`."""
+    tabs = list_tabs(cfg)
+    if not tabs:
+        raise BrowserError("no browser tabs found (is it running debuggable?)")
+    hit = _match(tabs, query)
+    _get(cfg, f"/json/activate/{hit['id']}", expect_json=False)
+    return f'Switched to "{hit["title"]}".'
+
+
+READ_CHARS = 4000
+
+
+def read_tab(cfg, query: str) -> str:
+    """The visible text of the matching tab, clipped for quota. Page text
+    reaches the model, so callers treat it as untrusted input — never as
+    instructions (same posture as the notify gate's quoted data)."""
+    from . import cdp
+    tabs = list_tabs(cfg)
+    if not tabs:
+        raise BrowserError("no browser tabs found (is it running debuggable?)")
+    hit = _match(tabs, query)
+    ws_url = _ws_url(cfg, hit["id"])
+    with cdp.CDPClient() as client:
+        client.connect(ws_url)
+        text = client.evaluate(
+            "document.body ? document.body.innerText : document.title")
+    text = " ".join((text or "").split())
+    if len(text) > READ_CHARS:
+        text = (text[:READ_CHARS].rsplit(" ", 1)[0]
+                + f"… [{len(text) - READ_CHARS} more chars omitted]")
+    return f'"{hit["title"]}": {text or "(no readable text)"}'
+
+
+def _ws_url(cfg, tab_id: str) -> str:
+    for t in _targets(cfg):
+        if t.get("id") == tab_id:
+            url = t.get("webSocketDebuggerUrl") or ""
+            if url.startswith("ws://"):
+                return url
+    raise BrowserError("tab went away before reading")
+
+
+def _targets(cfg) -> list:
+    import httpx
+    try:
+        r = httpx.get(_base_url(cfg) + "/json/list", timeout=TIMEOUT_S)
+    except Exception as e:
+        raise BrowserError(
+            "no debuggable browser — launch chromium with "
+            "--remote-debugging-port=9222") from e
+    if r.status_code != 200:
+        raise BrowserError(f"browser answered {r.status_code}")
+    try:
+        return r.json() or []
+    except ValueError as e:
+        raise BrowserError("browser answered garbage") from e

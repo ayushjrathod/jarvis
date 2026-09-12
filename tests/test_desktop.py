@@ -591,6 +591,28 @@ class TestTabVerbs(unittest.TestCase):
         self.assertEqual(desktop.policy(cfg, "tabs"), "allow")
         self.assertEqual(desktop.policy(cfg, "activate_tab"), "confirm")
 
+    def test_read_shapes_parse_and_confirm(self):
+        for s, want in (("read this tab", ""), ("read tab gmail", "gmail"),
+                        ("what is on this tab?", ""),
+                        ("what does the tab say", "")):
+            with self.subTest(s=s):
+                i = desktop.detect(s)
+                self.assertIsNotNone(i, s)
+                self.assertEqual((i.verb, i.arg), ("read_tab", want))
+        cfg = {"enabled": True}
+        self.assertEqual(desktop.policy(cfg, "read_tab"), "confirm")
+
+    def test_service_reads_tab_text_through_config(self):
+        svc = _Svc({"enabled": True, "confirm_timeout_s": 120})
+        parked = asyncio.run(svc.run_desktop_intent(
+            desktop.Intent("read_tab", arg="mail"), "voice"))
+        self.assertEqual(parked["status"], "needs_confirmation")
+        with mock.patch("dispatcher.browser.read_tab",
+                        return_value='"Mail": hello there'):
+            out = asyncio.run(svc.confirm_desktop(parked["confirm_id"], True))
+        self.assertEqual(out["status"], "done")
+        self.assertIn("hello there", out["speech"])
+
     def test_service_runs_browser_verbs_with_config(self):
         import dispatcher.browser as _b
         svc = _Svc({"enabled": True, "confirm_timeout_s": 120})

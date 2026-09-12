@@ -1126,7 +1126,7 @@ class Service:
         # run_intent_ok, not run_intent: the executor never raises, so the
         # sentence alone cannot tell success from failure — and a failed
         # launch ("open tasks" parsed as launch 'tasks') used to settle done.
-        if intent.verb in ("tabs", "activate_tab"):
+        if intent.verb in ("tabs", "activate_tab", "read_tab"):
             ok, speech = await asyncio.to_thread(self._run_browser_intent, intent)
         else:
             ok, speech = await asyncio.to_thread(desktop.run_intent_ok, intent)
@@ -1146,6 +1146,8 @@ class Service:
                                   "with --remote-debugging-port=9222.")
                 return True, ("Open tabs: " + "; ".join(
                     f'{t["title"]}' for t in tabs))
+            if intent.verb == "read_tab":
+                return True, browser.read_tab(self.cfg, intent.arg)
             return True, browser.activate_tab(self.cfg, intent.arg)
         except browser.BrowserError as e:
             return False, f"Sorry — {e}."
@@ -1164,7 +1166,7 @@ class Service:
                                    "confirm_id": confirm_id, "approved": False})
             return {"status": "declined",
                     "speech": "Okay, skipping it."}
-        if entry["intent"].verb in ("tabs", "activate_tab"):
+        if entry["intent"].verb in ("tabs", "activate_tab", "read_tab"):
             ok, speech = await asyncio.to_thread(
                 self._run_browser_intent, entry["intent"])
         else:
