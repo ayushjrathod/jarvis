@@ -325,6 +325,19 @@ class TestValidateSpec(unittest.TestCase):
             {"task_text": "x", "kind": "interval", "interval_minutes": 60})
         self.assertEqual(ok["interval_minutes"], 60)
 
+    def test_describe_never_raises_on_legacy_rows(self):
+        # Rows outlive code: a missing kind/time/weekday must still list
+        # instead of 500ing GET /automations.
+        self.assertIn("?", automations.describe({"kind": "weekly"}))
+        self.assertIn("unknown schedule", automations.describe({"kind": "cron"}))
+        self.assertIn("unknown schedule", automations.describe({}))
+        self.assertEqual(automations.describe(
+            {"kind": "daily", "time": "07:30"}), "daily at 07:30")
+
+    def test_unknown_kind_is_listed_not_fired(self):
+        self.assertIsNone(automations.next_run_iso({"kind": "cron"}))
+        self.assertIsNone(automations.next_run_iso({}))
+
     def test_check_interval_fails_toward_default(self):
         # Finding 2.7: a bare `check_interval_s:` parses as None and
         # sleep(None) killed the fire-and-forget scheduler forever; 0 spun.

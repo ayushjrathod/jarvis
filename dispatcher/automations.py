@@ -265,7 +265,11 @@ def next_run_iso(spec: dict, after: datetime | None = None) -> str | None:
     after = after or _now_local()
     if after.tzinfo is None:
         after = after.replace(tzinfo=_local_zone())
-    kind = spec["kind"]
+    kind = (spec or {}).get("kind")
+    if kind not in ("once", "interval", "daily", "weekly"):
+        # Legacy/hand-edited row no validator would accept today: unrunnable,
+        # listed honestly by describe(), never fired mysteriously.
+        return None
     if kind == "once":
         if spec.get("once_at") is None:
             return None
@@ -291,14 +295,21 @@ def next_run_iso(spec: dict, after: datetime | None = None) -> str | None:
 
 
 def describe(spec: dict) -> str:
-    kind = spec["kind"]
+    """One-line human schedule. Never raises: rows outlive code versions, so
+    a legacy or hand-edited row with a missing kind, time or weekday must
+    still list instead of 500ing GET /automations."""
+    kind = (spec or {}).get("kind")
     if kind == "daily":
-        return f"daily at {spec['time']}"
+        return f"daily at {spec.get('time') or '??:??'}"
     if kind == "weekly":
-        return f"weekly on {WEEKDAYS[spec['weekday']]} at {spec['time']}"
+        wd = spec.get("weekday")
+        day = WEEKDAYS[wd] if isinstance(wd, int) and 0 <= wd <= 6 else "?"
+        return f"weekly on {day} at {spec.get('time') or '??:??'}"
     if kind == "interval":
-        return f"every {spec['interval_minutes']} minutes"
-    return f"once at {str(spec.get('once_at', '')).replace('T', ' ')[:16]}"
+        return f"every {spec.get('interval_minutes') or '?'} minutes"
+    if kind == "once":
+        return f"once at {str(spec.get('once_at', '')).replace('T', ' ')[:16]}"
+    return f"unknown schedule ({kind})"
 
 
 def spec_from_row(row: dict) -> dict:
