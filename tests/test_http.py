@@ -913,6 +913,21 @@ class TestAutomationRoutes(HTTPTestCase):
     def test_toggling_an_unknown_automation_is_404(self):
         self.assertEqual(self.client.post("/automations/999/toggle").status_code, 404)
 
+    def test_toggling_a_legacy_kind_stays_quiet(self):
+        # A kind no validator accepts today: enabling must not crash and
+        # must not schedule a fire — NULL next run, listed as unknown.
+        row = self.svc.db.create_automation(
+            "legacy thing", "api",
+            {"task_text": "legacy thing", "kind": "cron", "time": None,
+             "weekday": None, "interval_minutes": None, "once_at": None,
+             "notify": True},
+            "2020-01-01T07:30:00+00:00")
+        self.svc.db.set_automation_enabled(row["id"], False)
+        on = self.client.post(f"/automations/{row['id']}/toggle").json()
+        self.assertEqual(on["enabled"], 1)
+        self.assertIsNone(on["next_run_at"])
+        self.assertIn("unknown schedule", on["describe"])
+
     def test_deleting_removes_the_row_and_a_second_delete_is_404(self):
         row = self.seed()
         r = self.client.delete(f"/automations/{row['id']}")
