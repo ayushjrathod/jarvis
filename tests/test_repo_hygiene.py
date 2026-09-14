@@ -60,3 +60,17 @@ class TestVaultCordon(unittest.TestCase):
             cwd=ROOT, capture_output=True, text=True,
         )
         self.assertEqual(out.stdout.strip(), "")
+
+
+class TestHistoryAudit(unittest.TestCase):
+    """scripts/audit_history.sh answers the publish question with facts.
+    This runs it: a clean tree must audit clean, so the check itself is
+    pinned against future leaks (run it by hand before every push)."""
+
+    def test_audit_is_clean(self):
+        out = subprocess.run(
+            ["bash", "scripts/audit_history.sh"],
+            cwd=ROOT, capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(out.returncode, 0, f"\n{out.stdout}\n{out.stderr}")
+        self.assertIn("history audit clean", out.stdout)

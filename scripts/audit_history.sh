@@ -30,14 +30,13 @@ for f in .env data/spotify.json; do
 done
 
 # 2. API-key-shaped strings anywhere in history (sk-ant-, ghp_, xoxb-).
-if git log --all -p -S 'sk-ant-' -- . ':!*.lock' 2>/dev/null | grep -q '^commit'; then
-  bad "sk-ant- string in history:"; git log --all --oneline -S 'sk-ant-' | head -n 5
-else
-  ok "no sk-ant- in history"
-fi
-for pat in 'ghp_' 'xoxb-'; do
-  if git log --all -p -S "$pat" 2>/dev/null | grep -q '^commit'; then
-    bad "$pat string in history"
+# The audit script itself names these patterns, so it is excluded from its
+# own search — otherwise committing the detector trips the detector.
+for pat in 'sk-ant-' 'ghp_' 'xoxb-'; do
+  if git log --all -p -S "$pat" -- . ':!scripts/audit_history.sh' 2>/dev/null \
+      | grep -q '^commit'; then
+    bad "$pat string in history:"
+    git log --all --oneline -S "$pat" -- . ':!scripts/audit_history.sh' | head -n 5
   else
     ok "no $pat in history"
   fi
