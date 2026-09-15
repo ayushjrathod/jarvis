@@ -20,7 +20,7 @@ KNOWN_DISPATCHER_KEYS = frozenset({
     "queue_max_retries", "max_concurrent_agentic", "claude_bin",
     "claude_config_dir", "models", "quick_session_idle_minutes", "budgets",
     "task_defaults", "task_types", "memory", "learning", "automations",
-    "media", "computer", "brief", "inbox", "screenshots_dir", "stt",
+    "media", "computer", "browser", "brief", "inbox", "screenshots_dir", "stt",
     "embeddings", "security",
 })
 

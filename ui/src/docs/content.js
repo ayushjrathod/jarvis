@@ -229,6 +229,7 @@ export const guide = [
             ["dispatcher.inbox", "vault/inbox watcher: poll interval, notify on arrival, optional per-file summary (off by default — it costs a model call)"],
             ["dispatcher.media", "Spotify control: enable, launch command, credentials path, search market"],
             ["dispatcher.computer", "desktop verbs: enable, and the per-verb allow / confirm / deny policy"],
+            ["dispatcher.browser", "browser-tab verbs: the DevTools debug port (launch chromium with --remote-debugging-port to match)"],
             ["dispatcher.security.public_hosts", "hostnames the CSRF origin guard trusts — your Tailscale name goes here for phone access"],
             ["jarvis", "trigger keys (ptt_key for the assistant, trigger_key for dictation — they must differ), wake word and threshold, STT/TTS engines, VAD and barge-in tuning"],
             ["jarvis.ask_screen", "shortcut, popup size, screenshots kept, browser binary"],
