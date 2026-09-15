@@ -181,6 +181,22 @@ class TestIngest(unittest.TestCase):
         hits = self.db.search_episodes("fern", after=today)
         self.assertTrue(hits)
 
+    def test_old_consolidation_exports_are_pruned(self):
+        from dispatcher.memory import _prune_exports
+        import time as _time
+        d = Path(self.tmp.name) / "data" / "consolidation"
+        d.mkdir(parents=True)
+        old = d / "2020-01-01T000000Z.md"
+        new = d / "export.md"
+        old.write_text("old")
+        new.write_text("new")
+        ancient = _time.time() - 40 * 86400
+        import os as _os
+        _os.utime(old, (ancient, ancient))
+        self.assertEqual(_prune_exports(d), 1)
+        self.assertFalse(old.exists())
+        self.assertTrue(new.exists())
+
     def test_unsupported_formats_are_counted_not_celebrated(self):
         # .csv/.eml have no chunker and were silently nobody's stat — while
         # the inbox announced them searchable.

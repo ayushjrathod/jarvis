@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 
 from .areas import AreaRegistry
@@ -158,6 +159,26 @@ def _write_new(path: Path, text: str, tries: int = 50) -> Path:
     return path
 
 
+def _prune_exports(directory: Path, days: int = 30) -> int:
+    """Delete consolidation exports older than `days`. The audit trail stays
+    useful for a month of manual replays; past that it is disk usage with a
+    story. Best-effort and quiet — a prune must never fail a consolidation."""
+    cutoff = time.time() - days * 86400
+    pruned = 0
+    try:
+        files = sorted(directory.glob("*.md"))
+    except OSError:
+        return 0
+    for p in files:
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+                pruned += 1
+        except OSError:
+            continue
+    return pruned
+
+
 def render_episodes(episodes: list[dict]) -> str:
     """The markdown the consolidation agent and the graph extractor both read.
 
@@ -190,6 +211,7 @@ def build_consolidation(cfg: Config, db: Database) -> dict | None:
     stamp = now().replace(":", "").replace("+0000", "Z")
     export = cfg.root / "data" / "consolidation" / f"{stamp}.md"
     export.parent.mkdir(parents=True, exist_ok=True)
+    _prune_exports(export.parent)
     # Exclusive create, uniquified on collision (2026-08-10). `stamp` has
     # one-second resolution and write_text overwrites, so two /memory/consolidate
     # calls landing in the same second both built a job and the second export
