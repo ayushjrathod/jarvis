@@ -2,11 +2,27 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
+
+log = logging.getLogger("dispatcher.config")
+
+# Every key Config.load reads under `dispatcher:`. Anything else is warned,
+# not failed: a typo'd key (poll_intervall_s, computer.pollicy misnested)
+# used to sit silently while the operator wondered why nothing changed, and
+# failing hard would break forward-compat with newer config files.
+KNOWN_DISPATCHER_KEYS = frozenset({
+    "host", "port", "db", "queue_dir", "poll_interval_s",
+    "queue_max_retries", "max_concurrent_agentic", "claude_bin",
+    "claude_config_dir", "models", "quick_session_idle_minutes", "budgets",
+    "task_defaults", "task_types", "memory", "learning", "automations",
+    "media", "computer", "brief", "inbox", "screenshots_dir", "stt",
+    "embeddings", "security",
+})
 
 
 @dataclass
@@ -44,6 +60,11 @@ class Config:
         raw = yaml.safe_load(path.read_text())
         d = raw.get("dispatcher", {})
         root = path.parent.resolve()
+        for key in d:
+            if key not in KNOWN_DISPATCHER_KEYS:
+                log.warning("config %s: unknown dispatcher key %r — typo? "
+                            "(known: %s)", path, key,
+                            ", ".join(sorted(KNOWN_DISPATCHER_KEYS)))
 
         def rel(p):
             p = Path(p)
