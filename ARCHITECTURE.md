@@ -264,33 +264,37 @@ notifies with a generic summary, because you asked to be told.
 
 | File | Owns |
 |---|---|
-| `main.py` | FastAPI app, 32 route handlers, CSRF origin guard, lifespan tasks (queue watcher, reindex, automations scheduler, embed refresh, inbox watcher), static SPA mount |
+| `main.py` | FastAPI app wiring: lifespan tasks, CSRF + cache middleware, static SPA mount, and one `register_*_routes()` call per group (vault, memory-read/write, automations, screen, media, desktop, learning, task, observability) |
 | `service.py` | **The core.** Task lifecycle, both dispatch paths, diverts, trust boundary, notify gate, reflection trigger, cancel/shutdown |
-| `runner.py` | `claude -p` agentic subprocess: command build, stream-json parsing → timeline steps, refusal/denial detection, env sanitizing |
+| `runner.py` | `claude -p` agentic subprocess: command build, stream-json parsing → timeline steps, refusal/denial detection, env sanitizing. Never raises (except cancel) |
 | `quick.py` | `claude -p` streaming subprocess for quick answers. One backend, 162 lines |
-| `db.py` | All SQLite. Schema, migrations, tasks/runs/episodes/entries/facts/automations, FTS5 + sqlite-vec hybrid search with RRF fusion |
-| `config.py` | `config.yaml` → dataclass. Paths resolve relative to the file |
-| `areas.py` | Area registry, frontmatter parsing, **tool-grant sanitizing**, subsequence trigger matching |
+| `db.py` | All SQLite. Schema, migrations, tasks/runs/episodes/entries/facts/automations, FTS5 + sqlite-vec hybrid search with RRF fusion, embedding identity |
+| `config.py` | `config.yaml` → dataclass. Paths resolve relative to the file; unknown keys warn |
+| `areas.py` | Area registry, subsequence trigger matching, **tool-grant sanitizing** (positive scope test). Frontmatter itself parses via `queue_watcher.parse_task_file` — one reader for the dispatcher |
+| `task_status.py` | One status reader for task files (brief, toggle, list agree) |
 | `classifier.py` | quick-vs-agentic heuristic |
-| `memory.py` | Core blocks rendering + budget, episode capture policy, consolidation export builder |
-| `ingest.py` | Vault → heading-ancestry chunks → hash-diff index. md/txt/html/pdf/epub/images |
-| `embeddings.py` | fastembed bge-small-en-v1.5 int8, lazy singleton, backfill |
-| `graph.py` | Knowledge-graph extraction + reconciliation prompts, deterministic apply |
+| `memory.py` | Core blocks rendering + budget, episode capture policy, consolidation export builder, export retention |
+| `ingest.py` | Vault → heading-ancestry chunks → hash-diff index. md/txt/html/pdf/epub/images; honest unsupported/unparseable accounting |
+| `embeddings.py` | fastembed bge-small-en-v1.5 int8, lazy singleton, serialized backfill with model-identity guard |
+| `graph.py` | Knowledge-graph extraction + reconciliation prompts, deterministic apply; clip reports surviving ids |
+| `cdp.py` | Minimal DevTools-protocol client over stdlib sockets (handshake, frames, id-matched calls) |
+| `browser.py` | Tab list/switch/read over DevTools HTTP + `cdp.py` |
+| `windows.py` | Window list/focus over AT-SPI via jeepney, zero new deps |
 | `automations.py` | NL→schedule parse, mechanical validation, DST-correct next-run math, in-process scheduler loop |
-| `notify.py` | Notify-or-not gate prompt + surfacing policy + `notify-send` |
+| `notify.py` | Notify-or-not gate prompt (nonce-fenced) + surfacing policy + `notify-send` |
 | `offline.py` | Degraded extractive answers from the local index when rate-limited |
 | `spotify.py` | Deterministic music parser + MPRIS over jeepney + Web API search |
-| `desktop.py` | Deterministic desktop verbs + allow/confirm/deny safety plane |
-| `inbox.py` | Two-phase-settle file watcher on `vault/inbox/` |
-| `brief.py` | Quiet-day pre-check for the daily brief |
+| `desktop.py` | Deterministic desktop/window/tab verbs + allow/confirm/deny safety plane |
+| `inbox.py` | Two-phase-settle file watcher on `vault/inbox/`, honest arrival summaries |
+| `brief.py` | Quiet-day pre-check + desktop ping for the daily brief |
 | `reflection.py` | Post-task review prompt + trigger policy |
 | `curator.py` | Deterministic skill lifecycle: active → stale → archived |
 | `limits.py` | Parse provider usage-limit errors, model-scope vs session-scope |
 | `telemetry.py` | TTFT / ITL percentiles / throughput from delta timestamps |
-| `queue_watcher.py` | `queue/*.md` → tasks, with transient-vs-terminal retry |
-| `vault.py` | Mechanical vault file I/O for the dashboard |
+| `queue_watcher.py` | `queue/*.md` → tasks, with transient-vs-terminal retry; owns `parse_task_file` |
+| `vault.py` | Mechanical vault file I/O for the dashboard (frontmatter-aware toggle) |
 | `stt.py` | Server-side Whisper for browser audio uploads |
-| `events.py` / `hooks.py` | In-process pub/sub; SSE broadcaster is registered as the first hook |
+| `events.py` / `hooks.py` | In-process pub/sub with lifecycle protection (steps evictable, lifecycle never dropped); SSE broadcaster is registered as the first hook |
 
 ### `jarvis/` — the voice pipeline (~1,880 lines)
 
@@ -303,8 +307,11 @@ the portal screenshot flow; `dictate.py` the standalone F9 dictation service.
 ### `ui/` — React SPA
 
 Vite + React 18, **two dependencies**. One SSE subscription in `App.jsx` fans
-`lastEvent` out to every widget. Widgets: AgentMonitor, Tasks, Brief,
-CommandBox (with browser mic), Automations, Stats, ConfirmBar. `ui/dist/` is
+`lastEvent` out to every widget (one synchronous commit per event — React 18
+batching used to eat same-tick pairs). Widgets: AgentMonitor (with system-task
+filter + non-terminal polling), Tasks, Brief (quiet-day polling), CommandBox
+(with browser mic), Volume, NowPlaying, Automations, Stats, ConfirmBar
+(sticky, retires on confirm_resolved), Notices. `ui/dist/` is
 **committed on purpose** — the dispatcher serves the built bundle, so a fresh
 clone needs it.
 
