@@ -553,6 +553,31 @@ class TestIntentOutcome(unittest.TestCase):
                          ("confirm_resolved", False))
 
 
+class TestVerbCoverage(unittest.TestCase):
+    """No orphan verbs: everything the policy plane names must have a
+    default, a description, and an executor — the three lists drifted apart
+    twice before anyone noticed (focus shipped its policy a day before its
+    describe in the first cut)."""
+
+    def test_every_verb_has_policy_describe_and_executor(self):
+        from dispatcher.service import Service
+        browser_verbs = {"tabs", "activate_tab", "read_tab"}
+        for verb in sorted(desktop.ALL_VERBS):
+            with self.subTest(verb=verb):
+                self.assertIn(verb, desktop.DEFAULT_POLICY)
+                # describe() falls back to the verb with underscores spaced
+                # for verbs with no special case (lock, status) — that IS the
+                # description, and it must never be empty.
+                self.assertTrue(desktop.Intent(verb, arg="x").describe())
+                runs_here = verb in desktop._EXECUTORS
+                runs_there = verb in browser_verbs and hasattr(
+                    Service, "_run_browser_intent")
+                self.assertTrue(runs_here or runs_there, verb)
+
+    def test_read_verbs_are_all_known_verbs(self):
+        self.assertTrue(desktop.READ_VERBS <= desktop.ALL_VERBS)
+
+
 class TestTabVerbs(unittest.TestCase):
     """K2 T3: browser tab list (allow) and switch (confirm). The tab
     qualifier keeps every tier apart: switch-to-tab never reaches window
