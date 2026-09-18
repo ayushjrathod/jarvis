@@ -706,6 +706,20 @@ class TestLifespan(unittest.TestCase):
 class TestDesktopRoutes(HTTPTestCase):
     cfg_overrides = {"computer": {"enabled": True, "confirm_timeout_s": 120}}
 
+    def test_verbs_lists_every_verb_with_its_policy(self):
+        # The honest surface: what the tier can do and under what policy —
+        # including the five K2 verbs. A verb missing here is a verb the
+        # dashboard cannot explain.
+        body = self.client.get("/desktop/verbs").json()
+        verbs = body["verbs"]
+        import dispatcher.desktop as _d
+        self.assertEqual(set(verbs), set(_d.ALL_VERBS))
+        self.assertEqual(verbs["windows"], "allow")
+        self.assertEqual(verbs["focus"], "confirm")
+        self.assertEqual(verbs["tabs"], "allow")
+        self.assertEqual(verbs["activate_tab"], "confirm")
+        self.assertEqual(verbs["read_tab"], "confirm")
+
     def test_desktop_is_503_when_the_feature_is_off(self):
         # an absent/disabled computer: block denies everything — the tier is
         # opt-in, and that default is what keeps this suite side-effect-free
