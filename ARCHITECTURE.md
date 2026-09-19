@@ -310,7 +310,8 @@ Vite + React 18, **two dependencies**. One SSE subscription in `App.jsx` fans
 `lastEvent` out to every widget (one synchronous commit per event — React 18
 batching used to eat same-tick pairs). Widgets: AgentMonitor (with system-task
 filter + non-terminal polling), Tasks, Brief (quiet-day polling), CommandBox
-(with browser mic), Volume, Windows (read-only list), NowPlaying, Automations, Stats, ConfirmBar
+(with browser mic), Volume, Windows (read-only list), Tabs (read-only list),
+NowPlaying, Automations, Stats, ConfirmBar
 (sticky, retires on confirm_resolved), Notices. `ui/dist/` is
 **committed on purpose** — the dispatcher serves the built bundle, so a fresh
 clone needs it.
