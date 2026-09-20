@@ -1,6 +1,6 @@
 # STATE — read me first each session
 
-_Last updated: 2026-09-13 (session 34, end)_
+_Last updated: 2026-09-20 (session 35, end)_
 
 ## Session 33 (2026-08-08..25): remediation weeks — READ THIS FIRST after 30
 
@@ -215,9 +215,9 @@ would reverse media-first precedence so Spotify's volume needs "music volume
 systemd; so are the unplanned additions (ask-screen, media control, desktop
 control T1, phone access + PWA, degraded mode, inbox watcher). Three
 whole-codebase reviews have been run **and remediated** (sessions 13, 26, 27)
-plus the standing-list sweeps in 28 and 29. **863 tests green** on the
+plus the standing-list sweeps in 28 and 29. **871 tests green** on the
 `history/aug-sep-backfill` branch (sessions 31–36: review remediation,
-Tier-3, K2 T2+T3 dep-free, route split), `main`
+Tier-3, K2 T2+T3 dep-free, route split, widgets), `main`
 pushed to origin at 2026-08-11.
 
 **A fourth review (session 30, 2026-08-13) has been run and NOT remediated** —
@@ -257,7 +257,7 @@ exists to gate yet).
   `mission-tailscale-serve` has no `Restart=`, so a dispatcher that reaches
   `failed` deactivates it via `Requires=` and restarting the dispatcher does
   **not** bring it back — phone access dies silently.
-- **863 unit tests** green (branch `history/aug-sep-backfill`, sessions 31–36).
+- **871 unit tests** green (branch `history/aug-sep-backfill`, sessions 31–36).
   `smoke_phase_a.sh` **8/8** (the script has 8 `ok()`
   calls; "7/7" was stale) and `smoke_phase_b.py` 12/12 as of session 25 — both
   spend real quota, so they are not run every session.
