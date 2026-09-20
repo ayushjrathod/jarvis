@@ -200,7 +200,8 @@ stream produced one.
 The unattended path. Different failure modes entirely — nobody is watching.
 
 ```
-systemd timer ──► run_agent.py ──► brief.is_quiet()? ──yes──► writes the file, exits
+systemd timer ──► run_agent.py ──► brief.is_quiet()? ──yes──► writes the file,
+      announces over notify-send, exits (no task, no gate, no model)
                                           │no
                                           ▼
                                   POST /task {source: timer, agent: daily-brief}
@@ -223,7 +224,12 @@ no `status: open` file and no note in `vault/notes/` was touched in 3 days,
 `run_agent.py` writes the brief itself and never submits a task. This exists
 because the agent spent ~$0.40 and 8–11 turns every single day from 07-24 to
 08-01 writing the words "clean slate". It **fails toward doing the work**: an
-unreadable task file counts as material.
+unreadable task file counts as material. Open-ness reads through the shared
+`task_status` module, so the brief, the checkbox and the task list can never
+disagree about what "open" means. The quiet path announces over notify-send
+(`announce_quiet`, best-effort, still zero model cost) because submitting no
+task means the notify gate never sees it — that silence lasted a month
+before anyone noticed the morning ping was gone.
 
 **The trust-boundary dance.** This is the subtlest thing in the repo and it cost
 three silent days of missing briefs. `run_agent.py` is an *external HTTP
