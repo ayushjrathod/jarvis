@@ -21,7 +21,9 @@ Supported:
   image, so a big dump makes the reindex noticeably slower once)
 
 Still unsupported: `.docx` / `.doc` / `.gif` — counted as `dep_gated` in the
-reindex stats.
+reindex stats. Anything else with an unfamiliar suffix (`.csv`, `.eml`,
+`.json`, `.zip`, …) is counted as `unsupported` and skipped, and the arrival
+notice says so instead of claiming success.
 
 Files are indexed in place — nothing is moved or renamed. Delete one and its
 entries disappear on the next pass (the watcher notices removals too, it just
