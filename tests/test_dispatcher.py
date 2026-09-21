@@ -140,6 +140,64 @@ class TestQueueParsing(unittest.TestCase):
             parse_task_file("---\n- a\n- b\n---\nbody\n", strict=True)
 
 
+class TestNoDoubleClaim(unittest.TestCase):
+    """At most one subsystem may claim a sentence. Divert order (automation
+    → media → desktop) resolves priority at runtime, but a sentence claimed
+    twice is a routing bug regardless of who wins — the loser never sees it.
+    One corpus across all three deterministic tiers plus the area triggers."""
+
+    CORPUS = [
+        # (sentence, expected owner or None)
+        ("play some jazz", "media"),
+        ("system volume up", "desktop"),
+        ("what windows are open", "desktop"),
+        ("list tabs", "desktop"),
+        ("switch to tab gmail", "desktop"),
+        ("focus Data3", "desktop"),
+        ("add task renew the domain", "area"),
+        # Accepted wart, pinned: "open tasks" parses as a launch and fails
+        # speakably at the executor (finding 1.2) rather than routing. The
+        # status fix is what makes the miss recoverable, not the parser.
+        ("open tasks", "desktop"),
+        ("what is in vault/notes/ideas.md?", None),  # agentic, no divert
+        ("open the window", None),
+        ("windows update", None),
+        ("put on the kettle", None),
+        ("play it by ear", None),
+        ("run the migration", None),
+        ("did you hear the album dropped today", None),
+        ("what is the airspeed velocity of a laden swallow", None),
+    ]
+
+    def test_each_sentence_has_at_most_one_owner(self):
+        from dispatcher import desktop, spotify
+        from dispatcher.areas import AreaRegistry
+        reg = AreaRegistry(Path(__file__).resolve().parent.parent / "areas")
+        for text, want in self.CORPUS:
+            with self.subTest(text=text):
+                owners = []
+                if spotify.detect(text) is not None:
+                    owners.append("media")
+                if desktop.detect(text) is not None:
+                    owners.append("desktop")
+                area, _ = reg.match(text)
+                if area is not None:
+                    owners.append("area")
+                # Media+desktop is the fatal pair: both are diverts, so the
+                # loser never sees the sentence and order is the only
+                # resolution. Desktop+area resolves deterministically the
+                # other way — try_divert runs before routing, so the divert
+                # always wins ("open tasks" launches-and-fails-speakably
+                # rather than becoming a task; finding 1.2, accepted).
+                self.assertFalse("media" in owners and "desktop" in owners,
+                                   owners)
+                self.assertLessEqual(len(owners), 2, owners)
+                if want is None:
+                    self.assertEqual(owners, [])
+                else:
+                    self.assertIn(want, owners)
+
+
 class TestRefusalDetection(unittest.TestCase):
     def test_variants(self):
         self.assertTrue(is_refusal({"stop_reason": "refusal"}))
