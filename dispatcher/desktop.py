@@ -55,6 +55,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import windows as _windows
+
 log = logging.getLogger("dispatcher.desktop")
 
 SINK = "@DEFAULT_AUDIO_SINK@"
@@ -1023,7 +1025,6 @@ _EXECUTORS = {
 
 
 def _list_windows() -> str:
-    from . import windows as _windows
     wins = _windows.list_windows()
     if not wins:
         return "No windows found."
@@ -1032,7 +1033,6 @@ def _list_windows() -> str:
 
 
 def _focus_window(intent: Intent) -> str:
-    from . import windows as _windows
     try:
         return _windows.focus_window(intent.arg)
     except _windows.WindowError as e:

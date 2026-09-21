@@ -12,8 +12,9 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import (automations, desktop, embeddings, graph, limits, memory, notify,
-               offline, quick, reflection, runner, spotify, telemetry)
+from . import (automations, browser, desktop, embeddings, graph, limits,
+               memory, notify, offline, quick, reflection, runner, spotify,
+               telemetry)
 from .areas import AreaRegistry
 from .classifier import classify
 from .config import Config
@@ -1137,7 +1138,6 @@ class Service:
         """Browser-tier verbs need the debug port from config, which the
         desktop executor signature doesn't carry — so they run here, with the
         same (acted, sentence) contract as run_intent_ok."""
-        from . import browser
         try:
             if intent.verb == "tabs":
                 tabs = browser.list_tabs(self.cfg)
