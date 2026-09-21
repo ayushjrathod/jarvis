@@ -303,7 +303,7 @@ def _spa_index(root: Path) -> FileResponse:
     return FileResponse(index, media_type="text/html",
                         headers={"Cache-Control": "no-cache"})
 
-def register_screen_routes(app: FastAPI, svc: Service, cfg: Config):
+def register_screen_routes(app: FastAPI, cfg: Config):
     """Ask-about-my-screen: STT upload, screenshot serving, popup shell."""
     # -- ask-about-my-screen ------------------------------------------------
 
@@ -678,7 +678,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
     register_memory_write_routes(app, svc, cfg)
 
-    register_screen_routes(app, svc, cfg)
+    register_screen_routes(app, cfg)
 
     register_automation_routes(app, svc, cfg)
 
