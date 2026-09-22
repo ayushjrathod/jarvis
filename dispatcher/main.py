@@ -32,7 +32,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
 
 _log = logging.getLogger("dispatcher.main")
 
-
 async def _embed_missing(cfg: Config, db: Database):
     """Best-effort vector backfill, shared by startup, the refresh loop and
     POST /memory/reindex. Hoisted out of create_app with the memory routes."""
@@ -49,10 +48,8 @@ async def _embed_missing(cfg: Config, db: Database):
 # content-type is correct regardless of interpreter.
 mimetypes.add_type("application/manifest+json", ".webmanifest")
 
-
 def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
-
 
 # /stt takes a raw audio body straight into memory; cap it so a stray/hostile
 # upload can't balloon RSS. ~25MB is minutes of Opus — far more than a question.
@@ -73,14 +70,12 @@ MAX_STT_BYTES = 25 * 1024 * 1024
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _GUARDED_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
-
 def _origin_is_local(origin: str, extra_hosts: "Iterable[str]" = ()) -> bool:
     try:
         host = urlsplit(origin).hostname or ""
     except ValueError:
         return False
     return host in _LOCAL_HOSTS or host in set(extra_hosts)
-
 
 class TaskIn(BaseModel):
     text: str
@@ -89,31 +84,25 @@ class TaskIn(BaseModel):
     area: str | None = None
     metadata: dict | None = None
 
-
 class LearnIn(BaseModel):
     request: str = ""       # empty: learn from the source's recent conversation
     source: str = "api"
-
 
 class AutomationIn(BaseModel):
     request: str            # natural language: "every morning, tell me …"
     source: str = "api"
 
-
 class MediaIn(BaseModel):
     command: str            # "play bohemian rhapsody", "pause", "volume 40"
     source: str = "api"
-
 
 class DesktopIn(BaseModel):
     command: str            # "lock the screen", "open firefox", "system volume 40"
     source: str = "api"
 
-
 class DesktopConfirmIn(BaseModel):
     confirm_id: str
     approve: bool = True
-
 
 def register_vault_routes(app: FastAPI, vault_dir: Path):
     """Dashboard file endpoints (mechanical file I/O, no Claude). First group
@@ -139,11 +128,10 @@ def register_vault_routes(app: FastAPI, vault_dir: Path):
             raise HTTPException(404, "no briefs yet")
         return brief
 
-
 def register_memory_read_routes(app: FastAPI, svc: Service, cfg: Config):
-    """Search, reindex and blocks. Second group out of create_app; the write
-    paths (consolidate/reconcile) stay until their turn — they share the
-    serialization helper with the route."""
+    """Search, reindex and blocks. The write paths live next door in
+    register_memory_write_routes — split because they share serialization
+    state, not because they were left behind."""
 
     @app.get("/memory/search")
     async def memory_search(q: str, limit: int = 10, scope: str = "all",
@@ -195,7 +183,6 @@ def register_memory_read_routes(app: FastAPI, svc: Service, cfg: Config):
 def register_memory_write_routes(app: FastAPI, svc: Service, cfg: Config):
     """Consolidate + reconcile. Third group out of create_app; the
     serialization flag lives on app.state, so it rides along."""
-    # -- memory write paths (consolidate/reconcile): next slice -------------
 
     @app.post("/memory/consolidate")
     async def memory_consolidate():
@@ -352,7 +339,6 @@ def register_screen_routes(app: FastAPI, svc: Service, cfg: Config):
         if not p:
             raise HTTPException(404, "no such screenshot")
         return FileResponse(p, media_type="image/png")
-
 
     @app.get("/ask")
     async def ask_page():
@@ -594,6 +580,21 @@ def register_obs_routes(app: FastAPI, svc: Service, cfg: Config):
             "origin": request.headers.get("origin"),
         }
 
+def register_docs_routes(app: FastAPI, cfg: Config):
+    """System docs page plus the static SPA mount (last: API wins)."""
+    # -- docs page ----------------------------------------------------------
+
+    @app.get("/system-docs")
+    async def docs_page():
+        """Human docs (guide + API reference). NOT /docs — that's FastAPI's
+        Swagger UI, which stays where it is."""
+        return _spa_index(cfg.root)
+
+    # serve the built dashboard, if present (mounted last: API routes win)
+    ui_dist = cfg.root / "ui" / "dist"
+    if ui_dist.is_dir():
+        app.mount("/", StaticFiles(directory=ui_dist, html=True), name="ui")
+
 def create_app(cfg: Config | None = None) -> FastAPI:
     cfg = cfg or Config.load()
     svc = Service(cfg)
@@ -669,9 +670,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
     register_task_routes(app, svc)
 
-
     register_obs_routes(app, svc, cfg)
-
 
     # -- vault endpoints for the dashboard (mechanical file I/O, no Claude) --
     register_vault_routes(app, cfg.root / "vault")
@@ -679,37 +678,19 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
     register_memory_write_routes(app, svc, cfg)
 
-
     register_screen_routes(app, svc, cfg)
-
 
     register_automation_routes(app, svc, cfg)
 
-
     register_media_routes(app, svc, cfg)
-
 
     register_desktop_routes(app, svc, cfg)
 
-
     register_learning_routes(app, svc, cfg)
 
-
-    # -- docs page ----------------------------------------------------------
-
-    @app.get("/system-docs")
-    async def docs_page():
-        """Human docs (guide + API reference). NOT /docs — that's FastAPI's
-        Swagger UI, which stays where it is."""
-        return _spa_index(cfg.root)
-
-    # serve the built dashboard, if present (mounted last: API routes win)
-    ui_dist = cfg.root / "ui" / "dist"
-    if ui_dist.is_dir():
-        app.mount("/", StaticFiles(directory=ui_dist, html=True), name="ui")
+    register_docs_routes(app, cfg)
 
     return app
-
 
 def main():
     cfg = Config.load()
@@ -718,7 +699,6 @@ def main():
     # orphan 'running' task rows on every restart
     uvicorn.run(create_app(cfg), host=cfg.host, port=cfg.port, log_level="info",
                 timeout_graceful_shutdown=5)
-
 
 if __name__ == "__main__":
     main()
