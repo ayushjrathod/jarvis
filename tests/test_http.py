@@ -1164,6 +1164,17 @@ class TestUICacheHeaders(HTTPTestCase):
             self.assertEqual(r.status_code, 200)
             self.assertEqual(r.headers.get("cache-control"), "no-cache")
 
+    def test_worker_and_manifest_revalidate(self):
+        import shutil
+        dist = Path(self._dist_tmp.name) / "ui" / "dist"
+        (dist / "sw.js").write_text("// worker")
+        (dist / "manifest.webmanifest").write_text("{}")
+        for path in ("/sw.js", "/manifest.webmanifest"):
+            r = self.client.get(path)
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.headers.get("cache-control"), "no-cache",
+                             path)
+
     def test_api_and_events_pass_through_untouched(self):
         r = self.client.get("/health")
         self.assertNotIn("immutable", r.headers.get("cache-control", ""))

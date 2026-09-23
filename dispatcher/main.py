@@ -666,6 +666,13 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                     "public, max-age=31536000, immutable")
             elif path == "/" or path.endswith(".html"):
                 resp.headers["Cache-Control"] = "no-cache"
+            elif path in ("/sw.js", "/manifest.webmanifest",
+                          "/favicon.ico", "/favicon.png",
+                          "/apple-touch-icon.png") or path.startswith("/icon-"):
+                # Small, versioned-rarely, correctness-critical: a stale sw.js
+                # pins the old shell offline, and stale icons/manifest break
+                # the installed PWA's identity. Always revalidate.
+                resp.headers["Cache-Control"] = "no-cache"
         return resp
 
     register_task_routes(app, svc)
