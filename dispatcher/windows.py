@@ -70,32 +70,40 @@ def _children(conn, bus, path) -> list:
         return []
 
 
+def _enumerate(conn) -> list[tuple[str, str, str, str]]:
+    """(bus, path, app, title) for every titled window/frame/dialog, deduped.
+    One walk for list and focus alike — and focus grabs the exact node it
+    matched, so two apps sharing a title can never land on the wrong one."""
+    out, seen = [], set()
+    for bus, path in _children(conn, *conn_root()):
+        try:
+            app = _name(conn, bus, path) or bus.split(".")[-1]
+        except WindowError:
+            continue
+        for cb, cp in _children(conn, bus, path):
+            try:
+                role = _call(conn, cb, cp, ACCESSIBLE_IFACE,
+                             "GetRoleName")[0]
+            except WindowError:
+                continue
+            if role not in WINDOW_ROLES:
+                continue
+            title = _name(conn, cb, cp)
+            if not title or (app, title) in seen:
+                continue
+            seen.add((app, title))
+            out.append((bus, cp, app, title))
+    return out
+
+
 def list_windows(conn=None) -> list[dict]:
     """[{app, title}] over every AT-SPI application. Read-only, never raises
     (the service settles what it can from an empty list instead)."""
     own = conn is None
     try:
         conn = conn or _a11y_connection()
-        out, seen = [], set()
-        for bus, path in _children(conn, *conn_root()):
-            try:
-                app = _name(conn, bus, path) or bus.split(".")[-1]
-            except WindowError:
-                continue
-            for cb, cp in _children(conn, bus, path):
-                try:
-                    role = _call(conn, cb, cp, ACCESSIBLE_IFACE,
-                                 "GetRoleName")[0]
-                except WindowError:
-                    continue
-                if role not in WINDOW_ROLES:
-                    continue
-                title = _name(conn, cb, cp)
-                if not title or (app, title) in seen:
-                    continue
-                seen.add((app, title))
-                out.append({"app": app, "title": title})
-        return out
+        return [{"app": app, "title": title}
+                for _, _, app, title in _enumerate(conn)]
     except WindowError:
         log.warning("window list failed", exc_info=True)
         return []
@@ -114,41 +122,34 @@ def conn_root() -> tuple[str, str]:
 def focus_window(query: str, conn=None) -> str:
     """Focus the window whose title (or app) best matches `query`.
     Raises WindowError when nothing matches (the service files it failed,
-    speakably) — and names candidates when several do."""
-    wins = [w for w in list_windows(conn) if w["title"] or w["app"]]
-    q = (query or "").strip().lower()
-    if not q:
-        raise WindowError("focus what?")
-    hits = [w for w in wins
-            if q in w["title"].lower() or q in w["app"].lower()]
-    if not hits:
-        raise WindowError(f'no window matching "{query}"')
-    if len(hits) > 1:
-        names = ", ".join(sorted({h["title"] for h in hits})[:5])
-        raise WindowError(f'which one? {names}')
-    return _grab(hits[0], conn)
-
-
-def _grab(win: dict, conn=None) -> str:
+    speakably) — and names candidates when several do. The grab lands on the
+    exact node matched: two apps sharing one title (an X11 client under both
+    its own name and mutter-x11-frames) focus that title without asking,
+    because asking with one name would be theater; distinct titles ask."""
     own = conn is None
     try:
         conn = conn or _a11y_connection()
-        for bus, path in _children(conn, *conn_root()):
-            for cb, cp in _children(conn, bus, path):
-                try:
-                    role = _call(conn, cb, cp, ACCESSIBLE_IFACE,
-                                 "GetRoleName")[0]
-                except WindowError:
-                    continue
-                if role not in WINDOW_ROLES:
-                    continue
-                if _name(conn, cb, cp) == win["title"]:
-                    _call(conn, cb, cp, COMPONENT_IFACE, "GrabFocus")
-                    return f'Focused "{win["title"]}".'
-        raise WindowError(f'"{win["title"]}" went away before focus landed')
+        wins = _enumerate(conn)
+        q = (query or "").strip().lower()
+        if not q:
+            raise WindowError("focus what?")
+        hits = [(b, p, a, t) for b, p, a, t in wins
+                if q in t.lower() or q in a.lower()]
+        if not hits:
+            raise WindowError(f'no window matching "{query}"')
+        titles = sorted({t for _, _, _, t in hits})
+        if len(titles) > 1:
+            raise WindowError(f'which one? {", ".join(titles[:5])}')
+        bus, path, app, title = hits[0]
+        try:
+            _call(conn, bus, path, COMPONENT_IFACE, "GrabFocus")
+        except WindowError:
+            raise WindowError(f'"{title}" went away before focus landed')
+        return f'Focused "{title}".'
     finally:
         if own and conn is not None:
             try:
                 conn.close()
             except Exception:
                 pass
+

@@ -111,6 +111,20 @@ class TestFocusWindow(unittest.TestCase):
         self.assertIn("which one", str(ctx.exception).lower())
         self.assertEqual(bus.focused, [])
 
+    def test_same_title_twice_focuses_without_asking(self):
+        # X11 clients appear under their own name AND mutter-x11-frames with
+        # one title: asking "which one?" with a single name would be theater.
+        tree = dict(TREE)
+        tree[("/win-extra", "role")] = "window"
+        tree[("/win-extra", "name")] = "Data3"
+        tree[("/appA", "children")] = [("bus.a", "/win1"), ("bus.a", "/win-extra")]
+        bus = FakeBus(tree)
+        with mock.patch.object(windows, "_a11y_connection", return_value=bus), \
+                mock.patch.object(windows, "_call", bus.fake_call):
+            speech = windows.focus_window("data3")
+        self.assertIn("Data3", speech)
+        self.assertEqual(len(bus.focused), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
