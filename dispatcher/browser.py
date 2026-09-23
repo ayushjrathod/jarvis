@@ -128,16 +128,7 @@ def _ws_url(cfg, tab_id: str) -> str:
 
 
 def _targets(cfg) -> list:
-    import httpx
-    try:
-        r = httpx.get(_base_url(cfg) + "/json/list", timeout=TIMEOUT_S)
-    except Exception as e:
-        raise BrowserError(
-            "no debuggable browser — launch chromium with "
-            "--remote-debugging-port=9222") from e
-    if r.status_code != 200:
-        raise BrowserError(f"browser answered {r.status_code}")
-    try:
-        return r.json() or []
-    except ValueError as e:
-        raise BrowserError("browser answered garbage") from e
+    targets = _get(cfg, "/json/list")
+    if not isinstance(targets, list):
+        raise BrowserError("browser answered garbage")
+    return targets
