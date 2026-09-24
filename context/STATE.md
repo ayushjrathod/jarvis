@@ -80,9 +80,10 @@ reaches the notify gate), and the dashboard task checkbox has **never** worked
 (`vault.toggle_task` writes the file back byte-identical and returns success —
 one `status` field, three parsers that disagree).
 
-**Deadline**: `backup_db.sh`'s retention (`-name 'mission-*.db' -mtime +14`)
-matches `mission-pre-purge-20260802T000402.db` — the recovery point taken before
-the knowledge-graph purge. **Eligible ~2026-08-17.**
+**Deadline (elapsed 2026-08-17, confirmed lost 2026-09-24)**:
+`backup_db.sh`'s old retention (`-name 'mission-*.db' -mtime +14`) matched
+`mission-pre-purge-20260802T000402.db` — the recovery point taken before the
+knowledge-graph purge — and it is gone from this box.
 
 Also worth knowing: **a truncated backup passes `integrity_check`** (256KB, zero
 tables, reported `ok`) and nothing ever verifies one; and **openjarvis contains
@@ -274,10 +275,12 @@ exists to gate yet).
    sweep in a bank statement. Still open: the 39 files are **already published**
    in history — either purge them (`filter-repo`) or make the repo private.
    Same class, still live: `data/` has no vault rule yet for future subtrees.
-0b. **Around 2026-08-17, `backup_db.sh` will delete
-   `mission-pre-purge-20260802T000402.db`** — the recovery point taken before
-   the knowledge-graph purge. Move it out of `data/backups/` or fix the
-   retention glob before then.
+0b. **The pre-purge recovery point is gone (confirmed 2026-09-24).**
+   `mission-pre-purge-20260802T000402.db` is nowhere on this box — the old
+   retention glob took it around 08-17 as warned. The dated-glob fix
+   (sessions 32) guards the class going forward, and backups now verify +
+   snapshot the secrets, but that one rollback is not recoverable. Lesson
+   filed: a warned deadline is a task with a date, not a note.
 1. **Reboot test — never run, and now the biggest unknown.** Phase E
    acceptance: reboot, then `journalctl --user -u 'mission-*' -b` should show
    clean startups. It matters specifically because a user service at boot has
