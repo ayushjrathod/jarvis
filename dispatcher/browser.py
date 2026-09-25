@@ -1,23 +1,25 @@
-"""T3 browser control, read-mostly — over the DevTools HTTP endpoints.
+"""T3 browser control, read-mostly — over the DevTools HTTP endpoints plus
+one stdlib-socket WebSocket client.
 
-No new dependency and no WebSocket framing: /json/list enumerates targets
-and /json/activate/{id} switches to one, both plain HTTP (httpx is in the
-stack). Reading page *text* would need Runtime.evaluate over a WS — that is
-a later slice; listing and switching tabs is the honest, useful half that
-needs nothing new. The browser must run with --remote-debugging-port
-(default 9222); without it every call fails speakably and fast, never
-hanging the divert.
+No new dependency: /json/list enumerates targets and /json/activate/{id}
+switches to one (plain httpx), while Runtime.evaluate for page text rides
+`cdp.py` (handshake, masked frames, id-matched calls). The browser must run
+with --remote-debugging-port (default 9222); without it every call fails
+speakably and fast, never hanging the divert.
 
 Verbs live in the desktop safety plane (tabs reads, so allow;
-activate_tab switches context, so confirm) — same policy, same confirm UX
-as window focus, which answers the same "switch to X" shape for OS windows.
-The parser keeps them apart with the tab qualifier: only sentences naming
-tabs reach this tier.
+activate_tab switches context, so confirm; read_tab lands page text in
+model context, so confirm with quoted-data posture) — same policy, same
+confirm UX as window focus, which answers the same "switch to X" shape for
+OS windows. The parser keeps them apart with the tab qualifier: only
+sentences naming tabs reach this tier.
 """
 
 from __future__ import annotations
 
 import logging
+
+from . import cdp
 
 log = logging.getLogger("dispatcher.browser")
 
@@ -54,11 +56,13 @@ def _get(cfg, path: str, expect_json: bool = True):
 
 
 def list_tabs(cfg) -> list[dict]:
-    """[{id, title, url}] over open pages. Never raises."""
+    """[{id, title, url}] over open pages. Never raises — and stays quiet
+    about the ordinary case (no debuggable browser is a state, not an
+    incident worth a traceback on every listing)."""
     try:
         targets = _get(cfg, "/json/list")
-    except BrowserError:
-        log.warning("tab list failed", exc_info=True)
+    except BrowserError as e:
+        log.warning("tab list failed: %s", e)
         return []
     out = []
     for t in targets or []:
