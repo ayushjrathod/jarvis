@@ -155,6 +155,12 @@ class TestNoDoubleClaim(unittest.TestCase):
         ("switch to tab gmail", "desktop"),
         ("focus Data3", "desktop"),
         ("add task renew the domain", "area"),
+        ("what windows are open", "desktop"),
+        ("focus Data3", "desktop"),
+        ("what tabs are open", "desktop"),
+        ("switch to tab gmail", "desktop"),
+        ("read this tab", "desktop"),
+        ("play jazz please", "media"),
         # Accepted wart, pinned: "open tasks" parses as a launch and fails
         # speakably at the executor (finding 1.2) rather than routing. The
         # status fix is what makes the miss recoverable, not the parser.
