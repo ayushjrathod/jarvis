@@ -103,5 +103,49 @@ class TestHookRegistry(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order, [0, 1, 2])
 
 
+class TestLifecycleProtection(unittest.IsolatedAsyncioTestCase):
+    """Finding 2.1, server half: the bus dropped the NEWEST event on a full
+    queue, so 300 steps + done + notify left the queue holding 256 steps and
+    neither terminal event. Steps stay droppable; lifecycle evicts steps."""
+
+    def drain(self, q):
+        out = []
+        while not q.empty():
+            out.append(q.get_nowait())
+        return out
+
+    async def test_done_survives_a_flood_of_steps(self):
+        bus = EventBus(max_queue=8)
+        q = bus.subscribe()
+        for i in range(30):
+            bus.publish({"event": "step", "n": i})
+        bus.publish({"event": "done", "task_id": "t"})
+        bus.publish({"event": "notify", "task_id": "t"})
+        kinds = [e["event"] for e in self.drain(q)]
+        self.assertEqual(kinds[-2:], ["done", "notify"])
+        self.assertGreater(bus.dropped_steps, 0)
+        self.assertGreater(bus.evicted_steps, 0)
+        self.assertEqual(bus.dropped_protected, 0)
+
+    async def test_incoming_steps_still_drop_on_a_full_queue(self):
+        bus = EventBus(max_queue=4)
+        q = bus.subscribe()
+        for i in range(10):
+            bus.publish({"event": "step", "n": i})
+        self.assertEqual(q.qsize(), 4)
+        self.assertGreater(bus.dropped_steps, 0)
+
+    async def test_lifecycle_order_survives_eviction(self):
+        bus = EventBus(max_queue=4)
+        q = bus.subscribe()
+        bus.publish({"event": "queued", "task_id": "t"})
+        for i in range(10):
+            bus.publish({"event": "step", "n": i})
+        bus.publish({"event": "done", "task_id": "t"})
+        kinds = [e["event"] for e in self.drain(q)]
+        self.assertEqual(kinds[0], "queued")
+        self.assertEqual(kinds[-1], "done")
+
+
 if __name__ == "__main__":
     unittest.main()

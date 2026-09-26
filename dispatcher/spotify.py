@@ -91,6 +91,10 @@ VETO = (
     "foul play", "play on youtube", "play the video", "play a video",
     "play on netflix", "play tennis", "play football", "play cricket",
     "play chess", "play a game", "play games",
+    # finding 1.3: "play it by ear" is an idiom, and nobody's kettle is a
+    # track — "put on the kettle" resolved as play 'the kettle'. The object
+    # is vetoed, never the verb, so "put on some jazz" still plays.
+    "by ear", "kettle",
 )
 
 # Matched on word boundaries, not as bare substrings (fixed 2026-08-08). An
@@ -101,6 +105,13 @@ VETO = (
 # here, so it is exactly the rule that must not overreach.
 _VETO_RE = re.compile("|".join(rf"\b{re.escape(v)}\b" for v in VETO))
 
+# A MAYBE remainder that asks nothing playable: interrogatives,
+# auxiliaries and pronouns open a clause ("what the user said", "me out"),
+# not a query. Demonstratives ("that song from ...") stay playable.
+_NON_QUERY_START = re.compile(
+    r"^(what|who|whom|whose|how|when|where|why|whether|if|"
+    r"did|does|do|is|are|was|were|can|could|would|should|will|"
+    r"i|you|we|they|he|she|it|me|my|your|our|their|him|her|us|them)\b")
 # words that make a sentence music-ish for the MAYBE fallback. Word boundaries
 # for the same reason, and with more at stake (fixed 2026-08-08): the old test
 # accepted a bare substring too, so "band" ⊂ "abandoned", "tune" ⊂ "fortune"
@@ -160,7 +171,14 @@ _MUTE_RE = re.compile(r"^(?:mute|mute (?:the )?(?:music|spotify)|unmute)$")
 def _normalize(text: str) -> str:
     t = (text or "").lower().strip(_PUNCT)
     t = re.sub(r"\s+", " ", t)
-    return re.sub(r"\bhey jarvis\b[,\s]*", "", t).strip(_PUNCT)
+    t = re.sub(r"\bhey jarvis\b[,\s]*", "", t).strip(_PUNCT)
+    # Politeness parity with desktop._normalize: "play jazz please" searched
+    # for "jazz please", and "pause please" reached neither parser — a real
+    # claude -p for good manners.
+    t = re.sub(r"^(?:please|can you|could you|would you)\s+", "",
+               t.strip(_PUNCT))
+    t = re.sub(r"[,\s]+please$", "", t.strip(_PUNCT))
+    return t.strip(_PUNCT)
 
 
 def _looks_musical(text: str) -> bool:
@@ -207,7 +225,10 @@ def detect(text: str):
 
     m = _VOL_SET_RE.match(t)
     if m:
-        return Intent("volume", arg=min(100, int(m.group("n"))) / 100.0)
+        n = int(m.group("n"))
+        if n > 100:
+            return None  # probable mishearing, like desktop: route, don't clamp
+        return Intent("volume", arg=n / 100.0)
     m = _VOL_WORD_RE.match(t)
     if m:
         down = (m.group("dir") or m.group("dir2")) == "down" or t in ("quieter", "softer")
@@ -225,8 +246,16 @@ def detect(text: str):
         type_, q = _classify_query(q)
         return Intent("play", query=q, type=type_)
 
-    # music-shaped but unparsed ("put on something for focusing")
-    if _looks_musical(t) and re.search(r"\b(play|put on|listen to|hear)\b", t):
+    # music-shaped but unparsed ("put on something for focusing"): the verb
+    # must LEAD, as in every strict pattern above — a music word plus a play
+    # verb ANYWHERE matched meeting-talk ("did you hear the album dropped
+    # today", "i need to hear the song from that meeting") and spent a real
+    # media-parse call just to eat the request. And the remainder must read
+    # like a query, not a clause: "listen to what the user said" and "hear me
+    # out" start right but ask nothing playable.
+    m = re.match(r"^(?:i want to\s+|i'd like to\s+|i'd love to\s+|i want\s+)?"
+                 r"(play|put on|listen to|hear)\b\s*(?P<q>.*)$", t)
+    if m and _looks_musical(t) and not _NON_QUERY_START.match(m.group("q")):
         return MAYBE
     return None
 

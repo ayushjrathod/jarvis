@@ -961,3 +961,192 @@ but **deferred** — scope as its own task when picked up. Items 6 (adaptive
 endpointing) and 7 (decision/commitment journal life area) are **parked**,
 do not build without explicit request.
 
+
+---
+
+## Rolled from STATE.md 2026-09-06 (sessions 26–28, verbatim)
+
+## Session 28 (2026-08-10): worked the standing list
+
+User asked to keep going on the remaining review findings, under a hard
+constraint: **no API key, no credits**. Everything is offline — source fixes plus
+LLM-free unit tests. No smoke script, no `claude -p`. Full detail:
+`context/sessions/2026-08-10-1.md`. **Tests 550 → 721, green.**
+
+Five batches (voice, memory, dispatch core, ops, HTTP coverage). The ones that
+would have bitten you soonest:
+
+- **The queue watcher could run a task up to 4×** — it submitted *before* renaming
+  the file into `.processed`, and a rename failure is on the transient-retry
+  whitelist. Now claims the file first.
+- **A wall-clock timeout re-ran the whole agentic task** over files the first
+  attempt had already edited, and lost that attempt's cost entirely from `/stats`.
+- **Every voice barge-in wrote a bogus `failed` run row** ("claude exited -9") over
+  the honest `cancelled`.
+- **A missing parser dep DELETED index rows** — an onnxruntime upgrade breaking
+  rapidocr would have silently removed every OCR'd document from search.
+- **One unreadable `SKILL.md` 500'd every `POST /task`** (areas are re-read on
+  every dispatch, and reflection/learn runs write those files).
+- **Code blocks are no longer read aloud** — a 1029-char block used to produce five
+  chunks of raw `rm -rf` shell.
+- **Timer units had no `TimeoutStartSec`** while reconcile's own retry budget
+  reached ~61 minutes against systemd's 90s default — SIGTERM'd and journaled as
+  failed while the dispatcher kept working.
+- **`tests/test_http.py` (94 tests)** where the HTTP layer had none — and it caught
+  a bug I introduced on 08-08: the divert renderer in `main.py` hardcoded
+  `status: "done"` while `_settle_divert` derived it, so an unresolved play was
+  reported to the dashboard as a success.
+
+**Note:** a `create_app(Config.load('config.yaml'))` sanity check instantiated a
+Service against the **live** `data/mission.db` and wrote to it — returning 4
+episodes stranded by a consolidation that failed on 08-07 to the pool. That is the
+repair the new code exists to do and nothing else was touched (no task was
+queued/running; `/health` fine), but it was unintended; use a temp config for that
+check.
+
+Standing list is now short — see the session log's "Still not done": the `Host`
+header check (needs a live tailnet check first), `graph_extracted_at`, the
+jarvis/dictate restart loop, `Config.brief`, ConfirmBar client-side expiry.
+
+## Session 27 (2026-08-08): second full review + fixes — READ THIS FIRST
+
+Whole-codebase review with six parallel reviewers, then fixes. Full detail:
+`context/sessions/2026-08-08-1.md`. **492 → 550 tests, green. Nothing
+committed** — sessions 26 and 27 are both sitting in the working tree.
+
+**The important finding: session 26's own divert fix introduced two bugs.**
+`_settle_divert` filed *every* divert `done` — including a parked confirmation
+nobody can answer, a denied verb, and a failed automation parse (the normal
+outcome during a plan-cap window, which left the request neither scheduled nor
+run) — and announced **nothing**, because it fires `done` with `kind="quick"`
+and the voice client only speaks `kind == "agentic"` or a `notify` event.
+`NEVER_GATE_TASK_TYPES` was unreachable dead code with a passing test over it.
+
+Fixed this session, each verified by executing it:
+
+- **degraded mode was dead** — the relevance anchor AND-ed every token including
+  stopwords, so no natural-language question ever anchored; now per content
+  word, and the "unladen swallow" property still holds
+- **the confirm plane was defeated by "okay so …"** — `parse_answer` matched a
+  prefix, so any sentence starting with an affirmation approved a parked
+  `clipboard_get`/`open`
+- **`run the tests` was executed as an app launch** (policy `allow`, no confirm)
+- **`media-parse` was feeding the knowledge graph** (live episode 62, already
+  consolidated) — same mechanism as 5f200f3
+- **the degraded answer was captured as an episode**, so an outage message could
+  be quoted back as memory
+- **`simulate_refusal` was outside the trust boundary** — any caller could force
+  a second run on the Opus fallback; now gated on
+  `security.allow_simulate_refusal` (false)
+- **the quick path ignored `metadata["allowed_tools"]`**, so `inbox.summarize`
+  could not read the file it was told to read
+- **`automations.detect` diverted questions** (no wake-word strip, no `?` veto)
+- **`inbox.summarize: true` was worse than useless** — replaced the free notice,
+  delivered its summary nowhere, and fanned out uncapped on a synced directory
+
+Plus VETO word boundaries in both parsers, `policy:` fail-closed, `open the
+door` (pre-existing — checked against HEAD before blaming the new code), and
+smoke-script cleanup.
+
+**Then the UI batch, all five items** (`ui/dist` rebuilt): `sw.js` no longer
+caches every navigation as the app shell (one click on "docs →" used to poison
+the installed PWA permanently); SSE now reconnects with backoff and says so —
+EventSource gives up entirely on a non-2xx reconnect, which is what a dispatcher
+restart looks like through Tailscale Serve; widgets re-seed after an outage;
+the mic no longer leaks a live recorder on a double-tap; degraded answers are
+labelled instead of replaced by the raw CLI error; and a new `Notices.jsx`
+renders `notify` events, which reached the browser and were displayed **nowhere**
+— the whole proactive-notification feature was invisible on the phone.
+
+Verified headlessly (chromium + CDP) against an **isolated** second dispatcher
+on :8799 — the real one on :8765 was never touched. A queue file → divert →
+`notify` → *"Right now: system volume 16%, screen unlocked."* rendered on the
+390px dashboard, which exercises both this session's divert fix and the new
+component. `kill -9` → banner; restart → recovers.
+
+**Still open in the web surface:** no `Host` header check, so DNS rebinding can
+*read* the vault/tasks/screenshots (writes stay blocked). Left deliberately —
+the allowlist has to match whatever `Host` Tailscale Serve forwards, and a wrong
+guess locks the phone out. Needs one live check first. The full standing list
+(voice, memory, core, ops, coverage) is at the end of the session log.
+
+**Awaiting your call:** `vault/briefs/test.md` and `refusal-test.md` are smoke
+artifacts, tracked in git and indexed for `/memory/search`. The script now
+cleans up after itself; those two need `git rm` + a reindex. I didn't delete
+vault content unilaterally.
+
+## Session 26 (2026-08-02): full-codebase review + the fixes it found
+
+User asked for a thorough senior-engineer review of the whole codebase, then to
+fix what it turned up. Read every dispatcher module, the voice pipeline, the UI,
+config, units and scripts. Full detail: `context/sessions/2026-08-02-1.md`.
+**Nothing committed — awaiting user review.**
+
+The architecture holds up; **almost every bug was in a seam between two
+subsystems that were each individually correct.** Eight fixed:
+
+- **The diverts only existed in the HTTP handler.** `automations.fire` and the
+  queue watcher call `svc.submit()` directly, so "every morning play jazz"
+  correctly became a standing automation — and then handed **"play jazz" to
+  Claude as an agentic task every morning** instead of to Spotify. The chain now
+  lives on `Service.try_divert()`; `main.py` renders it (SSE byte-identical,
+  still no task row), `submit()` uses it for `mode == "auto"` and records the
+  result as a task **born settled** (no run row). Diverts skip the notify gate
+  (the executor already wrote the summary) and episode capture (else the graph
+  eats an identical "play jazz" every morning — session 25's lesson). An
+  automation can never create an automation.
+- **Deleting a file from `vault/inbox/` announced "Indexed 0 files"** — the
+  notify branch fired on `removed` but formatted `arrived`.
+- **`/stats` `by_source.n` counted runs, not tasks** — `COUNT(*)` over a LEFT
+  JOIN to runs. Real db, same window: **old 49, new 46**.
+- **Desktop intents lowercased their arguments** — `copy Hello World …` stored
+  `hello world`, and a YouTube URL became a **different video**.
+- **H2 was bypassed on the consolidation path**: `build_consolidation` parsed
+  agent frontmatter itself instead of via `AreaRegistry`, so a reflection run
+  (which holds `Edit(areas/**)`) writing `- Bash` into `consolidate.md` handed
+  the nightly run a shell — simulated and confirmed. Now one source of truth.
+- **`Origin: null` passed the CSRF guard** (`""` was in `_LOCAL_HOSTS`).
+- **A dispatcher crash in `stream_quick` was filed `cancelled`**, i.e. read as a
+  user barge-in and kept out of the success rate. Now `failed`.
+- **`ingest_vault` held vanished files in the index** until a restart.
+
+Deliberately **not** changed, with reasons in the session log: `task_type` /
+`agent` tool selection (I flagged it, then talked myself back out — both select
+among *operator-authored on-disk* manifests, and locking them re-breaks the
+timers), `simulate_refusal` (smoke_phase_a needs it), unbounded quick-path
+concurrency, stranded voice notices, the unsurfaced `degraded` flag, ConfirmBar
+client-side expiry.
+
+**Then a cleanup pass** (user asked "what else?", approved the top four):
+
+- **A live `sk-ant-` key was sitting in `.env` at the repo root** — never
+  committed, gitignored, stripped by `cli_env`, and **doctor.sh had been warning
+  about it**. Nothing reads it (the API path went 2026-07-27). *Moved*, not
+  deleted, to `~/.local/share/mission-control/env.removed-from-repo-2026-08-02`
+  (600). **Rotate that key** — it lived in a working tree.
+- **`ui/dist/` was gitignored AND tracked**, so a rebuilt dashboard would
+  silently not commit: git keeps tracking existing files, but Vite emits
+  content-*hashed* names, so a new bundle is a new path the rule hides — you'd
+  commit an `index.html` pointing at a missing asset. Proven with a fake
+  `index-<hash>.js`; ignore rule removed.
+- **Dead since the Messages API removal**: `Config.quick_cost()`, the `prices:`
+  block that fed it, and the never-read `models.classifier` key. All confirmed
+  zero-reader by grep first.
+- **Tests for the three modules that had none.** `quick.py` mattered most —
+  every test patched `quick.stream`, so `_stream_cli`'s stream-json parsing (the
+  highest-churn contract here) was entirely unverified while its agentic sibling
+  has had fake-process tests since Phase H. +`test_quick.py` (15),
+  +`test_bus.py` (9, EventBus drop-on-full + HookRegistry isolation).
+
+**492 tests green** (450 → 468 fixes → 492 cleanup). Dispatcher restarted onto
+the new code and trimmed config: `/health` ok, no journal warnings, live free
+desktop divert answers, `/stats` totals agree, `doctor.sh` all ✓ bar the
+expected "spotify launched on demand". `smoke_phase_a.sh` **not** run — it
+spends real quota and the plan cap has taken the assistant down twice.
+
+Deferred, offered as their own change: frontmatter parsing duplicated 5×,
+`_normalize`/`VETO`/`parse_response` duplication, **STATE.md is 66KB** and the
+protocol reads it every session, `create_app` is 452 lines, 2 undocumented
+routes, `jarvis/ptt_dictate.py` is referenced by nothing, `_conn()` reconnects
+per query.
+

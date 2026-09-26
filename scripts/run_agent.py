@@ -20,12 +20,11 @@ import urllib.request
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-import yaml
-
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from dispatcher import brief as brief_mod  # noqa: E402
 from dispatcher.config import Config  # noqa: E402
+from dispatcher.queue_watcher import parse_task_file  # noqa: E402
 
 # Persistent= timers fire right at boot, often before the dispatcher has bound
 # its port (this lost the 2026-07-09/11/12 briefs). Connection-level failures
@@ -105,12 +104,10 @@ def main():
         sys.exit(f"no such agent: {path}")
 
     text = path.read_text()
-    meta = {}
-    if text.startswith("---"):
-        parts = text.split("---", 2)
-        if len(parts) == 3:
-            meta = yaml.safe_load(parts[1]) or {}
-            text = parts[2].strip()
+    # One frontmatter reader for the whole dispatcher (parse_task_file) —
+    # the timer agents' grants resolve server-side from the same file, so
+    # parsing it two different ways was a standing H2-shaped risk.
+    meta, text = parse_task_file(text)
 
     if args.date:
         today = args.date
@@ -134,7 +131,12 @@ def main():
         days = int(bcfg.get("quiet_notes_days", brief_mod.DEFAULT_NOTES_DAYS))
         if brief_mod.is_quiet(ROOT, days):
             out_path = brief_mod.write_quiet(ROOT, today, days)
+            summary = brief_mod.announce_quiet(today, days)
+            # No task is submitted on this path, so the notify gate never sees
+            # it — ping the desktop directly instead (best-effort, free).
+            brief_mod.send_quiet_notice(summary)
             print(f"vault is quiet — wrote {out_path.relative_to(ROOT)} without a model call")
+            print(f"NOTIFY: {summary}")
             return
 
     url = f"http://{cfg.host}:{cfg.port}/task"

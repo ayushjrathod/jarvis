@@ -5,10 +5,11 @@ apply. Vec tests skip when the sqlite-vec extension is unavailable."""
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
-from dispatcher import graph
+from dispatcher import embeddings, graph
 from dispatcher.db import Database, _rrf
 from dispatcher.ingest import chunk_markdown
 
@@ -99,6 +100,92 @@ class TestVecStore(unittest.TestCase):
             left = c.execute("SELECT count(*) n FROM entries_vec"
                              " WHERE rowid=?", (eid,)).fetchone()["n"]
         self.assertEqual(left, 0)
+
+    def test_overlapping_passes_do_not_raise_on_vec0(self):
+        # Finding 2.6: two backfill passes over the same missing list made the
+        # loser's whole executemany abort on the first colliding rowid — vec0
+        # RAISES on INSERT OR REPLACE — rolling back non-colliding rows too.
+        eid = self.ids["a"]
+        self.db.add_entry_embeddings([(eid, vec(0))])  # already embedded
+        with self.db._conn() as c:
+            n = c.execute("SELECT count(*) n FROM entries_vec"
+                          " WHERE rowid=?", (eid,)).fetchone()["n"]
+        self.assertEqual(n, 1)
+
+    def test_concurrent_inserts_do_not_raise(self):
+        import threading
+        eid = self.ids["b"]
+        errors = []
+
+        def hammer():
+            try:
+                for _ in range(20):
+                    self.db.add_entry_embeddings([(eid, vec(1))])
+            except Exception as e:  # noqa: BLE001 — the test IS the handler
+                errors.append(e)
+
+        threads = [threading.Thread(target=hammer) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+
+
+class TestEmbeddingIdentity(unittest.TestCase):
+    """Finding 2.6: a different 384-dim model was accepted silently, so KNN
+    answered from an incompatible space with no error anywhere — and a
+    non-384-dim one failed every backfill while search kept serving stale
+    vectors."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.tmp.name) / "t.db")
+        if not self.db.vec_ok:
+            self.skipTest("sqlite-vec unavailable")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _cfg(self, model=embeddings.DEFAULT_MODEL):
+        cfg = mock.Mock()
+        cfg.embeddings = {"enabled": True, "model": model}
+        return cfg
+
+    def test_first_pass_stamps_identity_without_reset(self):
+        eid = self.db.add_episode("t", "voice", "quick", None, "done", "q", "a")
+        with mock.patch.object(embeddings, "embed_passages",
+                               return_value=[vec(7)]) as ep:
+            stats = embeddings.embed_missing(self._cfg(), self.db)
+        self.assertTrue(ep.called)
+        self.assertFalse(stats["model_reset"])
+        self.assertEqual(self.db.embedding_identity(),
+                         (embeddings.DEFAULT_MODEL, embeddings.DIM))
+        self.assertEqual(self.db.episodes_missing_embeddings(10), [])
+
+    def test_model_change_drops_and_rebuilds(self):
+        eid = self.db.add_episode("t", "voice", "quick", None, "done", "q", "a")
+        self.db.add_episode_embeddings([(eid, vec(7))])
+        self.db.set_embedding_identity("sentence-transformers/all-MiniLM-L6-v2",
+                                       embeddings.DIM)
+        with mock.patch.object(embeddings, "embed_passages",
+                               return_value=[vec(7)]):
+            with self.assertLogs("dispatcher.embeddings", level="WARNING") as logs:
+                stats = embeddings.embed_missing(self._cfg(), self.db)
+        self.assertTrue(stats["model_reset"])
+        self.assertTrue(any("model changed" in m for m in logs.output))
+        self.assertEqual(self.db.embedding_identity(),
+                         (embeddings.DEFAULT_MODEL, embeddings.DIM))
+        # rebuilt from source text, not coexisting
+        self.assertEqual(self.db.episodes_missing_embeddings(10), [])
+
+    def test_same_model_never_resets(self):
+        self.db.set_embedding_identity(embeddings.DEFAULT_MODEL, embeddings.DIM)
+        with mock.patch.object(embeddings, "embed_passages",
+                               return_value=[]) as ep:
+            stats = embeddings.embed_missing(self._cfg(), self.db)
+        self.assertFalse(stats["model_reset"])
+        self.assertFalse(ep.called)
 
 
 class TestOrphanVectorsDoNotEatResultSlots(unittest.TestCase):
@@ -191,6 +278,38 @@ class TestGraphStore(unittest.TestCase):
         self.assertFalse(self.db.search_facts("neovim"))
         self.assertTrue(self.db.search_facts("neovim", include_invalid=True))
         self.assertEqual(self.db.graph_counts()["facts_invalidated"], 1)
+
+    def test_invalidation_keeps_record_time_and_world_time_distinct(self):
+        old = self.db.add_fact("Ayra uses Vim.", ["Ayra"], valid_at="2026-07-01")
+        self.assertEqual(self.db.invalidate_facts([old], superseded_at="2026-07-18"), 1)
+        with self.db._conn() as c:
+            row = c.execute("SELECT invalid_at, expired_at FROM kg_facts WHERE id=?",
+                            (old,)).fetchone()
+        self.assertEqual(row["expired_at"], "2026-07-18")  # world time: the new fact
+        self.assertNotEqual(row["invalid_at"], "2026-07-18")  # record time: now-ish
+        self.assertTrue(row["invalid_at"] >= "2026-07-18")
+
+    def test_newer_knowledge_survives_older_supersession(self):
+        # The model naming an id is a suggestion: a candidate NEWER than the
+        # superseding knowledge must not be killed by it.
+        new = self.db.add_fact("Ayra uses Neovim.", ["Ayra"], valid_at="2026-08-01")
+        self.assertEqual(self.db.invalidate_facts([new], superseded_at="2026-07-18"), 0)
+        self.assertTrue(self.db.search_facts("neovim"))
+        undated = self.db.add_fact("Ayra edits text.", ["Ayra"])
+        self.assertEqual(self.db.invalidate_facts([undated], superseded_at="2026-07-18"), 1)
+
+    def test_extraction_threads_the_new_date_into_retirement(self):
+        old = self.db.add_fact("Ayra uses Vim.", ["Ayra"], valid_at="2026-07-01")
+        counts = graph.apply_extraction(self.db, {
+            "facts": [{"fact": "Ayra switched to Neovim.",
+                       "entities": ["Ayra", "Neovim"], "valid_at": "2026-07-18"}],
+            "invalidated_ids": [old],
+        }, episode_ids=[7])
+        self.assertEqual(counts, {"facts_added": 1, "invalidated": 1})
+        with self.db._conn() as c:
+            row = c.execute("SELECT expired_at FROM kg_facts WHERE id=?",
+                            (old,)).fetchone()
+        self.assertEqual(row["expired_at"], "2026-07-18")
 
     def test_one_hop_neighbors(self):
         f1 = self.db.add_fact("Ayra runs mission-control.", ["Ayra", "mission-control"])
@@ -489,17 +608,17 @@ class TestEpisodeClipping(unittest.TestCase):
 
     def test_under_budget_is_untouched(self):
         text = self._export(3, 50)
-        self.assertEqual(graph.clip_episodes(text, 100000), text)
+        self.assertEqual(graph.clip_episodes(text, 100000)[0], text)
 
     def test_keeps_the_newest_episodes_not_the_oldest(self):
         text = self._export(10, 400)
-        out = graph.clip_episodes(text, 1500)
+        out, _seen = graph.clip_episodes(text, 1500)
         self.assertLessEqual(len(out), 1500)
         self.assertIn("marker10", out)       # the newest survived
         self.assertNotIn("marker1 ", out)    # the oldest did not
 
     def test_clips_on_whole_episode_boundaries(self):
-        out = graph.clip_episodes(self._export(10, 400), 1500)
+        out, _seen = graph.clip_episodes(self._export(10, 400), 1500)
         blocks = out.split("## Episode ")[1:]
         self.assertTrue(blocks)
         for b in blocks:                     # no half-parsed episode survives
@@ -507,7 +626,7 @@ class TestEpisodeClipping(unittest.TestCase):
 
     def test_the_clip_is_announced_in_band_and_logged(self):
         with self.assertLogs("dispatcher.graph", level="WARNING") as cm:
-            out = graph.clip_episodes(self._export(10, 400), 1500)
+            out, _seen = graph.clip_episodes(self._export(10, 400), 1500)
         self.assertIn("older episode(s) omitted", out)
         self.assertTrue(any("over the" in m for m in cm.output))
 
@@ -515,14 +634,14 @@ class TestEpisodeClipping(unittest.TestCase):
         for budget in (400, 900, 1500, 3000):
             with self.subTest(budget=budget):
                 with self.assertLogs("dispatcher.graph", level="WARNING"):
-                    out = graph.clip_episodes(self._export(10, 400), budget)
+                    out, _seen = graph.clip_episodes(self._export(10, 400), budget)
                 self.assertLessEqual(len(out), budget)
 
     def test_a_single_oversized_episode_is_truncated_not_dropped(self):
         """Handing the extractor an empty <episodes> block would be worse than
         a truncated one."""
         with self.assertLogs("dispatcher.graph", level="WARNING"):
-            out = graph.clip_episodes(self._export(2, 5000), 900)
+            out, _seen = graph.clip_episodes(self._export(2, 5000), 900)
         self.assertLessEqual(len(out), 900)
         self.assertIn("marker2", out)          # the newest, truncated
         self.assertNotIn("marker1 ", out)
@@ -530,9 +649,21 @@ class TestEpisodeClipping(unittest.TestCase):
     def test_unrecognized_shape_still_keeps_the_recent_end(self):
         text = "oldest marker\n" + "y" * 5000 + "\nnewest marker"
         with self.assertLogs("dispatcher.graph", level="WARNING"):
-            out = graph.clip_episodes(text, 200)
+            out, seen = graph.clip_episodes(text, 200)
         self.assertIn("newest marker", out)
         self.assertNotIn("oldest marker", out)
+        self.assertEqual(seen, [])  # nothing parseable: mark nothing, retry
+
+    def test_clip_reports_which_episodes_survived(self):
+        # The service marks only these extracted: marking the full list
+        # orphaned ~178 of 200 episodes past the budget on every backlog.
+        _out, seen = graph.clip_episodes(self._export(10, 400), 1500)
+        for i in seen:
+            self.assertIn(f"marker{i} ", _out)
+        self.assertNotIn(1, seen)  # oldest dropped
+        self.assertIn(10, seen)  # newest kept
+        _out2, seen2 = graph.clip_episodes(self._export(3, 50), 100000)
+        self.assertEqual(seen2, [1, 2, 3])  # under budget: all seen
 
     def test_extraction_prompt_applies_the_clip(self):
         with self.assertLogs("dispatcher.graph", level="WARNING"):

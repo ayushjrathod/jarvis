@@ -706,6 +706,20 @@ class TestLifespan(unittest.TestCase):
 class TestDesktopRoutes(HTTPTestCase):
     cfg_overrides = {"computer": {"enabled": True, "confirm_timeout_s": 120}}
 
+    def test_verbs_lists_every_verb_with_its_policy(self):
+        # The honest surface: what the tier can do and under what policy —
+        # including the five K2 verbs. A verb missing here is a verb the
+        # dashboard cannot explain.
+        body = self.client.get("/desktop/verbs").json()
+        verbs = body["verbs"]
+        import dispatcher.desktop as _d
+        self.assertEqual(set(verbs), set(_d.ALL_VERBS))
+        self.assertEqual(verbs["windows"], "allow")
+        self.assertEqual(verbs["focus"], "confirm")
+        self.assertEqual(verbs["tabs"], "allow")
+        self.assertEqual(verbs["activate_tab"], "confirm")
+        self.assertEqual(verbs["read_tab"], "confirm")
+
     def test_desktop_is_503_when_the_feature_is_off(self):
         # an absent/disabled computer: block denies everything — the tier is
         # opt-in, and that default is what keeps this suite side-effect-free
@@ -725,15 +739,15 @@ class TestDesktopRoutes(HTTPTestCase):
         self.assertEqual(r.json()["status"], "unrecognized")
 
     def test_an_allowed_verb_runs_and_speaks(self):
-        with patch("dispatcher.service.desktop.run_intent",
-                   return_value="Locked.") as run:
+        with patch("dispatcher.service.desktop.run_intent_ok",
+                   return_value=(True, "Locked.")) as run:
             r = self.client.post("/desktop", json={"command": "lock the screen"})
         self.assertEqual(r.json(), {"status": "done", "speech": "Locked."})
         self.assertEqual(run.call_args[0][0].verb, "lock")
 
     def test_a_denied_verb_never_reaches_the_executor(self):
         self.cfg.computer = {"enabled": True, "policy": {"lock": "deny"}}
-        with patch("dispatcher.service.desktop.run_intent") as run:
+        with patch("dispatcher.service.desktop.run_intent_ok") as run:
             r = self.client.post("/desktop", json={"command": "lock the screen"})
         run.assert_not_called()
         self.assertEqual(r.json()["status"], "denied")
@@ -741,7 +755,7 @@ class TestDesktopRoutes(HTTPTestCase):
     def test_a_confirm_verb_parks_instead_of_acting(self):
         # `open` is confirm-by-default: an arbitrary URL is an exfiltration
         # channel and the obvious prompt-injection payload.
-        with patch("dispatcher.service.desktop.run_intent") as run:
+        with patch("dispatcher.service.desktop.run_intent_ok") as run:
             r = self.client.post("/desktop", json={"command": "open github.com"})
         run.assert_not_called()
         body = r.json()
@@ -753,8 +767,8 @@ class TestDesktopRoutes(HTTPTestCase):
     def test_confirming_runs_the_parked_intent_exactly_once(self):
         cid = self.client.post("/desktop",
                                json={"command": "open github.com"}).json()["confirm_id"]
-        with patch("dispatcher.service.desktop.run_intent",
-                   return_value="Opening github.com.") as run:
+        with patch("dispatcher.service.desktop.run_intent_ok",
+                   return_value=(True, "Opening github.com.")) as run:
             first = self.client.post("/desktop/confirm",
                                      json={"confirm_id": cid, "approve": True})
             replay = self.client.post("/desktop/confirm",
@@ -767,7 +781,7 @@ class TestDesktopRoutes(HTTPTestCase):
     def test_declining_drops_the_intent_without_running_it(self):
         cid = self.client.post("/desktop",
                                json={"command": "open github.com"}).json()["confirm_id"]
-        with patch("dispatcher.service.desktop.run_intent") as run:
+        with patch("dispatcher.service.desktop.run_intent_ok") as run:
             r = self.client.post("/desktop/confirm",
                                  json={"confirm_id": cid, "approve": False})
         run.assert_not_called()
@@ -778,14 +792,14 @@ class TestDesktopRoutes(HTTPTestCase):
         cid = self.client.post("/desktop",
                                json={"command": "open github.com"}).json()["confirm_id"]
         self.svc.pending_desktop[cid]["expires"] = time.monotonic() - 1
-        with patch("dispatcher.service.desktop.run_intent") as run:
+        with patch("dispatcher.service.desktop.run_intent_ok") as run:
             r = self.client.post("/desktop/confirm",
                                  json={"confirm_id": cid, "approve": True})
         run.assert_not_called()
         self.assertEqual(r.json()["status"], "expired")
 
     def test_an_unknown_confirm_id_is_reported_not_executed(self):
-        with patch("dispatcher.service.desktop.run_intent") as run:
+        with patch("dispatcher.service.desktop.run_intent_ok") as run:
             r = self.client.post("/desktop/confirm",
                                  json={"confirm_id": "nope", "approve": True})
         run.assert_not_called()
@@ -838,6 +852,8 @@ SPEC = {"task_text": "give me the brief", "kind": "daily", "time": "07:30",
 
 
 class TestAutomationRoutes(HTTPTestCase):
+    cfg_overrides = {"automations": {"enabled": True}}
+
     def seed(self, next_run_at="2020-01-01T07:30:00+00:00"):
         return self.svc.db.create_automation("every morning, brief me", "api",
                                              SPEC, next_run_at)
@@ -865,6 +881,16 @@ class TestAutomationRoutes(HTTPTestCase):
         r = self.client.post("/automations", json={"request": "sometime, maybe"})
         self.assertEqual(r.status_code, 422)
         self.assertIn("couldn't", r.json()["detail"])
+
+    def test_a_disabled_block_is_409_before_any_parse(self):
+        # The scheduler only polls when the block is enabled; the old code
+        # returned 201 over a row nothing would ever run.
+        self.cfg.automations = {}
+        with patch.object(type(self.svc), "create_automation_from_nl") as parse:
+            r = self.client.post("/automations",
+                                 json={"request": "every morning, brief me"})
+        parse.assert_not_called()
+        self.assertEqual(r.status_code, 409)
 
     def test_listing_decorates_every_row_with_its_description(self):
         self.seed()
@@ -1100,6 +1126,58 @@ class TestLearnRoute(HTTPTestCase):
         row = self.client.get(f"/task/{body['task_id']}").json()
         self.assertEqual(row["area"], "learn")
         self.assertEqual(json.loads(row["metadata"])["task_type"], "learn")
+
+
+class TestDebugHost(HTTPTestCase):
+    def test_reports_host_and_origin_as_seen(self):
+        r = self.client.get("/debug/host", headers={"host": "box.tail.ts.net"})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["host"], "box.tail.ts.net")
+        self.assertIsNone(body["origin"])
+
+
+class TestUICacheHeaders(HTTPTestCase):
+    """Tier 3: heuristic freshness served a month-old shell with zero
+    requests. Hashed assets are immutable; the shell always revalidates."""
+
+    def setUp(self):
+        self._dist_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dist_tmp.cleanup)
+        # Minimal stand-in bundle, created BEFORE the app (the static mount
+        # checks is_dir at startup). Tests the headers, not the build.
+        dist = Path(self._dist_tmp.name) / "ui" / "dist"
+        (dist / "assets").mkdir(parents=True)
+        (dist / "index.html").write_text("<html></html>")
+        (dist / "assets" / "index-abc123.js").write_text("console.log(1)")
+        self.cfg_overrides = {"root": Path(self._dist_tmp.name)}
+        super().setUp()
+
+    def test_hashed_assets_are_immutable(self):
+        r = self.client.get("/assets/index-abc123.js")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("immutable", r.headers.get("cache-control", ""))
+
+    def test_shell_is_never_cached(self):
+        for path in ("/", "/ask?shot=x"):
+            r = self.client.get(path)
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.headers.get("cache-control"), "no-cache")
+
+    def test_worker_and_manifest_revalidate(self):
+        import shutil
+        dist = Path(self._dist_tmp.name) / "ui" / "dist"
+        (dist / "sw.js").write_text("// worker")
+        (dist / "manifest.webmanifest").write_text("{}")
+        for path in ("/sw.js", "/manifest.webmanifest"):
+            r = self.client.get(path)
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.headers.get("cache-control"), "no-cache",
+                             path)
+
+    def test_api_and_events_pass_through_untouched(self):
+        r = self.client.get("/health")
+        self.assertNotIn("immutable", r.headers.get("cache-control", ""))
 
 
 if __name__ == "__main__":

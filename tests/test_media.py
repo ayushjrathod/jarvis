@@ -98,7 +98,9 @@ class TestDetectVolume(unittest.TestCase):
         self.assertAlmostEqual(spotify.detect("set the volume to 75 percent").arg, 0.75)
 
     def test_clamped_above_100(self):
-        self.assertAlmostEqual(spotify.detect("volume 300").arg, 1.0)
+        # Was a clamp to full; now refused like desktop — likelier a
+        # misheard sentence than a request, and never worth full blast.
+        self.assertIsNone(spotify.detect("volume 300"))
 
     def test_relative(self):
         up, down = spotify.detect("turn it up"), spotify.detect("turn it down")
@@ -117,8 +119,22 @@ class TestDetectNegatives(unittest.TestCase):
     def test_idioms_vetoed(self):
         for t in ("play devil's advocate for a second",
                   "let me play devils advocate", "play it safe here",
-                  "play a video of the talk", "play chess with me"):
+                  "play a video of the talk", "play chess with me",
+                  "play it by ear on the demo", "put on the kettle"):
             self.assertIsNone(spotify.detect(t), t)
+
+    def test_politeness_is_not_part_of_the_request(self):
+        i = spotify.detect("play jazz please")
+        self.assertEqual((i.action, i.query), ("play", "jazz"))
+        self.assertEqual(spotify.detect("pause please").action, "pause")
+        i = spotify.detect("please play some miles davis")
+        self.assertEqual((i.action, i.query), ("play", "miles davis"))
+
+    def test_absurd_volume_routes_instead_of_clamping(self):
+        # desktop refuses >100 as a probable mishearing; clamping to full
+        # would blast the player on a misheard sentence.
+        self.assertIsNone(spotify.detect("volume 400"))
+        self.assertEqual(spotify.detect("volume 40").arg, 0.4)
 
     def test_questions_go_to_claude(self):
         for t in ("what should I play this weekend?",
@@ -141,6 +157,20 @@ class TestDetectMaybe(unittest.TestCase):
 
     def test_music_shaped_but_unparsed(self):
         self.assertIs(spotify.detect("i want to listen to some music now"), MAYBE)
+
+    def test_maybe_needs_a_leading_verb_and_a_query(self):
+        # Finding 2.9: a music word plus a play verb ANYWHERE matched
+        # meeting-talk and spent a media-parse call just to eat the request.
+        for t in ("did you hear the album dropped today",
+                  "listen to what the user said about the playlist feature",
+                  "i need to hear the song from that meeting",
+                  "hear me out about the band name",
+                  "we need to hear the album today"):
+            self.assertIsNone(spotify.detect(t), t)
+        for t in ("play something chill",
+                  "put on something to focus to",
+                  "play that song from the batman movie"):
+            self.assertIs(spotify.detect(t), MAYBE, t)
 
 
 # one natural sentence per VETO entry; the covers-everything test below keeps
@@ -165,6 +195,8 @@ VETO_SENTENCES = {
     "play cricket": "play cricket this weekend",
     "play chess": "play chess with me",
     "play a game": "play a game with me",
+    "by ear": "play it by ear on the demo",
+    "kettle": "put on the kettle",
 }
 
 

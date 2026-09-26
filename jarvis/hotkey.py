@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import select
 import threading
+import time
 
 from evdev import InputDevice, ecodes, list_devices
 
@@ -74,6 +75,8 @@ class HotkeyWatcher(threading.Thread):
         # PTT fired on_release and truncated the clip mid-sentence.
         pressed: set[int] = set()
         warned = False
+        last_rescan = time.monotonic()
+        sel_errors = 0
         while not self._stop.is_set():
             if not by_fd:
                 keyboards = find_keyboards()
@@ -91,15 +94,38 @@ class HotkeyWatcher(threading.Thread):
                 by_fd = {dev.fd: dev for dev in keyboards}
                 warned = False
                 log.info("watching %d keyboard(s) for %s", len(by_fd), self.code)
+                last_rescan = time.monotonic()
+            if time.monotonic() - last_rescan >= self.RESCAN_S:
+                # A replugged keyboard is never re-watched otherwise: the old
+                # code rescanned only when by_fd EMPTIED, but find_keyboards
+                # matches the AT board AND the ydotoold virtual device, so it
+                # never empties while ydotoold is up. Merge, don't rebuild.
+                last_rescan = time.monotonic()
+                self._merge_devices(by_fd, pressed)
             try:
                 ready, _, _ = select.select(by_fd, [], [], 0.5)
             except OSError:
-                by_fd = {}  # some fd went stale; rescan
+                # Transient hiccup (incl. BlockingIOError): retry with the set
+                # intact. The old code dropped EVERYTHING here, deafening all
+                # healthy boards on one spurious error. Persistent failure
+                # means a dead fd selecting forever — rebuild after 3, ending
+                # any stuck press cleanly rather than wedging it.
+                sel_errors += 1
+                if sel_errors < 3:
+                    continue
+                sel_errors = 0
+                log.warning("select failing repeatedly; rescanning keyboards")
+                for fd in list(pressed):
+                    self._release(fd, pressed)
+                by_fd = {}
                 continue
+            sel_errors = 0
             for fd in ready:
                 dev = by_fd.get(fd)
                 try:
                     events = list(dev.read())
+                except BlockingIOError:
+                    continue  # spurious; the device is healthy, keep it
                 except OSError:
                     log.warning("keyboard %s disappeared; dropping it", dev.path)
                     by_fd.pop(fd, None)
@@ -113,6 +139,60 @@ class HotkeyWatcher(threading.Thread):
                             self._press(fd, pressed)
                         elif event.value == 0:
                             self._release(fd, pressed)
+
+    def _merge_devices(self, by_fd: dict[int, InputDevice], pressed: set[int]) -> int:
+        """Fold newly appeared keyboards into the watch set, keyed by path.
+
+        find_keyboards() OPENS everything it reports, so an already-watched
+        board comes back as a duplicate that must be closed, not leaked. A
+        replugged board reuses its path with a FRESH fd: swap it in and retire
+        the stale object — releasing a stuck press on the dead fd so no
+        recording wedges on (the read-error path can no longer fire for it).
+        Returns the number of boards added or swapped.
+        """
+        try:
+            found = find_keyboards()
+        except OSError:
+            log.warning("hotkey rescan failed", exc_info=True)
+            return 0
+        by_path: dict[str, tuple[int, InputDevice]] = {}
+        for fd, dev in by_fd.items():
+            try:
+                by_path.setdefault(dev.path, (fd, dev))
+            except OSError:
+                continue  # path unreadable on a dying device; read path drops it
+        added = 0
+        for dev in found:
+            try:
+                path = dev.path
+            except OSError:
+                continue
+            cur = by_path.get(path)
+            if cur is None:
+                by_fd[dev.fd] = dev
+                by_path[path] = (dev.fd, dev)
+                added += 1
+                log.info("hotkey: newly watching %s for %s", path, self.code)
+            elif cur[0] != dev.fd:
+                old_fd, old_dev = cur
+                try:
+                    old_dev.close()
+                except OSError:
+                    pass
+                del by_fd[old_fd]
+                # End a clip the dead fd was holding — cleanly, once, rather
+                # than wedging the recorder on past the replug.
+                self._release(old_fd, pressed)
+                by_fd[dev.fd] = dev
+                by_path[path] = (dev.fd, dev)
+                added += 1
+                log.info("hotkey: %s replugged (fd %s -> %s)", path, old_fd, dev.fd)
+            else:
+                try:
+                    dev.close()  # duplicate open of a watched board; don't leak it
+                except OSError:
+                    pass
+        return added
 
     def _press(self, fd: int, pressed: set[int]) -> None:
         """Key down on `fd`. on_press fires only for the first device to hold

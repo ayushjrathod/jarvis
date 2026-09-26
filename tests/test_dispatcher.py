@@ -64,6 +64,15 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(got["runs"], [])
         self.assertEqual(len(self.db.list_tasks()), 1)
 
+    def test_list_tasks_filters_by_source(self):
+        # Tier 3: the monitor drowns in plumbing without a source filter.
+        self.db.create_task("user question", "api", "quick")
+        self.db.create_task("gate verdict", "notify-gate", "quick")
+        self.assertEqual(len(self.db.list_tasks()), 2)
+        only = self.db.list_tasks(source="notify-gate")
+        self.assertEqual([t["source"] for t in only], ["notify-gate"])
+        self.assertEqual(self.db.list_tasks(source="api")[0]["text"], "user question")
+
     def test_refusal_two_run_flow(self):
         task = self.db.create_task("borderline task", "queue", "agentic")
         r1 = self.db.create_run(task["id"], 1, "claude-fable-5")
@@ -121,6 +130,72 @@ class TestQueueParsing(unittest.TestCase):
         meta, body = parse_task_file("---\nmode: auto\n---\nline one\n---\nline two")
         self.assertEqual(meta["mode"], "auto")
         self.assertIn("---", body)
+
+    def test_non_mapping_frontmatter(self):
+        # Tolerant by default (queue/vault must survive hand-mangled files),
+        # strict on request (area manifests must not load neutered).
+        meta, body = parse_task_file("---\n- a\n- b\n---\nbody\n")
+        self.assertEqual((meta, body), ({}, "body"))
+        with self.assertRaises(ValueError):
+            parse_task_file("---\n- a\n- b\n---\nbody\n", strict=True)
+
+
+class TestNoDoubleClaim(unittest.TestCase):
+    """At most one subsystem may claim a sentence. Divert order (automation
+    → media → desktop) resolves priority at runtime, but a sentence claimed
+    twice is a routing bug regardless of who wins — the loser never sees it.
+    One corpus across all three deterministic tiers plus the area triggers."""
+
+    CORPUS = [
+        # (sentence, expected owner or None)
+        ("play some jazz", "media"),
+        ("system volume up", "desktop"),
+        ("what windows are open", "desktop"),
+        ("list tabs", "desktop"),
+        ("switch to tab gmail", "desktop"),
+        ("focus Data3", "desktop"),
+        ("add task renew the domain", "area"),
+        # Accepted wart, pinned: "open tasks" parses as a launch and fails
+        # speakably at the executor (finding 1.2) rather than routing. The
+        # status fix is what makes the miss recoverable, not the parser.
+        ("open tasks", "desktop"),
+        ("what is in vault/notes/ideas.md?", None),  # agentic, no divert
+        ("open the window", None),
+        ("windows update", None),
+        ("put on the kettle", None),
+        ("play it by ear", None),
+        ("run the migration", None),
+        ("did you hear the album dropped today", None),
+        ("what is the airspeed velocity of a laden swallow", None),
+    ]
+
+    def test_each_sentence_has_at_most_one_owner(self):
+        from dispatcher import desktop, spotify
+        from dispatcher.areas import AreaRegistry
+        reg = AreaRegistry(Path(__file__).resolve().parent.parent / "areas")
+        for text, want in self.CORPUS:
+            with self.subTest(text=text):
+                owners = []
+                if spotify.detect(text) is not None:
+                    owners.append("media")
+                if desktop.detect(text) is not None:
+                    owners.append("desktop")
+                area, _ = reg.match(text)
+                if area is not None:
+                    owners.append("area")
+                # Media+desktop is the fatal pair: both are diverts, so the
+                # loser never sees the sentence and order is the only
+                # resolution. Desktop+area resolves deterministically the
+                # other way — try_divert runs before routing, so the divert
+                # always wins ("open tasks" launches-and-fails-speakably
+                # rather than becoming a task; finding 1.2, accepted).
+                self.assertFalse("media" in owners and "desktop" in owners,
+                                   owners)
+                self.assertLessEqual(len(owners), 2, owners)
+                if want is None:
+                    self.assertEqual(owners, [])
+                else:
+                    self.assertIn(want, owners)
 
 
 class TestRefusalDetection(unittest.TestCase):
@@ -361,6 +436,17 @@ class TestRunnerTransientRetry(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(mock_spawn.call_count, 1)
 
+    async def test_unexpected_crash_becomes_failed_not_raised(self):
+        # Finding 2.3: one stream-json line over STREAM_LIMIT raises ValueError
+        # out of the readline — that used to propagate, skipping finish_run
+        # and stranding the run row `running` forever.
+        cfg = _test_cfg()
+        with patch("dispatcher.runner._attempt",
+                   AsyncMock(side_effect=ValueError("5MiB line"))):
+            result = await run_once("do it", cfg, None, [], {}, "task1")
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("internal error", result["error"])
+
 
 class TestDeniedToolSurfacing(unittest.IsolatedAsyncioTestCase):
     """2026-07-21..23: the CLI denied the daily brief every Write, the model
@@ -493,6 +579,27 @@ class TestDenialBlocksOutput(unittest.TestCase):
         false success, which is the failure mode session 17 fixed."""
         self.assertTrue(runner.denial_could_block_output("permission denied"))
         self.assertTrue(runner.denial_could_block_output(""))
+
+    def test_consolidation_input_does_not_doom_the_verdict(self):
+        # Finding 2.2: the prompt names its INPUT first (written pre-submit,
+        # so always stale) and its outputs later — first-match made this
+        # permanently False for consolidations, force-failing good runs on a
+        # harmless denial and re-running the batch nightly.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "data" / "consolidation").mkdir(parents=True)
+            (root / "vault" / "memory").mkdir(parents=True)
+            export = root / "data" / "consolidation" / "x.md"
+            export.write_text("episodes")
+            old = time.time() - 600
+            os.utime(export, (old, old))
+            text = ("Step 1: read data/consolidation/x.md. Step 2: update "
+                    "vault/memory/MEMORY.md with what you learn.")
+            now = time.time() - 60
+            self.assertFalse(runner.wrote_declared_output(text, root, now))
+            (root / "vault" / "memory" / "MEMORY.md").write_text("blocks")
+            self.assertTrue(runner.wrote_declared_output(text, root, now))
+            self.assertIsNone(runner.wrote_declared_output("no paths", root, 0))
 
 
 
@@ -870,6 +977,99 @@ class TestTrustBoundaryMetadata(unittest.TestCase):
         self.assertNotIn("resume_session_id", out)
         self.assertEqual(out["max_cost_usd"], 3.0)
 
+    def test_untrusted_cannot_name_episodes(self):
+        # Finding 2.4: episode_ids names the batch a failed consolidation
+        # returns to the pool. Anyone reaching POST /task could previously
+        # hand any failing task a set of ids to resurrect.
+        from dispatcher.service import sanitize_untrusted_metadata
+        out = sanitize_untrusted_metadata(
+            {"task_type": "memory-consolidate", "episode_ids": [1, 2, 3],
+             "automation_id": "kept", "notify": False},
+            cost_cap=3.0)
+        self.assertNotIn("episode_ids", out)
+        # ...while the keys the divert path legitimately carries survive.
+        self.assertEqual(out["automation_id"], "kept")
+        self.assertIs(out["notify"], False)
+        self.assertEqual(out["task_type"], "memory-consolidate")
+
+
+class TestStrandedRunRow(unittest.IsolatedAsyncioTestCase):
+    """Finding 2.3, service half: whatever escapes between create_run and
+    finish_run must still close the books. run_once never raises anymore, but
+    the finally below is what guarantees it for every future crash shape."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        cfg = Config(root=Path(self.tmp.name))
+        cfg.db_path = Path(self.tmp.name) / "t.db"
+        from dispatcher.service import Service
+        self.svc = Service(cfg)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    async def test_crash_mid_attempt_settles_the_run_row(self):
+        task = self.svc.db.create_task("do a thing", "api", "agentic", None, {})
+        with patch("dispatcher.runner.run_once",
+                   AsyncMock(side_effect=ValueError("5MiB line"))):
+            await self.svc._run_agentic(task)
+        self.assertEqual(self.svc.db.get_task(task["id"])["status"], "failed")
+        with self.svc.db._conn() as c:
+            rows = c.execute("SELECT status, error FROM runs WHERE task_id=?",
+                             (task["id"],)).fetchall()
+        self.assertTrue(rows)
+        for r in rows:
+            self.assertEqual(r["status"], "failed")
+        self.assertTrue(any("crashed" in (r["error"] or "") for r in rows))
+
+
+class TestForgedConsolidation(unittest.IsolatedAsyncioTestCase):
+    """Finding 2.4, second half: even past the sanitizer (or predating it),
+    a task that merely CLAIMS task_type memory-consolidate must not move
+    episodes. Only the timer's own consolidation holds a batch hostage."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        cfg = Config(root=Path(self.tmp.name))
+        cfg.db_path = Path(self.tmp.name) / "t.db"
+        from dispatcher.service import Service
+        self.svc = Service(cfg)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    async def test_forged_consolidation_from_api_resurrects_nothing(self):
+        eids = [self.svc.db.add_episode(None, "voice", "quick", None, "done",
+                                        f"q{i}", f"a{i}") for i in range(2)]
+        self.svc.db.mark_episodes_consolidated(eids)
+        task = self.svc.db.create_task(
+            "consolidate", "api", "agentic", None,
+            {"task_type": "memory-consolidate", "episode_ids": eids})
+
+        async def boom(_task):
+            raise RuntimeError("kaboom")
+
+        from unittest.mock import patch
+        with patch.object(self.svc, "_run_agentic_inner", boom):
+            await self.svc._run_agentic(task)
+        remaining = {e["id"] for e in self.svc.db.unconsolidated_episodes(50)}
+        self.assertEqual(remaining, set())
+
+    def test_startup_sweep_ignores_non_timer_rows(self):
+        eids = [self.svc.db.add_episode(None, "voice", "quick", None, "done",
+                                        "q", "a")]
+        self.svc.db.mark_episodes_consolidated(eids)
+        task = self.svc.db.create_task(
+            "consolidate", "api", "agentic", None,
+            {"task_type": "memory-consolidate", "episode_ids": eids})
+        self.svc.db.set_task_status(task["id"], "running")
+        from dispatcher.service import Service
+        cfg2 = Config(root=Path(self.tmp.name))
+        cfg2.db_path = self.svc.cfg.db_path
+        svc2 = Service(cfg2)  # next boot: forged row must not resurrect
+        remaining = {e["id"] for e in svc2.db.unconsolidated_episodes(50)}
+        self.assertEqual(remaining, set())
+
     def test_config_defaults_simulate_refusal_off(self):
         from pathlib import Path
         from dispatcher.config import Config
@@ -986,6 +1186,15 @@ class TestSystemdUnits(unittest.TestCase):
                 re.search(r"StartLimitIntervalSec=(\d+)", text).group(1))
             delay = int(re.search(r"RestartSec=(\d+)", text).group(1))
             self.assertLess(burst * delay, interval, unit.name)
+
+    def test_serve_rides_out_dispatcher_outages(self):
+        # Finding Tier 3: Requires= on the serve unit deactivated phone access
+        # whenever the dispatcher reached `failed` — reachable since the
+        # StartLimit change — and restarting the dispatcher never brought it
+        # back. Wants keeps the proxy up through the outage.
+        text = (self.UNITS / "mission-tailscale-serve.service").read_text()
+        self.assertNotIn("Requires=mission-dispatcher.service", text)
+        self.assertIn("Wants=mission-dispatcher.service", text)
 
 
 if __name__ == "__main__":

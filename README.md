@@ -24,6 +24,7 @@ CPU, no cloud scheduling.
 | I | Personal OS: pdf/image/html ingest, NL→automations, notify-or-not gate | ✅ |
 | J | Semantic + graph memory: vector search, bi-temporal fact graph | ✅ |
 | K1 | Desktop control: volume/lock/launch/open/clipboard + confirm gate | ✅ |
+| K2 | Windows over AT-SPI + browser tabs over DevTools, zero new deps | ✅ |
 
 Also shipped: **ask about my screen** (`<Super><Alt>a`) · **Spotify control**
 by voice · **phone access** over Tailscale + installable PWA · **inbox
@@ -247,7 +248,10 @@ installs as an app, mic and all.
   as such rather than claimed as opened. Apps run in their own systemd scope,
   so restarting the dispatcher never closes them. Reading the clipboard and
   opening a URL ask first ("Shall I …?"); answer by saying **yes/no**, or click
-  the banner at the top of the dashboard.
+  the banner at the top of the dashboard. Windows list and focus over AT-SPI
+  ("what windows are open", "switch to firefox"); browser tabs list, switch
+  and read over the DevTools port ("what tabs are open", "read this tab") —
+  the browser must run with `--remote-debugging-port`.
 - **Rate limited?** If Claude's plan-wide session cap is hit, Jarvis says so
   *and* answers from its own indexed memory where it can — quoting the vault
   verbatim with the source named, rather than going silent until the reset.

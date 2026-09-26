@@ -57,6 +57,19 @@ class TestSanitize(unittest.TestCase):
         self.assertEqual(sanitize("The capital of France is Paris."),
                          "The capital of France is Paris.")
 
+    def test_emoji_markup_and_images_are_not_spoken(self):
+        # Tier 3: ✅ reads as "white heavy check mark", <b> as
+        # "bee bold slash-bee", and ![diagram](x.png) keeps its "!" — while
+        # model replies routinely open with exactly this shape.
+        self.assertEqual(sanitize("✅ Done."), "Done.")
+        self.assertEqual(sanitize("a <b>bold</b> move"), "a bold move")
+        self.assertEqual(sanitize("see ![diagram](x.png) here"), "see diagram here")
+        self.assertEqual(sanitize("see ![](x.png) here"), "see image here")
+        self.assertEqual(sanitize("see [the docs][1] here"), "see the docs here")
+        # ...but real text survives: comparisons, arrows, identifiers.
+        self.assertEqual(sanitize("a < b and c > d"), "a < b and c > d")
+        self.assertEqual(sanitize("run backup_db.sh now"), "run backup_db.sh now")
+
 
 class TestSentenceChunker(unittest.TestCase):
     def test_stream_chunks_to_sentences(self):
@@ -138,6 +151,39 @@ class TestChunkerFences(unittest.TestCase):
         out3 = c.feed("z = 3\n```\nBack to prose. ")
         self.assertEqual(out3, ["Back to prose."])
         self.assertNotIn("x = 1", " ".join(out + out2 + out3))
+
+    def test_closer_split_across_deltas_still_ends_the_drop(self):
+        # Token boundaries split inside the 3-char closer routinely: the old
+        # partition matched each delta in isolation, so `` `` `` + `` ` ``
+        # never completed and every later delta was thrown away (zero spoken
+        # chunks after a runaway block, verified live).
+        c = SentenceChunker(max_code=60)
+        out = c.feed("```\n" + "x = 1\n" * 40)
+        self.assertEqual(out, ["Code block omitted."])
+        self.assertEqual(c.feed("y = 2\n" * 10 + "``"), [])
+        self.assertEqual(c.feed("`\nBack to prose. "), ["Back to prose."])
+
+    def test_tilde_fences_are_code_too(self):
+        # Models emit ~~~ blocks as often as ``` ones; espeak reading shell
+        # aloud is the same failure either way.
+        code = "\n".join(f"rm -rf /tmp/junk-{i}" for i in range(30))
+        text = f"Here is the script.\n~~~\n{code}\n~~~\nRun it carefully. "
+        c = SentenceChunker()
+        out = []
+        for delta in _stream(text):
+            out.extend(c.feed(delta))
+        out.extend(c.flush())
+        spoken = " ".join(out)
+        self.assertNotIn("rm -rf", spoken)
+        self.assertIn("code block omitted", spoken.lower())
+        self.assertIn("Run it carefully.", spoken)
+
+    def test_tilde_closer_split_across_deltas(self):
+        c = SentenceChunker(max_code=60)
+        out = c.feed("~~~\n" + "x = 1\n" * 40)
+        self.assertEqual(out, ["Code block omitted."])
+        self.assertEqual(c.feed("y = 2\n" * 10 + "~~"), [])
+        self.assertEqual(c.feed("~\nBack to prose. "), ["Back to prose."])
 
     def test_unclosed_fence_at_flush_is_not_spoken(self):
         # cancelled reply / dropped SSE mid-block: the pair never completes
@@ -458,10 +504,13 @@ class _FakeOut:
     still gets closed (sounddevice's own context manager only closes in
     __exit__, which never runs when __enter__ raised)."""
 
-    def __init__(self, on_write=None, start_error=None):
+    def __init__(self, on_write=None, start_error=None, stop_error=None,
+                 close_error=None):
         self.writes: list = []
         self._on_write = on_write
         self._start_error = start_error
+        self._stop_error = stop_error
+        self._close_error = close_error
         self.started = False
         self.closed = False
 
@@ -471,10 +520,14 @@ class _FakeOut:
         self.started = True
 
     def stop(self):
+        if self._stop_error is not None:
+            raise self._stop_error
         self.started = False
 
     def close(self):
         self.closed = True
+        if self._close_error is not None:
+            raise self._close_error
 
     def write(self, data):
         self.writes.append(data)
@@ -562,6 +615,47 @@ class TestStreamLeakOnFailedStart(unittest.TestCase):
                 stream.__enter__()
         self.assertTrue(fake.closed)
         self.assertIsNone(stream._stream)  # and nothing left half-open on self
+
+
+class TestRecorderDeviceFailure(unittest.TestCase):
+    """Finding 0.3b: a capture-device error wedged the Recorder permanently —
+    stop() raised with _stream still set, so is_recording() stayed True
+    forever and the wake word spun in on_busy() for the life of the process;
+    start() leaked the native stream the same way MicStream did."""
+
+    def _recording(self, fake):
+        r = Recorder()
+        with mock.patch("jarvis.audio.sd.InputStream", return_value=fake):
+            r.start()
+        r._append(np.zeros((512, 1), dtype=np.int16))
+        return r
+
+    def test_start_failure_closes_and_leaves_nothing_half_open(self):
+        fake = _FakeOut(start_error=OSError("device busy"))
+        r = Recorder()
+        with mock.patch("jarvis.audio.sd.InputStream", return_value=fake):
+            with self.assertRaises(OSError):
+                r.start()
+        self.assertTrue(fake.closed)
+        self.assertIsNone(r._stream)
+        self.assertFalse(r.is_recording())
+
+    def test_stop_failure_returns_frames_and_clears(self):
+        fake = _FakeOut(stop_error=OSError("device unplugged"))
+        r = self._recording(fake)
+        with self.assertLogs("jarvis.audio", level="WARNING"):
+            out = r.stop()
+        self.assertEqual(len(out), 512)  # captured audio still valid
+        self.assertTrue(fake.closed)
+        self.assertIsNone(r._stream)
+        self.assertFalse(r.is_recording())
+
+    def test_close_failure_after_stop_failure_still_returns_frames(self):
+        fake = _FakeOut(stop_error=OSError("gone"), close_error=OSError("gone"))
+        r = self._recording(fake)
+        out = r.stop()  # must not raise: a notification cannot fail capture
+        self.assertEqual(len(out), 512)
+        self.assertIsNone(r._stream)
 
 
 class TestPlayAsyncLogsFailures(unittest.TestCase):
@@ -978,6 +1072,45 @@ class TestPttBargeDuringTranscription(unittest.TestCase):
         self.assertTrue(app.barge_request.is_set())
         self.assertTrue(app.player.interrupt.is_set())  # playback stopped too
 
+    def test_key_down_stops_but_does_not_spend_the_run(self):
+        # The cancel used to fire here, so a stray tap destroyed the answer
+        # with the run already spent. Key-down now only stops + records;
+        # the spend happens at release, for real utterances.
+        app = _app()
+        app.brain.cancel = mock.AsyncMock()
+
+        async def scenario():
+            async with app.busy:
+                self.assertTrue(app._ptt_barge())
+            return True
+
+        asyncio.run(scenario())
+        app.brain.cancel.assert_not_awaited()
+
+    def test_cancel_inflight_reaches_the_brain_from_any_thread(self):
+        # Key release runs on the watcher thread: the cancel must be
+        # scheduled onto the event loop, never awaited inline, never raising.
+        app = _app()
+        app.brain.cancel = mock.AsyncMock()
+        app.loop = mock.Mock()
+        submitted = []
+
+        def fake_submit(coro, loop):
+            submitted.append(loop)
+            coro.close()  # never run: scheduling is what is pinned
+            return mock.Mock()
+
+        with mock.patch.object(asyncio, "run_coroutine_threadsafe",
+                               side_effect=fake_submit):
+            self.assertTrue(app._cancel_inflight())
+        self.assertEqual(submitted, [app.loop])
+        app.brain.cancel.assert_not_awaited()
+
+    def test_cancel_inflight_without_a_loop_reports_false(self):
+        app = _app()
+        app.loop = None
+        self.assertFalse(app._cancel_inflight())
+
 
 class TestWakeBusyPredicate(unittest.TestCase):
     """2026-08-10: capture_after_wake's gate was `busy.locked` alone, which is
@@ -1078,7 +1211,12 @@ class TestHotkeyWatcherSupervision(unittest.TestCase):
         self.assertIsInstance(w.error, OSError)
         self.assertTrue(any("watcher died" in line for line in caught.output))
 
-    def test_supervisor_raises_when_the_watcher_stops(self):
+    def test_supervisor_exits_the_process_when_the_watcher_stops(self):
+        # Was RuntimeError (2026-08-10): enough in --mode ptt, where every
+        # other task finishes and gather lets the error out — but in --mode
+        # both the wake capture never returns, gather never completes, and
+        # the process lives on deaf. os._exit(1) dies in every mode, which is
+        # what trips Restart=on-failure.
         app = _app()
         w = HotkeyWatcher("KEY_F9", lambda: None, lambda: None)
         w._watch = lambda: None   # "crashes" immediately, hardware never touched
@@ -1087,8 +1225,9 @@ class TestHotkeyWatcherSupervision(unittest.TestCase):
         async def scenario():
             await asyncio.wait_for(app._supervise_ptt(w), timeout=5)
 
-        with self.assertRaises(RuntimeError):
+        with mock.patch("jarvis.main.os._exit") as gone:
             asyncio.run(scenario())
+        gone.assert_called_once_with(1)
 
 
 class TestHotkeyPerDeviceState(unittest.TestCase):
@@ -1128,6 +1267,118 @@ class TestHotkeyPerDeviceState(unittest.TestCase):
         w._release(3, pressed)
         self.assertEqual(events, ["press", "release"])
         self.assertEqual(pressed, set())
+
+
+class TestHotkeyRescanMerge(unittest.TestCase):
+    """Finding 0.3c: the watcher rescanned only when its set EMPTIED, but the
+    set can never empty while ydotoold is up — so a replugged keyboard stayed
+    dead until a service restart, and one BlockingIOError dropped every
+    healthy board with it."""
+
+    class _Dev:
+        def __init__(self, fd, path):
+            self.fd, self.path, self.closed = fd, path, False
+
+        def close(self):
+            self.closed = True
+
+    def _watcher(self):
+        events = []
+        w = HotkeyWatcher("KEY_F9",
+                          lambda: events.append("press"),
+                          lambda: events.append("release"))
+        return w, events
+
+    def test_new_board_is_merged_in(self):
+        w, _ = self._watcher()
+        by_fd, pressed = {}, set()
+        new = self._Dev(9, "/dev/input/event9")
+        with mock.patch("jarvis.hotkey.find_keyboards", return_value=[new]):
+            self.assertEqual(w._merge_devices(by_fd, pressed), 1)
+        self.assertEqual(by_fd, {9: new})
+
+    def test_duplicate_open_is_closed_not_leaked(self):
+        w, _ = self._watcher()
+        watched = self._Dev(3, "/dev/input/event3")
+        dup = self._Dev(3, "/dev/input/event3")
+        by_fd = {3: watched}
+        with mock.patch("jarvis.hotkey.find_keyboards", return_value=[dup]):
+            self.assertEqual(w._merge_devices(by_fd, {}), 0)
+        self.assertEqual(by_fd, {3: watched})
+        self.assertTrue(dup.closed)
+        self.assertFalse(watched.closed)
+
+    def test_replugged_board_swaps_fd_and_releases_stuck_press(self):
+        w, events = self._watcher()
+        stale = self._Dev(3, "/dev/input/event3")
+        fresh = self._Dev(7, "/dev/input/event3")
+        by_fd, pressed = {3: stale}, {3}
+        with mock.patch("jarvis.hotkey.find_keyboards", return_value=[fresh]):
+            self.assertEqual(w._merge_devices(by_fd, pressed), 1)
+        self.assertEqual(by_fd, {7: fresh})
+        self.assertTrue(stale.closed)
+        self.assertEqual(events, ["release"])  # ended cleanly, never wedged
+        self.assertEqual(pressed, set())
+
+    def test_failed_rescan_leaves_the_set_untouched(self):
+        w, _ = self._watcher()
+        watched = self._Dev(3, "/dev/input/event3")
+        by_fd = {3: watched}
+        with mock.patch("jarvis.hotkey.find_keyboards",
+                         side_effect=OSError("wedged /dev/input")):
+            self.assertEqual(w._merge_devices(by_fd, set()), 0)
+        self.assertEqual(by_fd, {3: watched})
+
+
+class TestNoticesRespectCapture(unittest.TestCase):
+    """Tier 3: completion notices used `busy.locked()`, which covers neither
+    PTT capture nor wake phase-2 — so a notice talked straight over the user
+    answering. notices_loop now gates on _busy_for_wake()."""
+
+    def test_phase2_capture_marks_busy_and_clears(self):
+        app = _app()
+        seen = {}
+
+        def fake_capture(*a, **k):
+            seen["busy"] = app._busy_for_wake()
+            return None
+
+        fake_mic = mock.Mock()
+        fake_mic.read = mock.Mock(return_value=None)
+        fake_mic.__enter__ = mock.Mock(return_value=fake_mic)
+        fake_mic.__exit__ = mock.Mock(return_value=False)
+        with mock.patch("jarvis.main.MicStream", return_value=fake_mic), \
+                mock.patch("jarvis.main.capture_after_wake",
+                           side_effect=fake_capture):
+            app._wake_capture_once()
+        self.assertTrue(seen["busy"])
+        self.assertFalse(app._capture_busy.is_set())
+
+    def test_notice_queues_while_ptt_captures(self):
+        app = _app()
+
+        async def one_notice():
+            yield mock.Mock(text="done thing")
+            await asyncio.sleep(60)
+
+        app.brain = mock.Mock(notices=one_notice)
+        with mock.patch.object(app.recorder, "is_recording", return_value=True):
+            with self.assertRaises(asyncio.TimeoutError):
+                asyncio.run(asyncio.wait_for(app.notices_loop(), timeout=0.5))
+        self.assertEqual(app.pending_notices, ["done thing"])
+
+    def test_flush_defers_while_capturing_and_speaks_when_quiet(self):
+        app = _app()
+        app.pending_notices = ["one", "two"]
+        app.say = mock.AsyncMock(return_value=True)
+        with mock.patch.object(app.recorder, "is_recording", return_value=True):
+            asyncio.run(app._flush_notices())
+        self.assertEqual(app.pending_notices, ["one", "two"])
+        app.say.assert_not_awaited()
+        with mock.patch.object(app.recorder, "is_recording", return_value=False):
+            asyncio.run(app._flush_notices())
+        self.assertEqual(app.pending_notices, [])
+        self.assertEqual(app.say.await_count, 2)
 
 
 class TestDispatcherBrainCancelClose(unittest.TestCase):

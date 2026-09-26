@@ -39,7 +39,7 @@ export default function Notices({ lastEvent }) {
 
   if (!items.length) return null;
   return (
-    <div className="notices">
+    <div className="notices" role="status">
       {items.map((i) => (
         <div key={i.key} className="notice-row">
           <span className="notice-text">{i.text}</span>

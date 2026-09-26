@@ -18,6 +18,10 @@ export default function CommandBox() {
   const [recState, setRecState] = useState("idle"); // idle | recording | transcribing
   const [muted, setMuted] = useState(false);
   const recRef = useRef(null);
+  // Two minutes, like the ask-screen popup: a forgotten-open mic must not
+  // hold the server transcribe lock against every other /stt call.
+  const MIC_MAX_MS = 120000;
+  const recTimerRef = useRef(null);
   // set SYNCHRONOUSLY, before the getUserMedia await — see toggleMic
   const startingRef = useRef(false);
   // `say` is captured by rec.onstop, which closes over the render that STARTED
@@ -91,6 +95,7 @@ export default function CommandBox() {
   // Click to start listening, click again to stop; onstop transcribes + asks.
   async function toggleMic() {
     if (recRef.current) {
+      clearTimeout(recTimerRef.current);
       recRef.current.stop(); // onstop below does the rest
       return;
     }
@@ -109,6 +114,7 @@ export default function CommandBox() {
       const chunks = [];
       rec.ondataavailable = (e) => chunks.push(e.data);
       rec.onstop = async () => {
+        clearTimeout(recTimerRef.current);
         stream.getTracks().forEach((t) => t.stop());
         recRef.current = null;
         setRecState("transcribing");
@@ -135,6 +141,9 @@ export default function CommandBox() {
       };
       rec.start();
       recRef.current = rec;
+      recTimerRef.current = setTimeout(() => {
+        if (recRef.current) recRef.current.stop();
+      }, MIC_MAX_MS);
       setRecState("recording");
     } catch (err) {
       setNote(`mic error: ${err.message}`);

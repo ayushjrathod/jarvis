@@ -42,7 +42,8 @@ Every working session MUST:
 | — | Ask-about-my-screen (`<Super><Alt>a` → portal shot → popup → streamed answer) | **implemented, smoke passing — user E2E pending** (run scripts/setup_ask_screen.sh) |
 | — | Spotify media control ("hey jarvis, play …" → MPRIS, deterministic) | **implemented — user E2E pending** (run scripts/setup_spotify.sh) |
 | — | Phone access via Tailscale + installable PWA dashboard | **implemented, live — user add-to-home-screen pending** |
-| K1 | Desktop control (computer-use T1: volume/mute/lock/launch/open/clipboard + allow-confirm-deny safety plane) | **implemented, live-verified** — `launch`/`open` were broken until 2026-07-27 (no display in the service env); window mgmt + brightness deferred (need deps, see notes) |
+| K1 | Desktop control (computer-use T1: volume/mute/lock/launch/open/clipboard + allow-confirm-deny safety plane) | **implemented, live-verified** — `launch`/`open` were broken until 2026-07-27 (no display in the service env); brightness still deferred (needs deps, see notes) |
+| K2 | Computer-use T2 (windows over AT-SPI) + T3 (browser tabs over DevTools HTTP + stdlib WS), zero new deps | **implemented, live-verified 2026-09-08..11** — list/focus + tabs/switch/read; window close, click-by-name and page actions deliberately not built (unverified verbs stay out) |
 | — | Meta-task cost fix (`models.meta` → haiku for gate/parse tasks; notify gate no longer resumes) | **implemented, live-verified** — $0.141 → $0.0405 per gate run |
 | — | Degraded mode (plan-cap failures answered extractively from the local hybrid index) | **implemented, live-verified** |
 | — | Inbox watcher (first *event*-driven trigger: file lands in `vault/inbox/` → indexed + announced) | **implemented, live-verified** |
@@ -959,6 +960,34 @@ before writing from scratch.
   the Tailscale Serve URL is HTTPS (loopback is also secure). Caveat: iOS Safari
   can throttle `speechSynthesis` from async code — speaking is best-effort and
   never blocks the UI.
+
+## Operational notes (computer-use T2/T3 — windows + browser tabs)
+
+- **Neither tier needed its dependency.** The 2026-07-26 spike proved only
+  the GNOME Shell route unreachable; session 24 measured AT-SPI answering,
+  and T2 rides it over jeepney (`dispatcher/windows.py`: GetAddress →
+  registry bus → GetChildren/GetRoleName/Name, Component.GrabFocus).
+  T3 rides DevTools HTTP (`/json/list`, `/json/activate`) plus a ~150-line
+  stdlib-socket WS client (`dispatcher/cdp.py`) for Runtime.evaluate.
+  Q2 (dep approvals) is moot; `future/computer-use.md` §9 records it.
+- **Qualifier discipline, both tiers.** Window shapes require a listing verb
+  or open-state question beside "windows"; tab shapes require the word
+  "tab"; focus/activate take anything but a bare generic. Live catches
+  during wiring: `raise` is not a focus verb (volume collision), tab shapes
+  run before window shapes, `tabs` is not an app name. Generative
+  no-other-parser suites pin all three tiers pairwise.
+- **Policy follows the data.** List verbs read local state (allow); focus
+  and tab-switch move context (confirm); tab text lands in model context
+  (confirm, quoted-data posture). Executors adapt WindowError/BrowserError
+  to DesktopError, so misses settle failed and speak — the same honesty
+  rule as T1.
+- **Deliberately not built:** window close, click-by-name, page click/type.
+  The evaluate seam is proven; the actions are not, and an unverified verb
+  is the exact failure §5 of the plan doc exists to stop.
+- **Browser needs its side:** nothing debuggable on
+  `--remote-debugging-port` (default 9222, `browser.debug_port`) fails fast
+  and speakably, never hanging the divert. `GET /desktop/verbs` lists the
+  five new verbs with their policies.
 
 ## Known quirks / open items
 

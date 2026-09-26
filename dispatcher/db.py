@@ -11,7 +11,7 @@ import logging
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 log = logging.getLogger("dispatcher.db")
@@ -200,6 +200,12 @@ MIGRATIONS = [
     # extractor had already read successfully. NULL = never extracted, which is
     # where every pre-2026-08-11 episode starts.
     "ALTER TABLE episodes ADD COLUMN graph_extracted_at TEXT",
+    # Which embedding model wrote the vectors. A different 384-dim model
+    # (all-MiniLM-L6-v2) used to be accepted silently, coexisting in an
+    # incompatible space with no re-embed trigger — search answered from
+    # stale vectors every 15 minutes while logging backfill failure for a
+    # non-384-dim one. CREATE IF NOT EXISTS: runs clean on new and old DBs.
+    "CREATE TABLE IF NOT EXISTS embedding_meta (k TEXT PRIMARY KEY, v TEXT)",
 ]
 
 # Share of a candidate window reserved for the NEWEST active facts. Today's
@@ -244,8 +250,47 @@ def fts_query_any(q: str) -> str:
     return " OR ".join(f'"{t}"' for t in terms if t)
 
 
+def _fts_with_fallback(c, sql: str, args: list, q: str):
+    """Run an AND-joined FTS query; on zero rows retry OR-joined.
+
+    FTS5 joins space-separated terms with implicit AND, so every
+    natural-language question ('what is my preferred coding tool') demanded
+    all its words — stopwords included — in one chunk and returned nothing,
+    leaving hybrid search as pure KNN. AND-first preserves exact behavior
+    wherever it hits; the OR leg only fires on a miss, where BM25 still ranks
+    the fullest match first."""
+    rows = c.execute(sql, args).fetchall()
+    if not rows:
+        any_match = fts_query_any(q)
+        if any_match and any_match != args[0]:
+            rows = c.execute(sql, [any_match, *args[1:]]).fetchall()
+    return rows
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _is_date(s) -> bool:
+    """A YYYY-MM-DD string (the valid_at shape), nothing else."""
+    if not isinstance(s, str) or len(s.strip()) != 10:
+        return False
+    try:
+        date.fromisoformat(s.strip())
+        return True
+    except ValueError:
+        return False
+
+
+def local_today() -> str:
+    """Local YYYY-MM-DD for anything a human reads as "today".
+
+    `now()` is UTC; the timers fire on local wall-clock (02:30 local is 21:00
+    UTC the previous day at +5:30), so stamping a prompt with `now()[:10]`
+    told every nightly agent today was yesterday. Naive `datetime.now()` is
+    the same clock systemd OnCalendar and scripts/run_agent.py use, so the
+    brief and the memory blocks finally agree on what day it is."""
+    return datetime.now().date().isoformat()
 
 
 class Database:
@@ -348,6 +393,10 @@ class Database:
                 "SELECT metadata FROM tasks"
                 " WHERE json_extract(metadata,'$.task_type')='memory-consolidate'"
                 "   AND status!='done'"
+                # source lives in its own column, outside caller-settable
+                # metadata: only the timer's own consolidation may hold
+                # episodes hostage (added 2026-08-06, finding 2.4).
+                "   AND source='timer'"
             ).fetchall()
         ids: list[int] = []
         for r in rows:
@@ -369,13 +418,15 @@ class Database:
         out["runs"] = [dict(r) for r in runs]
         return out
 
-    def list_tasks(self, status=None, kind=None, limit=50) -> list[dict]:
+    def list_tasks(self, status=None, kind=None, limit=50, source=None) -> list[dict]:
         q, args = "SELECT * FROM tasks", []
         conds = []
         if status:
             conds.append("status=?"), args.append(status)
         if kind:
             conds.append("kind=?"), args.append(kind)
+        if source:
+            conds.append("source=?"), args.append(source)
         if conds:
             q += " WHERE " + " AND ".join(conds)
         q += " ORDER BY created_at DESC LIMIT ?"
@@ -565,16 +616,20 @@ class Database:
             " WHERE episodes_fts MATCH ?"
         )
         args: list = [match]
+        # valid_at is a full ISO timestamp, the filters are bare dates:
+        # comparing raw strings made before=<today> silently drop today's
+        # episodes while keeping today's notes (entries filter on a bare
+        # date column and were always inclusive). Compare calendar days.
         if after:
-            sql += " AND e.valid_at >= ?"
+            sql += " AND substr(e.valid_at,1,10) >= ?"
             args.append(after)
         if before:
-            sql += " AND e.valid_at <= ?"
+            sql += " AND substr(e.valid_at,1,10) <= ?"
             args.append(before)
         sql += " ORDER BY score LIMIT ?"
         args.append(limit)
         with self._conn() as c:
-            return [dict(r) for r in c.execute(sql, args).fetchall()]
+            return [dict(r) for r in _fts_with_fallback(c, sql, args, q)]
 
     # -- skill usage (Phase G) ---------------------------------------------
 
@@ -659,9 +714,14 @@ class Database:
     def set_automation_enabled(self, automation_id: int, enabled: bool,
                                next_run_at: str | None = None) -> bool:
         """Re-enabling passes a freshly computed next_run_at so a long-disabled
-        daily doesn't instantly fire on a stale past-due timestamp."""
+        daily doesn't instantly fire on a stale past-due timestamp. And when
+        the recompute is None — a spent `once` whose time has passed — the
+        NULL is WRITTEN, not skipped: the old code kept the stale timestamp
+        and the automation fired within 30s of clicking resume. NULL is the
+        spent state everywhere (the scheduler only selects non-NULL rows), so
+        a spent once stays spent instead of resurrecting."""
         with self._conn() as c:
-            if enabled and next_run_at is not None:
+            if enabled:
                 cur = c.execute(
                     "UPDATE automations SET enabled=1, next_run_at=? WHERE id=?",
                     (next_run_at, automation_id))
@@ -744,15 +804,37 @@ class Database:
                           (fid, eid))
         return fid
 
-    def invalidate_facts(self, ids: list[int]) -> int:
+    def invalidate_facts(self, ids: list[int],
+                         superseded_at: str | None = None) -> int:
+        """Retire facts, keeping the bi-temporal columns distinct: invalid_at
+        is when the GRAPH learned it (now, record time); expired_at is when
+        the fact stopped being true in the WORLD — the superseding
+        knowledge's valid_at. The old code stamped both with now(), making
+        the columns redundant and losing history the schema says can't be
+        retrofitted. And a candidate NEWER than the superseding knowledge is
+        never killed by it: the model naming an id is a suggestion, and old
+        knowledge must not eat new (skips are logged, not silent)."""
         if not ids:
             return 0
+        exp = superseded_at if _is_date(superseded_at) else now()
         with self._conn() as c:
-            cur = c.execute(
-                f"UPDATE kg_facts SET invalid_at=?, expired_at=?"
+            rows = c.execute(
+                f"SELECT id, valid_at FROM kg_facts"
                 f" WHERE invalid_at IS NULL AND id IN"
                 f" ({','.join('?' * len(ids))})",
-                [now(), now(), *ids])
+                list(ids)).fetchall()
+            kill = [r["id"] for r in rows
+                    if r["valid_at"] is None or r["valid_at"] <= exp]
+            skipped = len(rows) - len(kill)
+            if skipped:
+                log.info("kg: kept %d candidate(s) newer than the superseding "
+                         "knowledge (%s)", skipped, exp)
+            if not kill:
+                return 0
+            cur = c.execute(
+                f"UPDATE kg_facts SET invalid_at=?, expired_at=?"
+                f" WHERE id IN ({','.join('?' * len(kill))})",
+                [now(), exp, *kill])
             return cur.rowcount
 
     def active_facts(self, limit: int = 80) -> list[dict]:
@@ -977,9 +1059,24 @@ class Database:
             live = self._live_ids(c, "entries", [p[0] for p in pairs])
             rows = [p for p in pairs if p[0] in live]
             if rows:
-                c.executemany(
-                    "INSERT OR REPLACE INTO entries_vec (rowid, embedding) VALUES (?,?)",
-                    rows)
+                # OR IGNORE, not OR REPLACE: vec0 (sqlite-vec 0.1.9) RAISES on
+                # REPLACE — only UPDATE … WHERE rowid=? works. Two overlapping
+                # backfill passes (inbox arrival vs 15-min refresh) compute the
+                # same missing list, and the loser's whole executemany aborted
+                # on the first colliding rowid, rolling back non-colliding
+                # rows too. Measured further: this vec0 build raises even on
+                # the OR-IGNORE conflict path, so a residual collision falls
+                # back to per-row UPDATE — the one write vec0 honors. Either
+                # way the winner's vectors stand; same model, same content.
+                # (A model CHANGE re-embeds via reset, which deletes first.)
+                try:
+                    c.executemany(
+                        "INSERT OR IGNORE INTO entries_vec (rowid, embedding) VALUES (?,?)",
+                        rows)
+                except sqlite3.OperationalError:
+                    for rid, emb in rows:
+                        c.execute("UPDATE entries_vec SET embedding=? WHERE rowid=?",
+                                  (emb, rid))
 
     def add_episode_embeddings(self, pairs: list[tuple[int, bytes]]):
         if not pairs:
@@ -988,9 +1085,46 @@ class Database:
             live = self._live_ids(c, "episodes", [p[0] for p in pairs])
             rows = [p for p in pairs if p[0] in live]
             if rows:
-                c.executemany(
-                    "INSERT OR REPLACE INTO episodes_vec (rowid, embedding) VALUES (?,?)",
-                    rows)
+                # OR IGNORE + UPDATE fallback — see add_entry_embeddings.
+                try:
+                    c.executemany(
+                        "INSERT OR IGNORE INTO episodes_vec (rowid, embedding) VALUES (?,?)",
+                        rows)
+                except sqlite3.OperationalError:
+                    for rid, emb in rows:
+                        c.execute("UPDATE episodes_vec SET embedding=? WHERE rowid=?",
+                                  (emb, rid))
+
+    def embedding_identity(self) -> tuple[str | None, int | None]:
+        """(model, dim) that wrote the current vectors, (None, None) on a
+        fresh db. Vectors are raw model output — same dims, different space
+        means wrong neighbors with no error anywhere."""
+        try:
+            with self._conn() as c:
+                rows = dict(c.execute("SELECT k, v FROM embedding_meta").fetchall())
+        except sqlite3.OperationalError:
+            return None, None
+        dim = rows.get("dim")
+        return rows.get("model"), int(dim) if dim is not None else None
+
+    def set_embedding_identity(self, model: str, dim: int):
+        with self._conn() as c:
+            c.execute("INSERT OR REPLACE INTO embedding_meta (k, v) VALUES (?,?)",
+                      ("model", model))
+            c.execute("INSERT OR REPLACE INTO embedding_meta (k, v) VALUES (?,?)",
+                      ("dim", str(dim)))
+
+    def reset_embeddings(self) -> dict:
+        """Drop every vector (model change); the next backfill re-embeds from
+        source text. Returns what was dropped, for the log."""
+        with self._conn() as c:
+            out = {}
+            if self.vec_ok:
+                for table in ("entries_vec", "episodes_vec"):
+                    n = c.execute(f"SELECT count(*) n FROM {table}").fetchone()["n"]
+                    c.execute(f"DELETE FROM {table}")
+                    out[table] = n
+        return out
 
     def sweep_orphan_vectors(self) -> int:
         """Delete vec rows whose backing entry/episode is gone (L3). vec0 tables
@@ -1092,4 +1226,4 @@ class Database:
         sql += " ORDER BY score LIMIT ?"
         args.append(limit)
         with self._conn() as c:
-            return [dict(r) for r in c.execute(sql, args).fetchall()]
+            return [dict(r) for r in _fts_with_fallback(c, sql, args, q)]

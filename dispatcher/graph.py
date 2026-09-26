@@ -86,12 +86,20 @@ def candidate_ids(db: Database, limit: int = CANDIDATE_LIMIT) -> set[int]:
 # them); anchoring at line start keeps a quoted heading inside a body from
 # splitting a block.
 EPISODE_RE = re.compile(r"^## Episode ", re.M)
+EPISODE_ID_RE = re.compile(r"^## Episode (\d+)", re.M)
 NOTE_RESERVE = 120   # characters held back for the "N older … omitted" line
 
 
-def clip_episodes(text: str, max_chars: int = MAX_EPISODES_CHARS) -> str:
+def clip_episodes(text: str, max_chars: int = MAX_EPISODES_CHARS,
+                  ) -> tuple[str, list[int]]:
     """Fit the episode export into the prompt budget on WHOLE-episode
-    boundaries, keeping the most recent.
+    boundaries, keeping the most recent — and say which episodes survived.
+
+    Returns (clipped_text, seen_ids). The ids are load-bearing: the extractor
+    only ever sees the clipped text, so marking the FULL id list extracted
+    (as the service did until 2026-08-19) permanently orphaned every episode
+    past the budget — measured 25 of 82 surviving one real batch, ~22 of 200
+    at the cap. Mark only what was shown; the rest retry next pass.
 
     The clip used to be a bare `episodes_text[:MAX_EPISODES_CHARS]` — silent,
     mid-sentence, and dropping the TAIL, i.e. the NEWEST episodes (the export is
@@ -101,16 +109,18 @@ def clip_episodes(text: str, max_chars: int = MAX_EPISODES_CHARS) -> str:
     this codebase does not do silent caps, so it logs, keeps the recent end, and
     says in-band what it dropped (2026-08-10)."""
     if len(text) <= max_chars:
-        return text
+        return text, [int(m.group(1)) for m in EPISODE_ID_RE.finditer(text)]
     starts = [m.start() for m in EPISODE_RE.finditer(text)]
     if not starts:
         # Unrecognized export shape: still keep the RECENT end rather than the
         # head, and say so — a truncation we can't do cleanly is not a reason to
-        # do it wrongly.
+        # do it wrongly. No ids are returned, so nothing is marked extracted
+        # and the batch retries next pass (visible in the logs, self-healing
+        # if the format is fixed) instead of being silently orphaned.
         log.warning("graph: episode export (%d chars) has no episode headings; "
                     "clipping the oldest %d chars",
                     len(text), len(text) - max_chars)
-        return text[-max_chars:]
+        return text[-max_chars:], []
     header = text[:starts[0]]
     blocks = [text[s:e] for s, e in zip(starts, starts[1:] + [len(text)])]
     # The omission note costs characters too; reserve them up front, or the
@@ -134,15 +144,26 @@ def clip_episodes(text: str, max_chars: int = MAX_EPISODES_CHARS) -> str:
     log.warning("graph: episode export %d chars over the %d-char budget; "
                 "dropped the %d oldest of %d episodes",
                 len(text), max_chars, dropped, len(blocks))
-    return (header + note + "".join(kept))[:max_chars]
+    return (header + note + "".join(kept))[:max_chars], _block_ids(kept)
+
+
+def _block_ids(blocks: list[str]) -> list[int]:
+    """Episode ids whose headings survive in the kept blocks (in order)."""
+    ids = []
+    for b in blocks:
+        m = re.match(r"## Episode (\d+)", b)
+        if m:
+            ids.append(int(m.group(1)))
+    return ids
 
 
 def extraction_prompt(db: Database, episodes_text: str, date: str) -> str:
     entities = db.entity_names(limit=200)
     candidates = db.candidate_facts(limit=CANDIDATE_LIMIT)
+    clipped, _seen = clip_episodes(episodes_text)
     return EXTRACT_PROMPT.format(
         date=date,
-        episodes=clip_episodes(episodes_text),
+        episodes=clipped,
         entities=", ".join(entities) if entities else "(none yet)",
         candidates="\n".join(f"{f['id']}: {f['fact']}" for f in candidates)
         or "(none yet)",
@@ -199,6 +220,7 @@ def apply_extraction(db: Database, obj: dict, episode_ids: list[int],
     if allowed_ids is None:
         allowed_ids = candidate_ids(db, CANDIDATE_LIMIT)
     added, invalidated, duplicates = 0, 0, 0
+    added_dates: list[str] = []
     for item in obj.get("facts") or []:
         if added >= MAX_FACTS_PER_BATCH:
             break
@@ -217,10 +239,15 @@ def apply_extraction(db: Database, obj: dict, episode_ids: list[int],
         valid_at = _valid_date(item.get("valid_at"))
         db.add_fact(fact, names[:MAX_ENTITIES_PER_FACT], valid_at=valid_at,
                     episode_ids=episode_ids)
+        if valid_at:
+            added_dates.append(valid_at)
         added += 1
     ids = _allowed_invalidations(obj.get("invalidated_ids"), allowed_ids)
     if ids:
-        invalidated = db.invalidate_facts(ids)
+        # expired_at for the retired facts is the NEW knowledge's date, not
+        # now — and anything newer than it survives (see invalidate_facts).
+        superseded_at = max(added_dates) if added_dates else None
+        invalidated = db.invalidate_facts(ids, superseded_at=superseded_at)
     # Rotate the candidate window only now: selection has to stay stable across
     # candidate_ids() + extraction_prompt(), so the stamp happens once the
     # window has actually been used (db.candidate_facts).

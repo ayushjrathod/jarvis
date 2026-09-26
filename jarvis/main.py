@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import random
 import sys
 import threading
@@ -80,6 +81,11 @@ class Jarvis:
         self.barge_request = threading.Event()
         self.ptt_audio: asyncio.Queue = asyncio.Queue()
         self.pending_notices: list[str] = []
+        # Set while wake-mode phase-2 capture runs (after "hey jarvis", before
+        # endpointing): completion notices must not talk over the user
+        # answering. busy alone doesn't cover it — phase 2 holds no lock —
+        # and neither does the recorder (wake capture uses MicStream).
+        self._capture_busy = threading.Event()
 
     # -- startup ------------------------------------------------------------
 
@@ -270,6 +276,15 @@ class Jarvis:
 
     async def _flush_notices(self):
         while self.pending_notices:
+            # busy is HELD here (end of handle_utterance), so busyness means
+            # capture specifically: the user is already re-asking. Speaking
+            # now talks straight over the new utterance — leave the queue for
+            # the next quiet moment instead. Bounded upstream (notices_loop
+            # caps), so waiting cannot grow it here.
+            if self.recorder.is_recording() or self._capture_busy.is_set():
+                log.info("deferring %d notice(s) while capturing",
+                         len(self.pending_notices))
+                return
             if not await self.say(self.pending_notices.pop(0)):
                 # Barging in on notice 1 used to be followed instantly by
                 # notices 2 and 3, because say()'s result was discarded. An
@@ -284,11 +299,13 @@ class Jarvis:
     def _ptt_barge(self) -> bool:
         """PTT pressed while an interaction is in flight = explicit barge-in.
 
-        Stops playback (speak_sentences then cancels the in-flight dispatcher
-        call) so the new utterance isn't queued behind a long reply, AND
-        records the request in `barge_request` — player.interrupt alone is
-        erased by the next resume(), which is how a press during the STT
-        window used to be swallowed. Kept out of the on_press closure so it is
+        Stops playback and records the request in `barge_request` —
+        player.interrupt alone is erased by the next resume(), which is how a
+        press during the STT window used to be swallowed. The in-flight call
+        itself is cancelled at key RELEASE (see on_release), once the press
+        proves to be a real utterance and not a stray tap: cancelling on
+        key-down spent the run for a <250ms Right-Ctrl brush whose audio was
+        then discarded anyway. Kept out of the on_press closure so it is
         testable without a mic or a hotkey device.
         """
         if not self.busy.locked():
@@ -296,6 +313,20 @@ class Jarvis:
         self.barge_request.set()
         if self.player is not None:
             self.player.stop()
+        return True
+
+    def _cancel_inflight(self) -> bool:
+        """Cancel the in-flight dispatcher call from any thread. Key release
+        runs on the watcher thread, so run_coroutine_threadsafe is the seam;
+        a missing/closed loop reports False instead of raising — cancelling
+        must never fail capture."""
+        loop = getattr(self, "loop", None)
+        if loop is None:
+            return False
+        try:
+            asyncio.run_coroutine_threadsafe(self.brain.cancel(), loop)
+        except RuntimeError:
+            return False
         return True
 
     def _busy_for_wake(self) -> bool:
@@ -306,9 +337,11 @@ class Jarvis:
         the same microphone. So in --mode both (what mission-jarvis ships)
         holding PTT and saying "hey jarvis, …" had capture_after_wake answer
         the utterance, and the PTT release answered the same audio again.
-        2026-08-10.
+        2026-08-10. Wake phase-2 capture (2026-08-29) is the third leg: it
+        holds no lock and uses MicStream, not the Recorder.
         """
-        return self.busy.locked() or self.recorder.is_recording()
+        return (self.busy.locked() or self.recorder.is_recording()
+                or self._capture_busy.is_set())
 
     def start_ptt(self):
         """Hold-to-talk on `ptt_key`: press = listen, release = ask.
@@ -326,6 +359,15 @@ class Jarvis:
             audio = self.recorder.stop()
             if self.cfg.ptt_beep_ms > 0:  # lower tone = "got it, thinking"
                 play_beep_async(ms=self.cfg.ptt_beep_ms, freq=660.0)
+            if (len(audio) >= self.cfg.sample_rate // 4
+                    and self.busy.locked()):
+                # A REAL utterance released while a stale reply still runs:
+                # end it instead of queueing behind it. The cancel used to
+                # fire on key-DOWN, so a <250ms stray tap (Right-Ctrl is an
+                # ordinary modifier) destroyed the answer with the run already
+                # spent — while the tap audio itself was then discarded. Taps
+                # never reach here; the VAD barge covers mid-utterance stalls.
+                self._cancel_inflight()
             self.loop.call_soon_threadsafe(self.ptt_audio.put_nowait, audio)
 
         if self.cfg.ptt_key == self.cfg.trigger_key:
@@ -381,19 +423,30 @@ class Jarvis:
                 elif self.cfg.wake_beep_ms > 0:
                     play_beep_async(ms=self.cfg.wake_beep_ms)
 
-            return capture_after_wake(
-                mic.read, self.wake, self.vad, self.cfg,
-                prebuffer_frames=prebuffer_frames,
-                is_busy=self._busy_for_wake, on_busy=on_busy,
-                on_wake=on_wake,
-                # mic.read uses a ~1s timeout, so seconds-of-silence ≈ None count
-                none_limit=self.cfg.mic_lost_after_s,
-            )
+            # Phase-2 capture holds no lock, so mark it: completion notices
+            # check _busy_for_wake before speaking, and without this flag
+            # they talk over the user answering.
+            self._capture_busy.set()
+            try:
+                return capture_after_wake(
+                    mic.read, self.wake, self.vad, self.cfg,
+                    prebuffer_frames=prebuffer_frames,
+                    is_busy=self._busy_for_wake, on_busy=on_busy,
+                    on_wake=on_wake,
+                    # mic.read uses a ~1s timeout, so seconds-of-silence ≈ None count
+                    none_limit=self.cfg.mic_lost_after_s,
+                )
+            finally:
+                self._capture_busy.clear()
 
     async def notices_loop(self):
         async for ev in self.brain.notices():
             try:
-                if self.busy.locked():
+                # Capture-busyness, not just busy: a notice arriving while the
+                # user holds PTT or answers the wake word used to talk straight
+                # over them (both use `busy.locked()` paths that don't cover
+                # capture). Queued notices wait for the next quiet moment.
+                if self._busy_for_wake():
                     if len(self.pending_notices) >= MAX_PENDING_NOTICES:
                         # bounded on purpose: the newest completion is the one
                         # worth hearing, and the dashboard keeps them all
@@ -420,12 +473,20 @@ class Jarvis:
         while PTT is alive; it costs one default-executor thread for the life
         of the process, which is cheap next to a silently dead hotkey.
         2026-08-10.
+
+        The exit is os._exit, not an exception (2026-08-22): raising here only
+        worked in --mode ptt, where every other task finishes and gather lets
+        the error out. In --mode both — the mode the service actually runs —
+        wake_loop is parked in a blocking to_thread capture that never
+        returns, so gather() never completes, asyncio.run() then hangs joining
+        the non-daemon worker, and the process lives on deaf with systemd
+        reporting active. _exit skips cleanup (no finally, no log flush);
+        that is the price of actually dying, and dying is the whole job.
         """
         await asyncio.to_thread(watcher.join)
-        raise RuntimeError(
-            f"PTT hotkey watcher exited ({watcher.error or 'no error recorded'}); "
-            "exiting so systemd restarts us"
-        )
+        log.error("PTT hotkey watcher exited (%s); exiting so systemd restarts us",
+                  watcher.error or "no error recorded")
+        os._exit(1)
 
     async def run(self):
         self.loop = asyncio.get_running_loop()

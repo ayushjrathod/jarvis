@@ -33,6 +33,14 @@ export default function ConfirmBar({ lastEvent }) {
     );
   }, [lastEvent]);
 
+  // Answered anywhere else (a bare "yeah" by voice spends the id server-side
+  // and fires confirm_resolved): drop the row instead of offering Yes on a
+  // spent confirmation for the rest of its TTL.
+  useEffect(() => {
+    if (lastEvent?.event !== "confirm_resolved" || !lastEvent.confirm_id) return;
+    setPending((list) => list.filter((p) => p.confirm_id !== lastEvent.confirm_id));
+  }, [lastEvent]);
+
   // One timer for the whole bar rather than one per row: it only drives a
   // seconds countdown, and it stops entirely when nothing is pending.
   useEffect(() => {
@@ -61,7 +69,7 @@ export default function ConfirmBar({ lastEvent }) {
   if (!pending.length && !resolved) return null;
 
   return (
-    <div className="confirmbar">
+    <div className="confirmbar" role="alert">
       {pending.map((p) => (
         <div key={p.confirm_id} className="confirm-row">
           <span className="confirm-q">{p.speech || `Shall I ${p.description}?`}</span>

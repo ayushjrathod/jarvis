@@ -1,0 +1,143 @@
+"""T3 browser control, read-mostly — over the DevTools HTTP endpoints plus
+one stdlib-socket WebSocket client.
+
+No new dependency: /json/list enumerates targets and /json/activate/{id}
+switches to one (plain httpx), while Runtime.evaluate for page text rides
+`cdp.py` (handshake, masked frames, id-matched calls). The browser must run
+with --remote-debugging-port (default 9222); without it every call fails
+speakably and fast, never hanging the divert.
+
+Verbs live in the desktop safety plane (tabs reads, so allow;
+activate_tab switches context, so confirm; read_tab lands page text in
+model context, so confirm with quoted-data posture) — same policy, same
+confirm UX as window focus, which answers the same "switch to X" shape for
+OS windows. The parser keeps them apart with the tab qualifier: only
+sentences naming tabs reach this tier.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from . import cdp
+
+log = logging.getLogger("dispatcher.browser")
+
+DEFAULT_DEBUG_PORT = 9222
+TIMEOUT_S = 5.0
+
+
+class BrowserError(Exception):
+    pass
+
+
+def _base_url(cfg) -> str:
+    port = ((getattr(cfg, "browser", None) or {}).get("debug_port")
+            or DEFAULT_DEBUG_PORT)
+    return f"http://127.0.0.1:{port}"
+
+
+def _get(cfg, path: str, expect_json: bool = True):
+    import httpx
+    try:
+        r = httpx.get(_base_url(cfg) + path, timeout=TIMEOUT_S)
+    except Exception as e:
+        raise BrowserError(
+            "no debuggable browser — launch chromium with "
+            "--remote-debugging-port=9222") from e
+    if r.status_code != 200:
+        raise BrowserError(f"browser answered {r.status_code} for {path}")
+    if not expect_json:
+        return r.text
+    try:
+        return r.json()
+    except ValueError as e:
+        raise BrowserError("browser answered garbage") from e
+
+
+def list_tabs(cfg) -> list[dict]:
+    """[{id, title, url}] over open pages. Never raises — and stays quiet
+    about the ordinary case (no debuggable browser is a state, not an
+    incident worth a traceback on every listing)."""
+    try:
+        targets = _get(cfg, "/json/list")
+    except BrowserError as e:
+        log.warning("tab list failed: %s", e)
+        return []
+    out = []
+    for t in targets or []:
+        if not isinstance(t, dict) or t.get("type") != "page":
+            continue
+        title = (t.get("title") or "").strip() or "(untitled)"
+        out.append({"id": t.get("id", ""), "title": title,
+                    "url": t.get("url", "")})
+    return out
+
+
+def _match(tabs: list[dict], query: str) -> dict:
+    q = (query or "").strip().lower()
+    if not q:
+        raise BrowserError("which tab?")
+    hits = [t for t in tabs
+            if q in t["title"].lower() or q in t["url"].lower()]
+    if not hits:
+        raise BrowserError(f'no tab matching "{query}"')
+    if len(hits) > 1:
+        names = ", ".join(sorted({h["title"] for h in hits})[:5])
+        raise BrowserError(f"which tab? {names}")
+    return hits[0]
+
+
+def activate_tab(cfg, query: str) -> str:
+    """Switch to the tab whose title or URL best matches `query`."""
+    tabs = list_tabs(cfg)
+    if not tabs:
+        raise BrowserError("no browser tabs found (is it running debuggable?)")
+    hit = _match(tabs, query)
+    _get(cfg, f"/json/activate/{hit['id']}", expect_json=False)
+    return f'Switched to "{hit["title"]}".'
+
+
+READ_CHARS = 4000
+
+
+def read_tab(cfg, query: str) -> str:
+    """The visible text of the matching tab, clipped for quota. Page text
+    reaches the model, so callers treat it as untrusted input — never as
+    instructions (same posture as the notify gate's quoted data)."""
+    from . import cdp
+    tabs = list_tabs(cfg)
+    if not tabs:
+        raise BrowserError("no browser tabs found (is it running debuggable?)")
+    hit = _match(tabs, query)
+    ws_url = _ws_url(cfg, hit["id"])
+    try:
+        with cdp.CDPClient() as client:
+            client.connect(ws_url)
+            text = client.evaluate(
+                "document.body ? document.body.innerText : document.title")
+    except cdp.CDPError as e:
+        # Same honest-failure contract as every other tier: a dropped
+        # conversation is a speakable miss, never a 500.
+        raise BrowserError(f"could not read the tab: {e}") from e
+    text = " ".join((text or "").split())
+    if len(text) > READ_CHARS:
+        text = (text[:READ_CHARS].rsplit(" ", 1)[0]
+                + f"… [{len(text) - READ_CHARS} more chars omitted]")
+    return f'"{hit["title"]}": {text or "(no readable text)"}'
+
+
+def _ws_url(cfg, tab_id: str) -> str:
+    for t in _targets(cfg):
+        if t.get("id") == tab_id:
+            url = t.get("webSocketDebuggerUrl") or ""
+            if url.startswith("ws://"):
+                return url
+    raise BrowserError("tab went away before reading")
+
+
+def _targets(cfg) -> list:
+    targets = _get(cfg, "/json/list")
+    if not isinstance(targets, list):
+        raise BrowserError("browser answered garbage")
+    return targets

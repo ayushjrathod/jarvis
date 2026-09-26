@@ -127,7 +127,10 @@ async def _drive(svc, scans):
             raise asyncio.CancelledError
 
     with mock.patch.object(inbox, "scan", lambda d: pending.pop(0)), \
-         mock.patch("dispatcher.ingest.ingest_vault", return_value={}), \
+         mock.patch("dispatcher.ingest.ingest_vault",
+                    return_value={"files_scanned": 1, "files_changed": 1,
+                                  "added": 1, "deleted": 0, "dep_gated": 0,
+                                  "unsupported": 0, "unparseable": 0}), \
          mock.patch("dispatcher.embeddings.embed_missing", return_value={}), \
          mock.patch("dispatcher.notify.send_desktop",
                     new=mock.AsyncMock()) as send, \
@@ -284,6 +287,33 @@ class TestWatchSurvivesAwkwardConfig(unittest.IsolatedAsyncioTestCase):
         svc = _fake_svc(check_interval_s=1)
         await _drive(svc, [{}, {}])
         self.assertEqual(svc.sleeps[0], 5)
+
+
+class TestArrivalSummary(unittest.TestCase):
+    """Finding 2.8: the notice was derived from the arrival list, never the
+    reindex — a contract.docx/csv/eml that indexed nothing was still
+    celebrated, and a raised reindex still notified success."""
+
+    def test_success_names_the_file(self):
+        s = inbox.arrival_summary(["report.pdf"], {"added": 3})
+        self.assertIn("report.pdf", s)
+        self.assertIn("searchable now", s)
+
+    def test_success_counts_many(self):
+        s = inbox.arrival_summary(["a.pdf", "b.pdf"], {"added": 5})
+        self.assertIn("2 files", s)
+
+    def test_unsupported_formats_are_named_not_celebrated(self):
+        s = inbox.arrival_summary(
+            ["contract.docx", "expenses.csv", "thread.eml"],
+            {"added": 0, "unsupported": 2, "dep_gated": 1, "unparseable": 0})
+        self.assertNotIn("searchable now", s)
+        self.assertIn("unsupported", s)
+
+    def test_raised_reindex_reports_failure(self):
+        s = inbox.arrival_summary(["report.pdf"], None)
+        self.assertIn("Couldn't index", s)
+        self.assertIn("retry", s)
 
 
 if __name__ == "__main__":

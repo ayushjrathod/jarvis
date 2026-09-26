@@ -8,7 +8,12 @@ from dispatcher import offline
 
 
 def _tokens(text) -> set:
-    return set(re.findall(r"[a-z0-9']+", (text or "").lower()))
+    # Models FTS5's unicode61 tokenizer, which SPLITS on the apostrophe:
+    # "what's" is indexed (and queried) as {what, s}, never as one token.
+    # The old `[a-z0-9']+` kept it whole — the opposite of the real index —
+    # which is why this file passed while contractions anchored everything
+    # in production (fixed 2026-08-19).
+    return set(re.findall(r"[a-z0-9]+", (text or "").lower()))
 
 
 def _row_tokens(row: dict) -> set:
@@ -91,6 +96,11 @@ ENTRY = {"file_path": "vault/notes/neovim.md", "heading": "Editors",
          "raw": "The preferred editor is Neovim, configured with lazy.nvim."}
 EPISODE = {"assistant_text": "You set the editor to Neovim last month.",
            "valid_at": "2026-07-20T10:00:00+00:00"}
+# Briefs and episodes are Claude prose, i.e. full of contractions — the live
+# index the swallow anchored on looked like this, not like ENTRY.
+CHATTY_EPISODE = {"assistant_text": "So what's next? I don't think there's "
+                  "anything urgent — can't see a reason to hurry.",
+                  "valid_at": "2026-08-01T10:00:00+00:00"}
 
 
 class TestSearchMemory(unittest.TestCase):
@@ -168,6 +178,29 @@ class TestSearchMemory(unittest.TestCase):
         self.assertEqual(
             offline.search_memory({}, db, _Emb(on=True), "what is it"), [])
         self.assertEqual(db.probes, [])
+
+    def test_contractions_do_not_anchor(self):
+        # Finding 1.5, asked the way a person asks it: the old charset kept
+        # the apostrophe, so "what's" survived as a content word while "what"
+        # is a stopword — and FTS5 splits on the apostrophe, so the probe
+        # matched any chunk containing "what's". Against a contraction-full
+        # corpus the old code quoted three unrelated briefs as "what I already
+        # have on it"; the new code splits the way FTS5 does and the swallow
+        # gets nothing.
+        db = _Db([ENTRY], [EPISODE, CHATTY_EPISODE])
+        hits = offline.search_memory(
+            {}, db, _Emb(on=True),
+            "what's the airspeed velocity of a laden swallow?")
+        self.assertEqual(hits, [])
+        self.assertNotIn("what's", db.probes)
+
+    def test_contraction_question_still_anchors_real_terms(self):
+        # ...while a real question phrased with "what's" still finds Neovim:
+        # what's -> what is dropped, preferred/editor survive and match.
+        db = _Db([ENTRY], [EPISODE])
+        hits = offline.search_memory({}, db, _Emb(), "what's my preferred editor")
+        self.assertTrue(hits)
+        self.assertIn("Neovim", hits[0]["text"])
 
     def test_anchor_probes_are_capped(self):
         # any() short-circuits on a hit; a total miss must still not fan out

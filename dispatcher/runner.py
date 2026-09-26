@@ -61,16 +61,23 @@ def wrote_declared_output(task_text: str, root, since: float) -> bool | None:
     """Did a prompt that names an output file ("write it to vault/briefs/x.md")
     actually produce it during this run? None when the prompt names no file.
 
-    mtime, not mere existence: re-running a brief on a day whose file already
-    exists must not mask a denial that stopped it being refreshed."""
-    m = OUTPUT_PATH_RE.search(task_text)
-    if not m:
+    ANY named file, not the first: the consolidation prompt names its INPUT
+    (data/consolidation/<stamp>.md, written before submit so its mtime always
+    predates the run) in step 1 and its outputs later — first-match made this
+    permanently False for that task type, so one harmless denial force-failed
+    a good run, rolled the episodes back, and re-ran the same batch every
+    night. mtime, not mere existence: re-running a brief on a day whose file
+    already exists must not mask a denial that stopped it being refreshed."""
+    paths = [m.group(0) for m in OUTPUT_PATH_RE.finditer(task_text)]
+    if not paths:
         return None
-    p = Path(root) / m.group(0)
-    try:
-        return p.stat().st_mtime >= since
-    except OSError:
-        return False
+    for rel in paths:
+        try:
+            if (Path(root) / rel).stat().st_mtime >= since:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 # Whitelist for the one-time transient retry below: a spawn error (CLI binary
@@ -85,6 +92,32 @@ async def run_once(text: str, cfg: Config, model: str | None, tools: list[str],
                    resume_session_id: str | None = None,
                    max_cost_usd: float | None = None,
                    on_step=None) -> dict:
+    """One `claude -p` attempt (with one internal retry on a transient
+    spawn/timeout error). Returns normalized result fields incl. `steps`.
+    resume_session_id continues an earlier CLI session (reflection forks ride
+    the warm prompt cache); max_cost_usd overrides the default budget cap;
+    on_step is an async callback fired per timeline step as it happens. Never
+    raises (except CancelledError, which is BaseException and always
+    propagates): an unexpected crash inside _attempt used to skip finish_run
+    entirely, stranding the run row `running` forever while the task read
+    failed with no diagnosis. A crash is a failed result with the traceback
+    in the error, not an exception."""
+    try:
+        return await _run_with_retry(
+            text, cfg, model, tools, procs, task_id,
+            system_extra, resume_session_id, max_cost_usd, on_step)
+    except Exception as e:
+        log.exception("run_once crashed for task %s", task_id)
+        return {"status": "failed",
+                "error": f"internal error: {type(e).__name__}: {e}"}
+
+
+async def _run_with_retry(text: str, cfg: Config, model: str | None,
+                          tools: list[str],
+                          procs: dict, task_id: str, system_extra: str = "",
+                          resume_session_id: str | None = None,
+                          max_cost_usd: float | None = None,
+                          on_step=None) -> dict:
     """One `claude -p` attempt (with one internal retry on a transient
     spawn/timeout error). Returns normalized result fields incl. `steps`.
     resume_session_id continues an earlier CLI session (reflection forks ride

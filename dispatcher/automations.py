@@ -23,6 +23,18 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 log = logging.getLogger("dispatcher.automations")
 
+DEFAULT_CHECK_INTERVAL_S = 30
+
+
+def check_interval_s(acfg) -> int:
+    """Seconds between due-row polls. `or DEFAULT`, not `.get(key, DEFAULT)`
+    (the inbox learned this 2026-08-08): a bare `check_interval_s:` parses as
+    None, and `asyncio.sleep(None)` is a TypeError raised outside the loop's
+    try on a fire-and-forget task — one blank config line killed the whole
+    scheduler forever. Floored at 5 like the inbox: 0 means an 81k-query
+    busy-spin, not 'as fast as possible'."""
+    return max(5, (acfg or {}).get("check_interval_s") or DEFAULT_CHECK_INTERVAL_S)
+
 _ZONE = None
 
 
@@ -62,6 +74,10 @@ KINDS = ("daily", "weekly", "interval", "once")
 WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
             "Saturday", "Sunday")
 MIN_INTERVAL_MINUTES = 5
+# ...and a ceiling: above a day the daily/weekly kinds are the honest shape,
+# and a 10^9-minute typo would otherwise schedule silence until the heat death
+# of the universe while reporting success.
+MAX_INTERVAL_MINUTES = 7 * 24 * 60
 TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
 
 # Conservative on purpose: a false divert turns a question into an unwanted
@@ -224,6 +240,9 @@ def validate_spec(spec: dict) -> dict:
         iv = spec.get("interval_minutes")
         if not isinstance(iv, int) or iv < MIN_INTERVAL_MINUTES:
             raise ValueError(f"interval needs interval_minutes >= {MIN_INTERVAL_MINUTES}")
+        if iv > MAX_INTERVAL_MINUTES:
+            raise ValueError(f"interval over {MAX_INTERVAL_MINUTES} minutes "
+                             "is a daily/weekly schedule, not an interval")
         out["interval_minutes"] = iv
     if kind == "once":
         try:
@@ -315,7 +334,7 @@ async def loop(svc):
     """Poll due rows into the dispatch path. One bad automation or one bad
     check never kills the loop."""
     from .db import now as db_now
-    interval = (getattr(svc.cfg, "automations", None) or {}).get("check_interval_s", 30)
+    interval = check_interval_s(getattr(svc.cfg, "automations", None))
     log.info("automations scheduler up (checking every %ss)", interval)
     while True:
         try:

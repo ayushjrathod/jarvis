@@ -12,12 +12,13 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import (automations, desktop, embeddings, graph, limits, memory, notify,
-               offline, quick, reflection, runner, spotify, telemetry)
+from . import (automations, browser, desktop, embeddings, graph, limits,
+               memory, notify, offline, quick, reflection, runner, spotify,
+               telemetry)
 from .areas import AreaRegistry
 from .classifier import classify
 from .config import Config
-from .db import Database
+from .db import Database, local_today
 from .events import EventBus
 from .hooks import HookRegistry
 
@@ -91,10 +92,14 @@ def make_ack(text: str) -> str:
 
 
 # Metadata keys an UNtrusted caller must never be able to widen with: granting
-# tools or injecting a resume session. max_cost_usd is clamped (not dropped) so
-# an external caller can still narrow the budget. Internal server spawns pass
-# trusted=True and keep all three (they legitimately set them).
-_TRUSTED_ONLY_META_KEYS = ("allowed_tools", "resume_session_id")
+# tools, injecting a resume session, or naming episodes. max_cost_usd is
+# clamped (not dropped) so an external caller can still narrow the budget.
+# Internal server spawns pass trusted=True and keep all four (they
+# legitimately set them). `episode_ids` joined this list 2026-08-06: the key
+# names the batch a FAILED consolidation returns to the pool, and anyone
+# reaching POST /task could previously hand any failing task a set of ids to
+# resurrect — persisting across restarts via the startup sweep.
+_TRUSTED_ONLY_META_KEYS = ("allowed_tools", "resume_session_id", "episode_ids")
 
 # `simulate_refusal` forces the refusal fallback, i.e. a SECOND run of the same
 # task on models.fallback (an Opus). It is a test seam, but it sat outside the
@@ -369,10 +374,16 @@ class Service:
         final = "done" if divert.get("ok") else "failed"
         # Caller metadata (automations.fire passes automation_id/notify) is
         # kept: dropping it silently broke the task->automation link on the row.
+        # But it crosses UNsanitized no longer: queue-file frontmatter used to
+        # reach create_task marked trusted, the one place an untrusted dict
+        # crossed the boundary as trusted. trusted=False still keeps
+        # automation_id/notify (not in the drop list) while stripping anything
+        # a caller must never set; task_type/divert are assigned after the
+        # merge below, so a forged task_type cannot survive either.
         meta = {**(metadata or {}),
                 "task_type": "divert", "divert": divert["kind"]}
         task = await self.create_task(text, source, "quick", None, meta,
-                                      trusted=True)
+                                      trusted=False)
         self.db.set_task_status(task["id"], final)
         await self.fire(final, task, speech=divert["speech"],
                         divert=divert["kind"], cost_usd=0.0)
@@ -691,6 +702,20 @@ class Service:
             meta = {}
         if (meta or {}).get("task_type") != "memory-consolidate":
             return
+        # Only the timer's own consolidation may return episodes. task_type and
+        # episode_ids are caller-settable on the wire (episode_ids is stripped
+        # for untrusted callers now, but rows predate the fix and defense
+        # belongs at the use site too): without the source gate, any failing
+        # task claiming to be a consolidation resurrected arbitrary episodes.
+        source = task.get("source")
+        if source is None:
+            try:
+                row = self.db.get_task(task["id"]) or {}
+                source = row.get("source")
+            except Exception:
+                source = None
+        if source != "timer":
+            return
         ids = (meta or {}).get("episode_ids")
         if not ids:
             return
@@ -747,31 +772,51 @@ class Service:
         for attempt, model in attempts:
             label = model or "cli-default"
             run_id = self.db.create_run(task["id"], attempt, label)
-            if simulate and attempt == 1:
-                result = {"status": "refused", "stop_reason": "refusal",
-                          "error": "simulated refusal (metadata.simulate_refusal)"}
-            else:
-                result = await runner.run_once(
-                    task["text"], self.cfg, model, tools, self.procs, task["id"],
-                    system_extra=system_extra,
-                    resume_session_id=meta.get("resume_session_id"),
-                    max_cost_usd=meta.get("max_cost_usd"),
-                    on_step=on_step,
+            # Finding 2.3: run_id is local, so anything escaping between here
+            # and finish_run left runs.status='running' forever while the task
+            # read failed with no diagnosis (real trigger: one stream-json
+            # line over runner.STREAM_LIMIT raises ValueError out of the
+            # readline). run_once never raises anymore, but the books close
+            # HERE regardless — a run row is a fact about an attempt that
+            # started, and it always gets an ending.
+            settled = False
+            try:
+                if simulate and attempt == 1:
+                    result = {"status": "refused", "stop_reason": "refusal",
+                              "error": "simulated refusal (metadata.simulate_refusal)"}
+                else:
+                    result = await runner.run_once(
+                        task["text"], self.cfg, model, tools, self.procs, task["id"],
+                        system_extra=system_extra,
+                        resume_session_id=meta.get("resume_session_id"),
+                        max_cost_usd=meta.get("max_cost_usd"),
+                        on_step=on_step,
+                    )
+                # cancel() may have killed the subprocess and closed the books
+                # while run_once was returning; don't overwrite 'cancelled'
+                # with 'failed' (cancel_open_runs already settled this row).
+                current = self.db.get_task(task["id"])
+                if current and current["status"] == "cancelled":
+                    settled = True
+                    return
+                output_path = runner.guess_output_path(task["text"], self.cfg.root)
+                self.db.finish_run(
+                    run_id, result["status"],
+                    stop_reason=result.get("stop_reason"), cost_usd=result.get("cost_usd"),
+                    input_tokens=result.get("input_tokens"), output_tokens=result.get("output_tokens"),
+                    num_turns=result.get("num_turns"), session_id=result.get("session_id"),
+                    output_text=result.get("output_text"), error=result.get("error"),
+                    output_path=output_path,
                 )
-            # cancel() may have killed the subprocess and closed the books while
-            # run_once was returning; don't overwrite 'cancelled' with 'failed'
-            current = self.db.get_task(task["id"])
-            if current and current["status"] == "cancelled":
-                return
-            output_path = runner.guess_output_path(task["text"], self.cfg.root)
-            self.db.finish_run(
-                run_id, result["status"],
-                stop_reason=result.get("stop_reason"), cost_usd=result.get("cost_usd"),
-                input_tokens=result.get("input_tokens"), output_tokens=result.get("output_tokens"),
-                num_turns=result.get("num_turns"), session_id=result.get("session_id"),
-                output_text=result.get("output_text"), error=result.get("error"),
-                output_path=output_path,
-            )
+                settled = True
+            finally:
+                if not settled:
+                    try:
+                        self.db.finish_run(run_id, "failed",
+                                           error="internal error: attempt crashed "
+                                                 "before settling")
+                    except Exception:
+                        log.exception("run settle failed for run %s", run_id)
             try:
                 self.db.add_run_steps(run_id, result.get("steps") or [])
             except Exception:
@@ -1079,9 +1124,33 @@ class Service:
             log.info("desktop: %s awaiting confirmation (%s)", intent.verb, cid)
             return {"status": "needs_confirmation", "confirm_id": cid,
                     "speech": speech}
-        speech = await asyncio.to_thread(desktop.run_intent, intent)
+        # run_intent_ok, not run_intent: the executor never raises, so the
+        # sentence alone cannot tell success from failure — and a failed
+        # launch ("open tasks" parsed as launch 'tasks') used to settle done.
+        if intent.verb in ("tabs", "activate_tab", "read_tab"):
+            ok, speech = await asyncio.to_thread(self._run_browser_intent, intent)
+        else:
+            ok, speech = await asyncio.to_thread(desktop.run_intent_ok, intent)
         log.info("desktop: ran %s -> %s", intent.verb, speech[:80])
-        return {"status": "done", "speech": speech}
+        return {"status": "done" if ok else "failed", "speech": speech}
+
+    def _run_browser_intent(self, intent) -> tuple[bool, str]:
+        """Browser-tier verbs need the debug port from config, which the
+        desktop executor signature doesn't carry — so they run here, with the
+        same (acted, sentence) contract as run_intent_ok."""
+        try:
+            if intent.verb == "tabs":
+                tabs = browser.list_tabs(self.cfg)
+                if not tabs:
+                    return True, ("No browser tabs found — launch chromium "
+                                  "with --remote-debugging-port=9222.")
+                return True, ("Open tabs: " + "; ".join(
+                    f'{t["title"]}' for t in tabs))
+            if intent.verb == "read_tab":
+                return True, browser.read_tab(self.cfg, intent.arg)
+            return True, browser.activate_tab(self.cfg, intent.arg)
+        except browser.BrowserError as e:
+            return False, f"Sorry — {e}."
 
     async def confirm_desktop(self, confirm_id: str, approve: bool) -> dict:
         """Answer a parked desktop confirmation. Unknown/expired ids are
@@ -1093,10 +1162,23 @@ class Service:
                     "speech": "That request already expired."}
         if not approve:
             log.info("desktop: user declined %s", entry["intent"].verb)
-            return {"status": "declined", "speech": "Okay, skipping it."}
-        speech = await asyncio.to_thread(desktop.run_intent, entry["intent"])
+            await self.hooks.fire({"event": "confirm_resolved",
+                                   "confirm_id": confirm_id, "approved": False})
+            return {"status": "declined",
+                    "speech": "Okay, skipping it."}
+        if entry["intent"].verb in ("tabs", "activate_tab", "read_tab"):
+            ok, speech = await asyncio.to_thread(
+                self._run_browser_intent, entry["intent"])
+        else:
+            ok, speech = await asyncio.to_thread(desktop.run_intent_ok, entry["intent"])
         log.info("desktop: confirmed %s -> %s", entry["intent"].verb, speech[:80])
-        return {"status": "done", "speech": speech}
+        # A voice "yeah" spends the id, but the dashboard banner only removes
+        # rows it answers itself or that time out — without this event it kept
+        # offering Yes on the spent id for the full TTL (same shape as the
+        # 2026-08-11 stale-banner fix, reached by the other channel).
+        await self.hooks.fire({"event": "confirm_resolved",
+                               "confirm_id": confirm_id, "approved": True})
+        return {"status": "done" if ok else "failed", "speech": speech}
 
     def _expire_desktop_confirms(self):
         now = time.monotonic()
@@ -1125,7 +1207,10 @@ class Service:
         return bool((self.cfg.memory.get("graph") or {}).get("enabled"))
 
     def _today(self) -> str:
-        return datetime.now(timezone.utc).date().isoformat()
+        # Local wall clock, like db.local_today: the UTC version told the
+        # extractor and the reconciler yesterday at +5:30, same family as the
+        # consolidation {{DATE}} fix.
+        return local_today()
 
     async def graph_extract(self, episodes_text: str,
                             episode_ids: list[int]) -> dict | None:
@@ -1133,8 +1218,14 @@ class Service:
         JSON call, deterministic apply (graph.py). None = parse failure —
         the export file is still on disk for a manual replay."""
         candidates = graph.candidate_ids(self.db)  # the exact set the prompt shows
+        # Clip once HERE: the extractor only ever sees the clipped text, so
+        # only the surviving ids may be marked extracted or linked to facts.
+        # Marking the full list orphaned ~178 of 200 episodes past the budget
+        # on every backlog. extraction_prompt re-clips internally, which is a
+        # no-op on already-clipped text (no double warning).
+        clipped, seen = graph.clip_episodes(episodes_text)
         task = await self.create_task(
-            graph.extraction_prompt(self.db, episodes_text, self._today()),
+            graph.extraction_prompt(self.db, clipped, self._today()),
             "graph-extract", "quick", None, {"task_type": "graph-extract"},
             trusted=True)
         reply, status = await self._collect_quick(task)
@@ -1142,7 +1233,7 @@ class Service:
             if status != "done":
                 raise ValueError(f"extract task status {status}")
             counts = graph.apply_extraction(
-                self.db, graph.parse_reply(reply), episode_ids,
+                self.db, graph.parse_reply(reply), seen,
                 allowed_ids=candidates)
         except ValueError as e:
             log.warning("graph extraction failed: %s", e)
@@ -1151,7 +1242,7 @@ class Service:
         # rate-limited run leaves the episodes unmarked so the next pass
         # retries them, which is the same fail-toward-retry direction
         # `mark_episodes_unconsolidated` takes for the consolidation half.
-        self.db.mark_episodes_graph_extracted(episode_ids)
+        self.db.mark_episodes_graph_extracted(seen)
         await self.hooks.fire({"event": "graph", **counts})
         log.info("graph extraction: %s", counts)
         return counts

@@ -95,12 +95,19 @@ async def _ingest_one(f, service, processed, failed, retries: dict, max_retries:
             pass
 
 
-def parse_task_file(text: str) -> tuple[dict, str]:
+def parse_task_file(text: str, *, strict: bool = False) -> tuple[dict, str]:
+    """Split `---` frontmatter off a markdown file. Tolerant by default: no
+    frontmatter (or a non-mapping one) yields ({}, stripped text), so one
+    hand-mangled task file never takes out a queue scan or a brief. strict=True
+    raises ValueError on a non-mapping frontmatter instead — for AREA
+    manifests, where silently loading a neutered skill would be worse."""
     if text.startswith("---"):
         parts = text.split("---", 2)
         if len(parts) == 3:
             meta = yaml.safe_load(parts[1]) or {}
             if not isinstance(meta, dict):
+                if strict:
+                    raise ValueError("frontmatter is not a mapping")
                 meta = {}
             return meta, parts[2].strip()
     return {}, text.strip()

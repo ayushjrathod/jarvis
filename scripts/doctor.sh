@@ -187,7 +187,43 @@ for f in "${timers[@]}"; do
   else
     warn "$t.timer not enabled"
   fi
+  # Enabled is not healthy: a timer whose service failed last run still shows
+  # enabled while the job silently never succeeds. systemctl show reads the
+  # last-run result without journalctl spelunking.
+  last=$(systemctl --user show "$t" -p ExecMainStatus --value 2>/dev/null || echo "?")
+  if [ "$last" = "0" ] || [ -z "$last" ]; then
+    : # ok/never-ran: the enabled line above already spoke
+  elif [ "$last" = "?" ]; then
+    warn "could not read last result for $t (service may never have run)"
+  else
+    bad "$t last run exited $last — journalctl --user -u $t"
+  fi
 done
+
+hdr "─── voice units (jarvis + dictate) ───"
+# doctor never looked at these, and they are the two units whose silence is
+# invisible: nothing else tells you the assistant has gone deaf.
+for u in mission-jarvis mission-dictate; do
+  if systemctl --user is-active --quiet "$u" 2>/dev/null; then
+    ok "$u.service active"
+  else
+    bad "$u.service not active — hotkey capture may be down"
+  fi
+done
+
+hdr "─── backups ───"
+# A backup system nobody looks at is a hope, not a system. Fresh = written in
+# the last 36h (nightly at 03:30 plus catch-up slack); verified = the writer
+# script checks integrity + table parity since 2026-08-24, so presence plus
+# freshness is the whole check here.
+latest=$(ls -t data/backups/mission-[0-9]*.db 2>/dev/null | head -1 || true)
+if [ -z "$latest" ]; then
+  bad "no dated backups in data/backups/ — has mission-backup.timer ever fired?"
+elif [ -n "$(find "$latest" -mmin +2160 -print 2>/dev/null)" ]; then
+  warn "latest backup $latest is older than 36h"
+else
+  ok "latest backup $latest ($(du -h "$latest" | cut -f1))"
+fi
 
 echo
 echo "Done. ✓ = fine, ! = check when convenient, ✗ = likely broken."

@@ -12,13 +12,13 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
-
-import yaml
 
 from .areas import AreaRegistry
 from .config import Config
-from .db import Database, now
+from .db import Database, local_today, now
+from .queue_watcher import parse_task_file
 
 log = logging.getLogger("dispatcher.memory")
 
@@ -159,6 +159,26 @@ def _write_new(path: Path, text: str, tries: int = 50) -> Path:
     return path
 
 
+def _prune_exports(directory: Path, days: int = 30) -> int:
+    """Delete consolidation exports older than `days`. The audit trail stays
+    useful for a month of manual replays; past that it is disk usage with a
+    story. Best-effort and quiet — a prune must never fail a consolidation."""
+    cutoff = time.time() - days * 86400
+    pruned = 0
+    try:
+        files = sorted(directory.glob("*.md"))
+    except OSError:
+        return 0
+    for p in files:
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+                pruned += 1
+        except OSError:
+            continue
+    return pruned
+
+
 def render_episodes(episodes: list[dict]) -> str:
     """The markdown the consolidation agent and the graph extractor both read.
 
@@ -191,6 +211,7 @@ def build_consolidation(cfg: Config, db: Database) -> dict | None:
     stamp = now().replace(":", "").replace("+0000", "Z")
     export = cfg.root / "data" / "consolidation" / f"{stamp}.md"
     export.parent.mkdir(parents=True, exist_ok=True)
+    _prune_exports(export.parent)
     # Exclusive create, uniquified on collision (2026-08-10). `stamp` has
     # one-second resolution and write_text overwrites, so two /memory/consolidate
     # calls landing in the same second both built a job and the second export
@@ -201,15 +222,11 @@ def build_consolidation(cfg: Config, db: Database) -> dict | None:
     export = _write_new(export, render_episodes(episodes))
 
     prompt_path = cfg.root / "areas" / "memory" / "agents" / "consolidate.md"
-    text = prompt_path.read_text()
-    meta = {}
-    if text.startswith("---"):
-        parts = text.split("---", 2)
-        if len(parts) == 3:
-            meta = yaml.safe_load(parts[1]) or {}
-            text = parts[2].strip()
+    # Same single frontmatter reader as areas and run_agent (parse_task_file):
+    # body for the prompt here, grants via AreaRegistry per the H2 comment.
+    meta, text = parse_task_file(prompt_path.read_text())
     rel = str(export.relative_to(cfg.root))
-    text = text.replace("{{EPISODES_FILE}}", rel).replace("{{DATE}}", now()[:10])
+    text = text.replace("{{EPISODES_FILE}}", rel).replace("{{DATE}}", local_today())
 
     # Grants come through AreaRegistry, NOT from the frontmatter we just parsed
     # for the body (H2). This task is submitted trusted=True, so an unsanitized

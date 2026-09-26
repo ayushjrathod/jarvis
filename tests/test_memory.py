@@ -22,6 +22,22 @@ def make_cfg(root: Path, **mem) -> Config:
 
 
 class TestChunking(unittest.TestCase):
+    def test_fenced_code_comments_are_not_headings(self):
+        # A ```bash block containing "# install the thing" used to register
+        # as a level-1 heading, evicting the real stack — every later chunk
+        # carried the comment as ancestry (finding 2.8).
+        text = ("# Real\nbody one\n\n```bash\n# install the thing\n"
+                "sudo pacman -S x\n```\n\nbody two\n")
+        chunks = chunk_markdown("vault/notes/a.md", text)
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]["heading"], "Real")
+        self.assertIn("# install the thing", chunks[0]["compiled"])
+        # unclosed fence: rest of file is code, no phantom headings either
+        text2 = "# Real\nbody\n\n```\n# not a heading\nmore\n"
+        chunks2 = chunk_markdown("f.md", text2)
+        self.assertEqual(len(chunks2), 1)
+        self.assertEqual(chunks2[0]["heading"], "Real")
+
     def test_heading_ancestry(self):
         text = "intro line\n\n# Top\nbody one\n\n## Sub\nbody two\n\n# Other\nbody three\n"
         chunks = chunk_markdown("vault/notes/a.md", text)
@@ -128,6 +144,86 @@ class TestIngest(unittest.TestCase):
         self.assertEqual(stats["deleted"], 1)
         self.assertEqual(self.db.search_entries("content"), [])
         self.assertEqual(self.db.vault_file_mtimes(), {})
+
+    def test_natural_language_question_reaches_bm25(self):
+        # Finding 1.4: FTS5 implicit AND demanded every token — stopwords
+        # included — in one chunk, so search_entries returned 0 rows for any
+        # NL question and hybrid search was pure KNN. AND-first still wins
+        # where it hits; the OR leg only fires on a miss.
+        self.write("vault/memory/USER.md",
+                   "<!-- editor note -->\n\n## Tools\nMy preferred coding tool is Neovim.\n")
+        ingest.ingest_vault(self.db, self.root, ["vault"])
+        hits = self.db.search_entries("what is my preferred coding tool?")
+        self.assertTrue(any("Neovim" in h["raw"] for h in hits), hits)
+        # ...and exact-phrase behavior is unchanged where AND hits.
+        exact = self.db.search_entries("preferred coding tool Neovim")
+        self.assertTrue(exact)
+
+    def test_natural_language_question_reaches_episodes(self):
+        self.db.add_episode(None, "voice", "quick", None, "done",
+                            "remind me to water the plants",
+                            "Done, watering the fern every morning.")
+        hits = self.db.search_episodes("when do I water the plants?")
+        self.assertTrue(any("fern" in (h["user_text"] + h["assistant_text"])
+                            for h in hits), hits)
+
+    def test_episode_before_filter_is_inclusive_of_today(self):
+        # Finding 2.6: valid_at is a full ISO timestamp string-compared
+        # against a bare date, so before=<today> silently dropped today's
+        # episodes while keeping today's notes.
+        from datetime import date
+        self.db.add_episode(None, "voice", "quick", None, "done",
+                            "water the fern", "watering the fern done")
+        today = date.today().isoformat()
+        hits = self.db.search_episodes("fern", before=today)
+        self.assertTrue(any("fern" in (h["user_text"] + h["assistant_text"])
+                            for h in hits), hits)
+        hits = self.db.search_episodes("fern", after=today)
+        self.assertTrue(hits)
+
+    def test_old_consolidation_exports_are_pruned(self):
+        from dispatcher.memory import _prune_exports
+        import time as _time
+        d = Path(self.tmp.name) / "data" / "consolidation"
+        d.mkdir(parents=True)
+        old = d / "2020-01-01T000000Z.md"
+        new = d / "export.md"
+        old.write_text("old")
+        new.write_text("new")
+        ancient = _time.time() - 40 * 86400
+        import os as _os
+        _os.utime(old, (ancient, ancient))
+        self.assertEqual(_prune_exports(d), 1)
+        self.assertFalse(old.exists())
+        self.assertTrue(new.exists())
+
+    def test_unsupported_formats_are_counted_not_celebrated(self):
+        # .csv/.eml have no chunker and were silently nobody's stat — while
+        # the inbox announced them searchable.
+        self.write("vault/inbox/expenses.csv", "a,b\n1,2\n")
+        self.write("vault/inbox/thread.eml", "Subject: hi\n")
+        stats = ingest.ingest_vault(self.db, self.root, ["vault"])
+        self.assertEqual(stats["unsupported"], 2)
+        self.assertEqual(stats["files_scanned"], 0)
+        self.assertEqual(stats["added"], 0)
+
+    def test_corrupt_file_records_mtime_and_stops_billing(self):
+        # A chunker that raises used to leave the mtime unrecorded, so the
+        # file re-paid full parsing on every reindex forever (up to 10 OCR
+        # pages per inbox arrival). Now the mtime is recorded with zero
+        # chunks: skipped until touched again.
+        def boom(rel, p):
+            raise RuntimeError("corrupt")
+
+        self.write("vault/inbox/scan.pdf", "%PDF-garbage")
+        with mock.patch.dict(ingest.CHUNKERS, {".pdf": boom}):
+            stats = ingest.ingest_vault(self.db, self.root, ["vault"])
+        self.assertEqual(stats["unparseable"], 1)
+        self.assertIn("vault/inbox/scan.pdf", self.db.vault_file_mtimes())
+        with mock.patch.dict(ingest.CHUNKERS, {".pdf": boom}):
+            again = ingest.ingest_vault(self.db, self.root, ["vault"])
+        self.assertEqual(again["files_changed"], 0)
+        self.assertEqual(again["unparseable"], 0)
 
     def test_hidden_files_skipped(self):
         self.write("vault/.obsidian/cache.md", "# H\nsecret\n")

@@ -55,6 +55,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import windows as _windows
+
 log = logging.getLogger("dispatcher.desktop")
 
 SINK = "@DEFAULT_AUDIO_SINK@"
@@ -66,9 +68,12 @@ LAUNCH_SETTLE_S = 2.0    # how long we wait to see a launched app show up
 LAUNCH_POLL_S = 0.1
 
 # Verbs that only read state. Everything else changes something.
-READ_VERBS = frozenset({"status", "clipboard_get"})
+# (read_tab is NOT here: page text lands in model context, so it confirms
+# like open — a page is third-party input, not local state.)
+READ_VERBS = frozenset({"status", "clipboard_get", "windows", "tabs"})
 ALL_VERBS = READ_VERBS | frozenset(
-    {"volume", "mute", "lock", "launch", "open", "clipboard_set"})
+    {"volume", "mute", "lock", "launch", "open", "clipboard_set", "focus",
+     "activate_tab", "read_tab"})
 
 # See the module docstring for why these are the defaults.
 DEFAULT_POLICY = {
@@ -78,8 +83,13 @@ DEFAULT_POLICY = {
     "lock": "allow",
     "launch": "allow",
     "clipboard_set": "allow",
+    "windows": "allow",
+    "tabs": "allow",
     "clipboard_get": "confirm",
     "open": "confirm",
+    "focus": "confirm",
+    "activate_tab": "confirm",
+    "read_tab": "confirm",
 }
 
 OPEN_SCHEMES = frozenset({"http", "https", "file", ""})
@@ -113,6 +123,16 @@ class Intent:
             return f"turn the system volume {'up' if self.delta > 0 else 'down'}"
         if self.verb == "mute":
             return {True: "mute", False: "unmute", None: "toggle mute"}[self.on]
+        if self.verb == "windows":
+            return "list open windows"
+        if self.verb == "focus":
+            return f'focus "{self.arg}"'
+        if self.verb == "tabs":
+            return "list browser tabs"
+        if self.verb == "activate_tab":
+            return f'switch to the "{self.arg}" tab'
+        if self.verb == "read_tab":
+            return f'read the "{self.arg}" tab'
         return self.verb.replace("_", " ")
 
 
@@ -318,6 +338,46 @@ _STATUS_RE = re.compile(
     rf"|is {_DET}(?:{_SYS}|{_AUDIO}) muted)$")
 
 
+# Window verbs (K2 T2, 2026-09-08). The list shapes all name windows beside a
+# listing verb or an open-state question — "open the window", "close the
+# window", "look out the window" and "windows update" match none of them, by
+# the same qualifier discipline that keeps the volume parser honest. Focus
+# takes any argument EXCEPT a bare generic ("focus the window" is prose, not
+# a target); misses fail honestly at the executor, which names no match.
+_WINDOW_LIST_RE = re.compile(
+    r"^(?:(?:what|which) windows are open"
+    r"|(?:list|show)(?: me)?(?: my| the| all| open)? windows"
+    r"|are (?:there )?any windows open"
+    r"|what(?:'?s| is) open(?: right now)?)$")
+_WINDOW_FOCUS_RES = (
+    # No "raise": it collides with volume phrasing ("raise the volume" has no
+    # system qualifier, so it reaches this branch) — three verbs suffice.
+    re.compile(r"^(?:focus|switch to)\s+(?P<q>.+)$"),
+    re.compile(r"^bring\s+(?P<q>.+?)\s+to\s+(?:the\s+)?(?:front|foreground|forward)$"),
+)
+_WINDOW_GENERIC_ARGS = frozenset({
+    "the window", "a window", "this window", "that window", "it", "that",
+    "this", "them", "windows",
+})
+
+# Browser tabs (K2 T3, 2026-09-10). Same qualifier discipline as windows:
+# only sentences naming tabs reach this tier — "switch to firefox" stays a
+# window focus, "list tasks" stays tasks. Bare generics are prose.
+_TAB_LIST_RE = re.compile(
+    r"^(?:(?:what|which) (?:browser |chrome |chromium )?tabs are open"
+    r"|(?:list|show)(?: me)?(?: my| the| all| open)? (?:browser |chrome |chromium )?tabs"
+    r"|are (?:there )?any tabs open)$")
+_TAB_ACTIVATE_RES = (
+    re.compile(r"^(?:switch to|go to|open|focus|activate) (?:the )?tab (?P<q>.+)$"),
+    re.compile(r"^bring (?:the )?tab (?P<q>.+?) to (?:the )?front$"),
+)
+_TAB_GENERIC_ARGS = frozenset({"it", "that", "this", "a tab", "the tab", "them"})
+_TAB_READ_RE = re.compile(
+    r"^(?:read (?:the |this |that |my )?tab(?P<q1> .*?)?"
+    r"|what(?:'?s| is) (?:on|in) (?:the |this |that |my )?tab(?P<q2> .*?)?"
+    r"|what does (?:the |this |that )?tab say)$")
+
+
 # -- shape tests for the two ambiguous branches ------------------------------
 #
 # Both are pure and lexical, because detect() may not do I/O: it cannot ask
@@ -332,6 +392,9 @@ _NOT_APP_WORDS = frozenset({
     "the", "a", "an", "my", "our", "your", "this", "that", "these", "those",
     "all", "some", "another", "again", "it", "them", "up", "for",
     "with", "from", "on", "in", "of", "and", "to", "please",
+    # Tier nouns, never app names (2026-09-10): "open tabs" is a tab-list
+    # request misheard by the launch branch, not an app called "tabs".
+    "tab", "tabs",
 })
 
 
@@ -477,6 +540,14 @@ def detect(text: str) -> Intent | None:
         return Intent("clipboard_get")
     if _STATUS_RE.match(t):
         return Intent("status")
+    if _WINDOW_LIST_RE.match(t):
+        return Intent("windows")
+    if _TAB_LIST_RE.match(t):
+        return Intent("tabs")
+    m = _TAB_READ_RE.match(t)
+    if m:
+        target = (m.group("q1") or m.group("q2") or "").strip(_PUNCT)
+        return Intent("read_tab", arg=target)
     if asking:
         return None
 
@@ -509,6 +580,27 @@ def detect(text: str) -> Intent | None:
         if m:
             down = m.group("dir") in _DOWN_WORDS
             return Intent("volume", delta=-VOLUME_STEP if down else VOLUME_STEP)
+
+    # Tab-activate before window-focus: "switch to tab gmail" names a tab,
+    # and the more specific qualifier wins. Window-focus owns the bare shape.
+    for rx in _TAB_ACTIVATE_RES:
+        m = rx.match(t)
+        if m:
+            target = m.group("q").strip(_PUNCT)
+            if target and target not in _TAB_GENERIC_ARGS:
+                return Intent("activate_tab", arg=target)
+            return None
+
+    for rx in _WINDOW_FOCUS_RES:
+        m = rx.match(t)
+        if m:
+            target = m.group("q").strip(_PUNCT)
+            # A bare generic is prose, not a target ("focus the window" about
+            # a state machine, "switch to it" mid-conversation). Misses with a
+            # REAL name fail honestly at the executor instead of here.
+            if target and target not in _WINDOW_GENERIC_ARGS:
+                return Intent("focus", arg=target)
+            return None
 
     # A dotted token that isn't a plausible web address ("notes.md",
     # "org.gnome.Nautilus") falls through to the app branch rather than being
@@ -927,7 +1019,42 @@ _EXECUTORS = {
     "clipboard_get": lambda i: _clipboard_get(),
     "clipboard_set": _clipboard_set,
     "status": lambda i: _status(),
+    "windows": lambda i: _list_windows(),
+    "focus": lambda i: _focus_window(i),
 }
+
+
+def _list_windows() -> str:
+    wins = _windows.list_windows()
+    if not wins:
+        return "No windows found."
+    return "Open windows: " + "; ".join(
+        f'{w["title"]} ({w["app"]})' for w in wins)
+
+
+def _focus_window(intent: Intent) -> str:
+    try:
+        return _windows.focus_window(intent.arg)
+    except _windows.WindowError as e:
+        raise DesktopError(str(e)) from None
+
+
+def run_intent_ok(intent: Intent) -> tuple[bool, str]:
+    """(acted, speakable sentence). run_intent() never raises, so a failed
+    launch used to come back as a sorry-sentence the service filed 'done' —
+    every parser miss ("open tasks", "run migrations") looked like success
+    and was never seen by a model. The bool is what the service settles on;
+    the sentence is what Jarvis speaks."""
+    fn = _EXECUTORS.get(intent.verb)
+    if fn is None:
+        return False, "I don't know how to do that yet."
+    try:
+        return True, fn(intent)
+    except DesktopError as e:
+        return False, f"Sorry — {e}."
+    except Exception:
+        log.exception("desktop verb %s crashed", intent.verb)
+        return False, "Sorry, that didn't work."
 
 
 def run_intent(intent: Intent) -> str:
@@ -938,13 +1065,4 @@ def run_intent(intent: Intent) -> str:
     Policy is checked by the *caller* — this function assumes the verb was
     already allowed, so tests can exercise executors directly.
     """
-    fn = _EXECUTORS.get(intent.verb)
-    if fn is None:
-        return "I don't know how to do that yet."
-    try:
-        return fn(intent)
-    except DesktopError as e:
-        return f"Sorry — {e}."
-    except Exception:
-        log.exception("desktop verb %s crashed", intent.verb)
-        return "Sorry, that didn't work."
+    return run_intent_ok(intent)[1]

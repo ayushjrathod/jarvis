@@ -482,6 +482,278 @@ class TestRunIntentNeverRaises(unittest.TestCase):
         self.assertEqual(run.call_args[0][0][3], "1.00")
 
 
+class TestIntentOutcome(unittest.TestCase):
+    """Finding 1.2: the executor never raises, so the sentence alone cannot
+    tell success from failure — and run_desktop_intent settled everything
+    done. run_intent_ok carries the bool the service settles on."""
+
+    def test_success_reports_true(self):
+        with mock.patch.object(desktop, "_run", return_value=""):
+            ok, speech = desktop.run_intent_ok(desktop.Intent("lock"))
+        self.assertTrue(ok)
+        self.assertIsInstance(speech, str)
+
+    def test_desktop_error_reports_false(self):
+        with mock.patch.object(desktop, "_run",
+                               side_effect=desktop.DesktopError("tasks didn't start")):
+            ok, speech = desktop.run_intent_ok(desktop.Intent("volume", number=0.4))
+        self.assertFalse(ok)
+        self.assertIn("didn't start", speech)
+
+    def test_unknown_verb_reports_false(self):
+        ok, speech = desktop.run_intent_ok(desktop.Intent("fly"))
+        self.assertFalse(ok)
+        self.assertIn("don't know", speech)
+
+    def test_service_settles_a_failed_launch_failed(self):
+        svc = _Svc({"enabled": True, "confirm_timeout_s": 120})
+        with mock.patch.object(
+                desktop, "run_intent_ok",
+                return_value=(False, "Sorry — tasks didn't start.")):
+            out = asyncio.run(svc.run_desktop_intent(
+                desktop.Intent("launch", arg="tasks"), "voice"))
+        self.assertEqual(out["status"], "failed")
+        self.assertIn("didn't start", out["speech"])
+
+    def test_service_still_settles_success_done(self):
+        svc = _Svc({"enabled": True, "confirm_timeout_s": 120})
+        with mock.patch.object(
+                desktop, "run_intent_ok",
+                return_value=(True, "Locking the screen.")):
+            out = asyncio.run(svc.run_desktop_intent(
+                desktop.Intent("lock"), "voice"))
+        self.assertEqual(out["status"], "done")
+
+    def test_answering_elsewhere_retires_the_banner(self):
+        # A voice "yeah" spends the id, but the dashboard banner only removes
+        # rows it answers itself — without confirm_resolved it kept offering
+        # Yes on the spent id for the full TTL.
+        svc = _Svc({"enabled": True, "confirm_timeout_s": 120})
+        svc.pending_desktop["cid1"] = {
+            "intent": desktop.Intent("lock"), "source": "voice",
+            "expires": 9999999999.0,
+        }
+        with mock.patch.object(desktop, "run_intent_ok",
+                               return_value=(True, "Locked.")):
+            out = asyncio.run(svc.confirm_desktop("cid1", True))
+        self.assertEqual(out["status"], "done")
+        ev = svc.hooks.fire.await_args.args[0]
+        self.assertEqual(ev["event"], "confirm_resolved")
+        self.assertEqual(ev["confirm_id"], "cid1")
+        self.assertTrue(ev["approved"])
+
+        svc.pending_desktop["cid2"] = {
+            "intent": desktop.Intent("lock"), "source": "voice",
+            "expires": 9999999999.0,
+        }
+        out = asyncio.run(svc.confirm_desktop("cid2", False))
+        self.assertEqual(out["status"], "declined")
+        ev = svc.hooks.fire.await_args.args[0]
+        self.assertEqual((ev["event"], ev["approved"]),
+                         ("confirm_resolved", False))
+
+
+class TestVerbCoverage(unittest.TestCase):
+    """No orphan verbs: everything the policy plane names must have a
+    default, a description, and an executor — the three lists drifted apart
+    twice before anyone noticed (focus shipped its policy a day before its
+    describe in the first cut)."""
+
+    def test_every_verb_has_policy_describe_and_executor(self):
+        from dispatcher.service import Service
+        browser_verbs = {"tabs", "activate_tab", "read_tab"}
+        for verb in sorted(desktop.ALL_VERBS):
+            with self.subTest(verb=verb):
+                self.assertIn(verb, desktop.DEFAULT_POLICY)
+                # describe() falls back to the verb with underscores spaced
+                # for verbs with no special case (lock, status) — that IS the
+                # description, and it must never be empty.
+                self.assertTrue(desktop.Intent(verb, arg="x").describe())
+                runs_here = verb in desktop._EXECUTORS
+                runs_there = verb in browser_verbs and hasattr(
+                    Service, "_run_browser_intent")
+                self.assertTrue(runs_here or runs_there, verb)
+
+    def test_read_verbs_are_all_known_verbs(self):
+        self.assertTrue(desktop.READ_VERBS <= desktop.ALL_VERBS)
+
+
+class TestTabVerbs(unittest.TestCase):
+    """K2 T3: browser tab list (allow) and switch (confirm). The tab
+    qualifier keeps every tier apart: switch-to-tab never reaches window
+    focus, switch-to-app never reaches tabs, and bare "open tabs" reaches
+    neither (tabs is not an app name)."""
+
+    def test_list_shapes_parse(self):
+        for s in ("what tabs are open", "list tabs",
+                  "show me my browser tabs", "which chrome tabs are open",
+                  "are any tabs open"):
+            with self.subTest(s=s):
+                i = desktop.detect(s)
+                self.assertIsNotNone(i, s)
+                self.assertEqual(i.verb, "tabs")
+
+    def test_activate_shapes_parse_with_target(self):
+        for s, want in (("switch to tab gmail", "gmail"),
+                        ("go to tab calendar", "calendar"),
+                        ("open tab youtube", "youtube"),
+                        ("focus tab docs", "docs"),
+                        ("activate tab mail", "mail"),
+                        ("bring tab chat to front", "chat")):
+            with self.subTest(s=s):
+                i = desktop.detect(s)
+                self.assertIsNotNone(i, s)
+                self.assertEqual((i.verb, i.arg), ("activate_tab", want))
+
+    def test_tiers_do_not_claim_each_other(self):
+        self.assertEqual(desktop.detect("switch to firefox").verb, "focus")
+        self.assertIsNone(desktop.detect("open tabs"))
+        self.assertIsNone(desktop.detect("list tasks"))
+        self.assertIsNone(desktop.detect("switch to it"))
+
+    def test_tab_policy_is_allow_and_confirm(self):
+        cfg = {"enabled": True}
+        self.assertEqual(desktop.policy(cfg, "tabs"), "allow")
+        self.assertEqual(desktop.policy(cfg, "activate_tab"), "confirm")
+
+    def test_read_shapes_parse_and_confirm(self):
+        for s, want in (("read this tab", ""), ("read tab gmail", "gmail"),
+                        ("what is on this tab?", ""),
+                        ("what does the tab say", "")):
+            with self.subTest(s=s):
+                i = desktop.detect(s)
+                self.assertIsNotNone(i, s)
+                self.assertEqual((i.verb, i.arg), ("read_tab", want))
+        cfg = {"enabled": True}
+        self.assertEqual(desktop.policy(cfg, "read_tab"), "confirm")
+
+    def test_service_reads_tab_text_through_config(self):
+        svc = _Svc({"enabled": True, "confirm_timeout_s": 120})
+        parked = asyncio.run(svc.run_desktop_intent(
+            desktop.Intent("read_tab", arg="mail"), "voice"))
+        self.assertEqual(parked["status"], "needs_confirmation")
+        with mock.patch("dispatcher.browser.read_tab",
+                        return_value='"Mail": hello there'):
+            out = asyncio.run(svc.confirm_desktop(parked["confirm_id"], True))
+        self.assertEqual(out["status"], "done")
+        self.assertIn("hello there", out["speech"])
+
+    def test_service_runs_browser_verbs_with_config(self):
+        import dispatcher.browser as _b
+        svc = _Svc({"enabled": True, "confirm_timeout_s": 120})
+        with mock.patch("dispatcher.browser.list_tabs",
+                        return_value=[{"id": "a", "title": "Mail", "url": "u"}]):
+            out = asyncio.run(svc.run_desktop_intent(
+                desktop.Intent("tabs"), "voice"))
+        self.assertEqual(out["status"], "done")
+        self.assertIn("Mail", out["speech"])
+        parked = asyncio.run(svc.run_desktop_intent(
+            desktop.Intent("activate_tab", arg="mail"), "voice"))
+        self.assertEqual(parked["status"], "needs_confirmation")
+        with mock.patch("dispatcher.browser.activate_tab",
+                        side_effect=_b.BrowserError("no debuggable browser")):
+            out = asyncio.run(svc.confirm_desktop(
+                parked["confirm_id"], True))
+        self.assertEqual(out["status"], "failed")
+        self.assertIn("debuggable", out["speech"])
+
+
+class TestWindowVerbs(unittest.TestCase):
+    """K2 T2: window list (allow) and focus (confirm) over AT-SPI. The list
+    shapes name windows beside a listing verb; ordinary window-talk
+    ("open/close the window", "look out the window") matches nothing, by the
+    same qualifier discipline as the volume parser."""
+
+    def test_list_shapes_parse(self):
+        for s in ("what windows are open", "list my windows",
+                  "show me open windows", "which windows are open",
+                  "are any windows open", "what is open"):
+            with self.subTest(s=s):
+                i = desktop.detect(s)
+                self.assertIsNotNone(i, s)
+                self.assertEqual(i.verb, "windows")
+
+    def test_ordinary_window_talk_is_not_a_command(self):
+        for s in ("open the window", "close the window",
+                  "look out the window", "windows update", "open windows",
+                  "focus the window", "switch to it", "raise the volume"):
+            with self.subTest(s=s):
+                i = desktop.detect(s)
+                self.assertTrue(i is None or i.verb in ("launch", "volume"), s)
+
+    def test_focus_shapes_parse_with_target(self):
+        i = desktop.detect("switch to firefox")
+        self.assertEqual((i.verb, i.arg), ("focus", "firefox"))
+        i = desktop.detect("bring nautilus to front")
+        self.assertEqual((i.verb, i.arg), ("focus", "nautilus"))
+
+    def test_focus_policy_is_confirm_list_is_allow(self):
+        cfg = {"enabled": True}
+        self.assertEqual(desktop.policy(cfg, "windows"), "allow")
+        self.assertEqual(desktop.policy(cfg, "focus"), "confirm")
+
+    def test_list_executor_reports_honestly(self):
+        with mock.patch("dispatcher.windows.list_windows",
+                        return_value=[{"app": "a", "title": "T"}]):
+            out = desktop.run_intent(desktop.Intent("windows"))
+        self.assertIn("T", out)
+        with mock.patch("dispatcher.windows.list_windows", return_value=[]):
+            out = desktop.run_intent(desktop.Intent("windows"))
+        self.assertIn("No windows", out)
+
+    def test_focus_miss_is_failed_not_done(self):
+        import dispatcher.windows as _w
+        with mock.patch("dispatcher.windows.focus_window",
+                        side_effect=_w.WindowError("no window matching")):
+            ok, speech = desktop.run_intent_ok(desktop.Intent("focus", arg="x"))
+        self.assertFalse(ok)
+        self.assertIn("no window matching", speech)
+
+    def test_parked_focus_answers_by_voice(self):
+        # The confirm plane is verb-agnostic, but focus is the first new
+        # confirm verb since open/clipboard_get: prove a bare yeah spends it.
+        svc = _Svc({"enabled": True, "confirm_timeout_s": 120})
+        parked = asyncio.run(svc.desktop_command("switch to firefox", "voice"))
+        self.assertEqual(parked["status"], "needs_confirmation")
+        with mock.patch.object(
+                desktop, "run_intent_ok",
+                return_value=(True, 'Focused "firefox".')):
+            done = asyncio.run(svc.desktop_command("yeah", "voice"))
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(svc.pending_desktop, {})
+
+    def test_window_sentences_belong_to_no_other_parser(self):
+        # Generative version of the qualifier invariant: every window command
+        # the desktop parser claims must be claimed by nothing else (media
+        # runs first), and the window-talk it refuses must not leak in
+        # through a neighbor.
+        apps = ["firefox", "nautilus", "terminal", "vlc", "obsidian"]
+        lists = ["what windows are open", "list my windows",
+                 "show me open windows", "which windows are open",
+                 "are any windows open", "what is open"]
+        n = 0
+        for s in lists:
+            for variant in (s, "please " + s, s + " please"):
+                i = desktop.detect(variant)
+                self.assertIsNotNone(i, variant)
+                self.assertEqual(i.verb, "windows")
+                self.assertIsNone(spotify.detect(variant), variant)
+                n += 1
+        for app in apps:
+            for s in (f"focus {app}", f"switch to {app}",
+                      f"bring {app} to front"):
+                i = desktop.detect(s)
+                self.assertIsNotNone(i, s)
+                self.assertEqual((i.verb, i.arg), ("focus", app))
+                self.assertIsNone(spotify.detect(s), s)
+                n += 1
+        self.assertGreater(n, 30)
+        for s in ("open the window", "close the window",
+                  "look out the window", "clean the windows"):
+            self.assertIsNone(desktop.detect(s), s)
+            self.assertIsNone(spotify.detect(s), s)
+
+
 class TestScreenLocked(unittest.TestCase):
     """Lock state comes from the session bus, not `loginctl show-session self`:
     the dispatcher is a systemd user service, which belongs to
@@ -691,7 +963,8 @@ class _Svc:
         self.pending_desktop = {}
         self.hooks = mock.Mock(fire=mock.AsyncMock())
         for name in ("desktop_command", "run_desktop_intent", "confirm_desktop",
-                     "pending_desktop_for", "_expire_desktop_confirms"):
+                     "pending_desktop_for", "_expire_desktop_confirms",
+                     "_run_browser_intent"):
             setattr(self, name, getattr(Service, name).__get__(self))
 
 
@@ -703,7 +976,7 @@ class TestConfirmFlow(unittest.TestCase):
 
     def test_allowed_verb_runs_immediately(self):
         svc = _Svc(self.CFG)
-        with mock.patch.object(desktop, "run_intent", return_value="Locking the screen."):
+        with mock.patch.object(desktop, "run_intent_ok", return_value=(True, "Locking the screen.")):
             out = self.run_cmd(svc, "lock the screen")
         self.assertEqual(out["status"], "done")
         self.assertEqual(svc.pending_desktop, {})
@@ -714,7 +987,7 @@ class TestConfirmFlow(unittest.TestCase):
         clicking it reported "expired" with no prior warning. ConfirmBar counts
         this down and removes the row itself."""
         svc = _Svc({"enabled": True, "confirm_timeout_s": 45})
-        with mock.patch.object(desktop, "run_intent") as ran:
+        with mock.patch.object(desktop, "run_intent_ok") as ran:
             self.run_cmd(svc, "what's on my clipboard")
         ran.assert_not_called()
         event = svc.hooks.fire.await_args.args[0]
@@ -723,7 +996,7 @@ class TestConfirmFlow(unittest.TestCase):
 
     def test_confirm_verb_parks_and_does_not_run(self):
         svc = _Svc(self.CFG)
-        with mock.patch.object(desktop, "run_intent") as run:
+        with mock.patch.object(desktop, "run_intent_ok") as run:
             out = self.run_cmd(svc, "what's on my clipboard")
             run.assert_not_called()
         self.assertEqual(out["status"], "needs_confirmation")
@@ -734,7 +1007,7 @@ class TestConfirmFlow(unittest.TestCase):
         self.assertEqual(payload["event"], "confirm")
         self.assertEqual(payload["confirm_id"], out["confirm_id"])
 
-        with mock.patch.object(desktop, "run_intent", return_value="Clipboard: hi"):
+        with mock.patch.object(desktop, "run_intent_ok", return_value=(True, "Clipboard: hi")):
             done = asyncio.run(svc.confirm_desktop(out["confirm_id"], True))
         self.assertEqual(done["status"], "done")
         self.assertEqual(svc.pending_desktop, {})   # consumed, not replayable
@@ -742,14 +1015,14 @@ class TestConfirmFlow(unittest.TestCase):
     def test_declining_does_not_run(self):
         svc = _Svc(self.CFG)
         out = self.run_cmd(svc, "read my clipboard")
-        with mock.patch.object(desktop, "run_intent") as run:
+        with mock.patch.object(desktop, "run_intent_ok") as run:
             done = asyncio.run(svc.confirm_desktop(out["confirm_id"], False))
             run.assert_not_called()
         self.assertEqual(done["status"], "declined")
 
     def test_unknown_or_expired_id_never_executes(self):
         svc = _Svc(self.CFG)
-        with mock.patch.object(desktop, "run_intent") as run:
+        with mock.patch.object(desktop, "run_intent_ok") as run:
             self.assertEqual(asyncio.run(svc.confirm_desktop("nope", True))["status"],
                              "expired")
             out = self.run_cmd(svc, "read my clipboard")
@@ -761,14 +1034,14 @@ class TestConfirmFlow(unittest.TestCase):
 
     def test_denied_verb_refuses(self):
         svc = _Svc({"enabled": True, "policy": {"lock": "deny"}})
-        with mock.patch.object(desktop, "run_intent") as run:
+        with mock.patch.object(desktop, "run_intent_ok") as run:
             out = self.run_cmd(svc, "lock the screen")
             run.assert_not_called()
         self.assertEqual(out["status"], "denied")
 
     def test_feature_off_denies_every_verb(self):
         svc = _Svc({})
-        with mock.patch.object(desktop, "run_intent") as run:
+        with mock.patch.object(desktop, "run_intent_ok") as run:
             self.assertEqual(self.run_cmd(svc, "lock the screen")["status"], "denied")
             run.assert_not_called()
 
@@ -784,7 +1057,7 @@ class TestConfirmFlow(unittest.TestCase):
         svc = _Svc(self.CFG)
         for text in ("run the tests", "start the deployment",
                      "run the migration", "start writing the report"):
-            with mock.patch.object(desktop, "run_intent") as run:
+            with mock.patch.object(desktop, "run_intent_ok") as run:
                 out = self.run_cmd(svc, text)
                 run.assert_not_called()
             self.assertEqual(out["status"], "unrecognized", text)
@@ -830,7 +1103,7 @@ class TestVoiceAnswer(unittest.TestCase):
         svc = _Svc(self.CFG)
         parked = asyncio.run(svc.desktop_command("what's on my clipboard", "voice"))
         self.assertEqual(parked["status"], "needs_confirmation")
-        with mock.patch.object(desktop, "run_intent") as run:
+        with mock.patch.object(desktop, "run_intent_ok") as run:
             out = asyncio.run(
                 svc.desktop_command("okay so what's on my calendar", "voice"))
             run.assert_not_called()
@@ -841,7 +1114,7 @@ class TestVoiceAnswer(unittest.TestCase):
         svc = _Svc(self.CFG)
         out = asyncio.run(svc.desktop_command("read my clipboard", "voice"))
         self.assertEqual(out["status"], "needs_confirmation")
-        with mock.patch.object(desktop, "run_intent", return_value="Clipboard: hi") as run:
+        with mock.patch.object(desktop, "run_intent_ok", return_value=(True, "Clipboard: hi")) as run:
             done = asyncio.run(svc.desktop_command("yeah", "voice"))
             run.assert_called_once()
         self.assertEqual(done["status"], "done")
@@ -850,7 +1123,7 @@ class TestVoiceAnswer(unittest.TestCase):
     def test_no_declines_the_parked_verb(self):
         svc = _Svc(self.CFG)
         asyncio.run(svc.desktop_command("read my clipboard", "voice"))
-        with mock.patch.object(desktop, "run_intent") as run:
+        with mock.patch.object(desktop, "run_intent_ok") as run:
             done = asyncio.run(svc.desktop_command("nope", "voice"))
             run.assert_not_called()
         self.assertEqual(done["status"], "declined")
@@ -858,7 +1131,7 @@ class TestVoiceAnswer(unittest.TestCase):
     def test_answer_only_applies_to_the_same_source(self):
         svc = _Svc(self.CFG)
         asyncio.run(svc.desktop_command("read my clipboard", "voice"))
-        with mock.patch.object(desktop, "run_intent") as run:
+        with mock.patch.object(desktop, "run_intent_ok") as run:
             other = asyncio.run(svc.desktop_command("yes", "ui"))
             run.assert_not_called()
         self.assertEqual(other["status"], "unrecognized")
@@ -866,7 +1139,7 @@ class TestVoiceAnswer(unittest.TestCase):
 
     def test_stray_yes_without_a_pending_confirm_does_nothing(self):
         svc = _Svc(self.CFG)
-        with mock.patch.object(desktop, "run_intent") as run:
+        with mock.patch.object(desktop, "run_intent_ok") as run:
             out = asyncio.run(svc.desktop_command("yes", "voice"))
             run.assert_not_called()
         self.assertEqual(out["status"], "unrecognized")

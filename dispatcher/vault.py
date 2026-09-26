@@ -10,6 +10,7 @@ from datetime import date
 from pathlib import Path
 
 from .queue_watcher import parse_task_file
+from .task_status import current_status, set_status
 
 log = logging.getLogger("dispatcher.vault")
 
@@ -49,12 +50,12 @@ def toggle_task(vault: Path, filename: str) -> dict:
     if not path.exists():
         raise FileNotFoundError(filename)
     text = path.read_text()
-    if "status: open" in text:
-        new = "done"
-        text = text.replace("status: open", "status: done", 1)
-    else:
-        new = "open"
-        text = text.replace("status: done", "status: open", 1)
+    meta, _ = parse_task_file(text)
+    new = "done" if current_status(meta) == "open" else "open"
+    try:
+        text = set_status(text, new)
+    except ValueError:
+        raise ValueError(f"{filename} has unterminated frontmatter")
     path.write_text(text)
     return {"file": filename, "status": new}
 

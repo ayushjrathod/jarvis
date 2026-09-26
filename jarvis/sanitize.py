@@ -13,9 +13,17 @@ from __future__ import annotations
 import re
 import unicodedata
 
-_CODE_BLOCK = re.compile(r"```.*?```", re.S)
+_CODE_BLOCK = re.compile(r"```.*?```|~~~.*?~~~", re.S)
 _INLINE_CODE = re.compile(r"`([^`]*)`")
 _LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+# Images keep their alt text (the meaningful half) and drop the URL; an
+# empty alt becomes "image" rather than silence. Reference-style links keep
+# the text the same way. All three run before _LINK, which would otherwise
+# match the bracket half and leave the "!" behind.
+_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]+\)")
+_REFLINK = re.compile(r"\[([^\]]+)\]\[[^\]]*\]")
+# Tag-like markup only (<b>, </div>): a bare "a < b" comparison must survive.
+_TAG = re.compile(r"</?[a-zA-Z][^>]*>")
 _URL = re.compile(r"https?://\S+")
 _HEADER = re.compile(r"^#{1,6}\s*", re.M)
 _EMPHASIS = re.compile(r"(\*{1,3}|~~|__)(?=\S)(.+?)(?<=\S)\1")
@@ -34,16 +42,52 @@ _WS = re.compile(r"[ \t]+")
 # sentence boundary: ./!/? followed by whitespace (avoids most mid-number splits)
 _SENTENCE_END = re.compile(r"(?<=[.!?…])[\"')\]]*\s+")
 
-_FENCE = "```"
+_FENCES = ("```", "~~~")  # GFM allows both; models emit both
+
+
+def _fence_count(text: str, start: int = 0, end: int | None = None) -> int:
+    """Fence markers in text[start:end]. Mixed ```/~~~ nesting miscounts —
+    accepted: real replies don't nest one marker inside the other, and the
+    alternative (style tracking) breaks the day they do it anyway."""
+    stop = len(text) if end is None else end
+    return sum(text.count(m, start, stop) for m in _FENCES)
+
+
+def _find_fence(text: str, start: int = 0) -> int:
+    """Earliest index of either marker at/after start, -1 when absent."""
+    hits = [i for m in _FENCES for i in [text.find(m, start)] if i >= 0]
+    return min(hits) if hits else -1
+
+
+def _rfind_fence(text: str) -> int:
+    """Latest index of either marker, -1 when absent."""
+    return max([text.rfind(m) for m in _FENCES])
 # spoken in place of a fenced block the chunker refuses to buffer to its close,
 # and when a single reply outruns the whole-reply cap
 _CODE_OMITTED = "Code block omitted."
 _TRUNCATED = "The rest of the answer is too long to read out."
 
 
+def _strip_emoji(text: str) -> str:
+    """Drop Symbol-Other characters (emoji, ✅, ©-style dingbats): espeak
+    renders ✅ as 'white heavy check mark', and model replies routinely open
+    with one. Letters, digits and punctuation (incl. →, …, •) are untouched —
+    only the So category goes."""
+    return "".join(ch for ch in text if unicodedata.category(ch) != "So")
+
+
+def _image_alt(m: re.Match) -> str:
+    alt = m.group(1).strip()
+    return alt if alt else "image"
+
+
 def sanitize(text: str) -> str:
     """Make model output speakable. Idempotent, safe on plain prose."""
     text = _CODE_BLOCK.sub(" code block omitted. ", text)
+    text = _IMAGE.sub(_image_alt, text)
+    text = _REFLINK.sub(r"\1", text)
+    text = _TAG.sub(" ", text)
+    text = _strip_emoji(text)
     text = _INLINE_CODE.sub(r"\1", text)
     text = _LINK.sub(r"\1", text)
     text = _URL.sub(" a link ", text)
@@ -116,16 +160,20 @@ class SentenceChunker:
         self._max_total = max_total
         self._spoken = 0
         self._dropping = False  # inside a runaway block, discarding to its closer
+        # Trailing "`"s of a fenceless dropping delta. Token boundaries split
+        # inside the 3-char closer routinely (`` `` `` then `` ` ``), so the
+        # partition below must see the carry + the new delta together.
+        self._carry = ""
 
     # -- fence bookkeeping ---------------------------------------------------
     # A position sits inside a ``` pair iff an odd number of fences precede it;
     # the buffer as a whole has an open fence iff its fence count is odd.
 
     def _fence_open(self) -> bool:
-        return self._buf.count(_FENCE) % 2 == 1
+        return _fence_count(self._buf) % 2 == 1
 
     def _inside_fence(self, index: int) -> bool:
-        return self._buf.count(_FENCE, 0, index) % 2 == 1
+        return _fence_count(self._buf, 0, index) % 2 == 1
 
     def _next_boundary(self) -> int | None:
         """End offset of the next sentence boundary that is NOT inside a
@@ -149,11 +197,17 @@ class SentenceChunker:
         out: list[str] = []
         if self._dropping:
             # mid-runaway-block: everything up to the closing fence is code we
-            # already announced as omitted, so it never reaches the buffer
-            _code, fence, tail = delta.partition(_FENCE)
-            if not fence:
+            # already announced as omitted, so it never reaches the buffer —
+            # but the closer may be SPLIT across deltas, so search the
+            # carry + delta together. A full 3-char marker would have matched
+            # already, so at most 2 of one kind carry forward.
+            s = self._carry + delta
+            i = _find_fence(s)
+            if i < 0:
+                m = re.search(r"(`{1,2}|~{1,2})$", delta)
+                self._carry = m.group(0) if m else ""
                 return out
-            self._dropping, delta = False, tail
+            self._dropping, self._carry, delta = False, "", s[i + 3:]
         self._buf += delta
         while True:
             if self._fence_open():
@@ -162,7 +216,7 @@ class SentenceChunker:
                 # would land in a later chunk.
                 if len(self._buf) <= self._max_code:
                     return out
-                cut = self._buf.rfind(_FENCE)  # the last fence is the open one
+                cut = _rfind_fence(self._buf)  # the last fence is the open one
                 prefix, self._buf, self._dropping = self._buf[:cut], "", True
                 self._emit(out, sanitize(prefix))
                 self._emit(out, _CODE_OMITTED)
@@ -179,8 +233,8 @@ class SentenceChunker:
                     # the fence count is even here, so the next fence at/after
                     # the cut closes the pair the cut fell into: take the whole
                     # block as one chunk and let sanitize() swallow it
-                    close = self._buf.find(_FENCE, cut)
-                    cut = close + len(_FENCE) if close >= 0 else len(self._buf)
+                    close = _find_fence(self._buf, cut)
+                    cut = close + 3 if close >= 0 else len(self._buf)
                 chunk, self._buf = self._buf[:cut], self._buf[cut:]
                 self._emit(out, sanitize(chunk))
             else:
@@ -188,11 +242,11 @@ class SentenceChunker:
 
     def flush(self) -> list[str]:
         out: list[str] = []
-        rest, self._buf, self._dropping = self._buf, "", False
-        if rest.count(_FENCE) % 2 == 1:
+        rest, self._buf, self._dropping, self._carry = self._buf, "", False, ""
+        if _fence_count(rest) % 2 == 1:
             # the stream ended mid-block (cancelled reply, dropped SSE): the
             # unpaired fence means sanitize() would hand the code to the TTS
-            cut = rest.rfind(_FENCE)
+            cut = _rfind_fence(rest)
             self._emit(out, sanitize(rest[:cut]))
             self._emit(out, _CODE_OMITTED)
             return out

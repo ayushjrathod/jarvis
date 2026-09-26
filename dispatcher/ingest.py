@@ -100,6 +100,7 @@ def chunk_markdown(file_label: str, text: str) -> list[dict]:
     stack: list[tuple[int, str]] = []   # (level, title)
     buf: list[str] = []
     buf_start = 1
+    in_fence = False
 
     def flush():
         body = "\n".join(buf).strip()
@@ -123,7 +124,17 @@ def chunk_markdown(file_label: str, text: str) -> list[dict]:
             })
 
     for i, line in enumerate(text.splitlines(), start=1):
-        m = HEADING_RE.match(line)
+        stripped = line.strip()
+        # Fenced code is payload, not structure: a ```bash block containing
+        # "# install the thing" used to register as a level-1 heading, evict
+        # the real stack, and brand every later chunk with the comment as its
+        # ancestry — plus spurious hash churn on every reindex. Tildes count:
+        # GFM allows ~~~ fences too.
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            buf.append(line)
+            continue
+        m = None if in_fence else HEADING_RE.match(line)
         if m:
             flush()
             level = len(m.group(1))
@@ -267,11 +278,13 @@ def chunk_pdf_file(file_label: str, path: Path) -> list[dict]:
     except ImportError as e:
         raise DepMissing(str(e))
     parts, ocr_budget = [], OCR_MAX_PAGES_PER_FILE
+    skipped_pages = 0
     with pymupdf.open(path) as doc:
         for page in doc:
             text = page.get_text().strip()
             if not text:
                 if ocr_budget <= 0:
+                    skipped_pages += 1
                     continue
                 ocr = _ocr(page.get_pixmap(dpi=150).tobytes("png"))
                 if ocr is None:  # no OCR dep: index the text pages we do have
@@ -282,6 +295,10 @@ def chunk_pdf_file(file_label: str, path: Path) -> list[dict]:
                 text = ocr.strip()
             if text:
                 parts.append(f"## page {page.number + 1}\n\n{text}")
+    if skipped_pages:
+        log.info("%s: %d textless page(s) beyond the %d-page OCR budget, "
+                 "not indexed", file_label, skipped_pages,
+                 OCR_MAX_PAGES_PER_FILE)
     return chunk_markdown(file_label, "\n\n".join(parts))
 
 
@@ -329,8 +346,9 @@ def ingest_vault(db: Database, root: Path, dirs: list[str]) -> dict:
     indexed = db.vault_file_mtimes()
     seen: set[str] = set()
     stats = {"files_scanned": 0, "files_changed": 0, "added": 0, "deleted": 0,
-             "dep_gated": 0}
+             "dep_gated": 0, "unsupported": 0, "unparseable": 0}
     gated_names: list[str] = []
+    unsupported_names: list[str] = []
     walked_prefixes: list[str] = []
     for d in dirs:
         base = root / d
@@ -348,6 +366,13 @@ def ingest_vault(db: Database, root: Path, dirs: list[str]) -> dict:
                 if p.suffix.lower() in DEP_GATED_EXTS:
                     stats["dep_gated"] += 1
                     gated_names.append(rel)
+                else:
+                    # .csv/.eml/.json/.zip and friends: no chunker, and until
+                    # now not even counted — the inbox announced "Indexed N
+                    # files — searchable now" over files that indexed nothing.
+                    stats["unsupported"] += 1
+                    if len(unsupported_names) < 5:
+                        unsupported_names.append(rel)
                 continue
             # stat() before anything is counted: a file that vanished between
             # the rglob and here must fall through to the prune pass below
@@ -385,7 +410,21 @@ def ingest_vault(db: Database, root: Path, dirs: list[str]) -> dict:
                 log.warning("ingest: skipping %s: %s", rel, e)
                 continue
             except Exception as e:  # one corrupt pdf/image must not end the walk
+                # ...but it must not bill us forever either. Until now a file
+                # whose chunker raised never recorded its mtime, so with the
+                # inbox reindexing the whole vault per arrival, one corrupt
+                # scanned PDF re-paid up to 10 OCR pages (~15s) per arrival,
+                # indefinitely, with files_changed at 0 hiding it. Record the
+                # mtime with zero chunks: skipped until touched again, and any
+                # stale entries for it are dropped rather than quoted forever.
+                # (DepMissing is separate above on purpose: a broken dep comes
+                # back, a corrupt file doesn't fix itself.)
                 log.warning("ingest: failed to parse %s: %s", rel, e)
+                added, deleted = db.replace_file_entries(rel, mtime, [])
+                stats["files_changed"] += 1
+                stats["added"] += added
+                stats["deleted"] += deleted
+                stats["unparseable"] += 1
                 continue
             stats["files_changed"] += 1
             stats["added"] += added
@@ -404,4 +443,8 @@ def ingest_vault(db: Database, root: Path, dirs: list[str]) -> dict:
         log.info("ingest: %d file(s) need PDF/OCR deps, not indexed: %s%s",
                  len(gated_names), ", ".join(gated_names[:5]),
                  "…" if len(gated_names) > 5 else "")
+    if unsupported_names:
+        log.info("ingest: %d unsupported file(s), not indexed: %s%s",
+                 stats["unsupported"], ", ".join(unsupported_names),
+                 "…" if stats["unsupported"] > 5 else "")
     return stats
