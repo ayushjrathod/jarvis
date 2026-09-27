@@ -1,6 +1,6 @@
 # STATE — read me first each session
 
-_Last updated: 2026-09-24 (session 37, end)_
+_Last updated: 2026-09-26 (session 38, merge day)_
 
 ## Session 33 (2026-08-08..25): remediation weeks — READ THIS FIRST after 30
 
@@ -219,7 +219,7 @@ whole-codebase reviews have been run **and remediated** (sessions 13, 26, 27)
 plus the standing-list sweeps in 28 and 29. **876 tests green** on the
 `history/aug-sep-backfill` branch (sessions 31–37: review remediation,
 Tier-3, K2 T2+T3 dep-free, route split, widgets, routing matrix), `main`
-pushed to origin at 2026-08-11.
+merged to main 2026-09-26 (111 commits, no-ff).
 
 **A fourth review (session 30, 2026-08-13) has been run and NOT remediated** —
 81 findings, none fixed, in `context/reviews/2026-08-13-full-codebase-review.md`
