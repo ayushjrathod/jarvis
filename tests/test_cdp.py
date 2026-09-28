@@ -120,6 +120,16 @@ class TestCDPClient(unittest.TestCase):
             c.evaluate("x")
         fake.join(timeout=5)
 
+    def test_broken_socket_is_cdperror_not_oserror(self):
+        import socket as _socket
+        c = cdp.CDPClient(timeout_s=5)
+        c.sock = _socket.socketpair()[0]
+        c.sock.close()  # reads fail immediately
+        with self.assertRaises(cdp.CDPError):
+            c.call("Runtime.evaluate", {})
+
+
+
 
 if __name__ == "__main__":
     unittest.main()

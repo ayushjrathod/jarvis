@@ -107,5 +107,17 @@ class TestReadTab(unittest.TestCase):
                 browser.read_tab(_cfg(), "docs")
 
 
+    def test_dropped_conversation_is_speakable(self):
+        import dispatcher.cdp as cdp_mod
+        with mock.patch("httpx.get") as hg, \
+                mock.patch.object(cdp_mod.CDPClient, "connect",
+                                  side_effect=cdp_mod.CDPError("boom")):
+            hg.return_value = mock.Mock(status_code=200,
+                                        json=lambda: self._targets())
+            with self.assertRaises(browser.BrowserError) as ctx:
+                browser.read_tab(_cfg(), "docs")
+        self.assertIn("could not read", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

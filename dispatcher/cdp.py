@@ -156,21 +156,28 @@ class CDPClient:
             return data.decode("utf-8", "replace")
 
     def call(self, method: str, params: dict | None = None) -> dict:
-        """One CDP round-trip. Raises CDPError on protocol or method errors."""
+        """One CDP round-trip. Raises CDPError on protocol or method errors —
+        never a raw socket or decode error, so callers can promise callers
+        speakable failures instead of 500s."""
         if self.sock is None:
             raise CDPError("not connected")
         self._next_id += 1
         rid = self._next_id
         deadline = time.monotonic() + self.timeout_s
-        self._send_text(json.dumps({"id": rid, "method": method,
-                                    "params": params or {}}))
-        while True:
-            msg = json.loads(self._recv_text(deadline))
-            if msg.get("id") != rid:
-                continue  # session events land here; the call owns the line
-            if "error" in msg:
-                raise CDPError(f"{method}: {msg['error'].get('message', msg['error'])}")
-            return msg.get("result", {})
+        try:
+            self._send_text(json.dumps({"id": rid, "method": method,
+                                        "params": params or {}}))
+            while True:
+                msg = json.loads(self._recv_text(deadline))
+                if msg.get("id") != rid:
+                    continue  # session events land here; the call owns the line
+                if "error" in msg:
+                    raise CDPError(f"{method}: {msg['error'].get('message', msg['error'])}")
+                return msg.get("result", {})
+        except CDPError:
+            raise
+        except (OSError, ValueError) as e:
+            raise CDPError(f"browser conversation failed: {e}") from e
 
     def evaluate(self, expression: str) -> str:
         """JS expression -> its JSON value rendered as text."""

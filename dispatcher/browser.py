@@ -107,10 +107,15 @@ def read_tab(cfg, query: str) -> str:
         raise BrowserError("no browser tabs found (is it running debuggable?)")
     hit = _match(tabs, query)
     ws_url = _ws_url(cfg, hit["id"])
-    with cdp.CDPClient() as client:
-        client.connect(ws_url)
-        text = client.evaluate(
-            "document.body ? document.body.innerText : document.title")
+    try:
+        with cdp.CDPClient() as client:
+            client.connect(ws_url)
+            text = client.evaluate(
+                "document.body ? document.body.innerText : document.title")
+    except cdp.CDPError as e:
+        # Same honest-failure contract as every other tier: a dropped
+        # conversation is a speakable miss, never a 500.
+        raise BrowserError(f"could not read the tab: {e}") from e
     text = " ".join((text or "").split())
     if len(text) > READ_CHARS:
         text = (text[:READ_CHARS].rsplit(" ", 1)[0]
