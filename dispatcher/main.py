@@ -23,7 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import (automations, curator, desktop, embeddings, inbox, ingest, memory,
-               queue_watcher, quick, spotify, stt, vault)
+               opencode, queue_watcher, quick, spotify, stt, vault)
 from .config import Config
 from .db import Database
 from .service import Service, make_ack, resolve_screenshot
@@ -562,7 +562,8 @@ def register_obs_routes(app: FastAPI, svc: Service, cfg: Config):
             "status": "ok",
             "db": str(cfg.db_path),
             "queue_dir": str(cfg.queue_dir),
-            "quick_backend": quick.BACKEND,
+            "quick_backend": (opencode.BACKEND if cfg.backend == "opencode"
+                              else quick.BACKEND),
             "running_tasks": len(svc.bg),
         }
 

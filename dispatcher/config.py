@@ -17,8 +17,9 @@ log = logging.getLogger("dispatcher.config")
 # failing hard would break forward-compat with newer config files.
 KNOWN_DISPATCHER_KEYS = frozenset({
     "host", "port", "db", "queue_dir", "poll_interval_s",
-    "queue_max_retries", "max_concurrent_agentic", "claude_bin",
-    "claude_config_dir", "models", "quick_session_idle_minutes", "budgets",
+    "queue_max_retries", "max_concurrent_agentic", "backend",
+    "claude_bin", "claude_config_dir", "opencode_bin",
+    "models", "quick_session_idle_minutes", "budgets",
     "task_defaults", "task_types", "memory", "learning", "automations",
     "media", "computer", "browser", "brief", "inbox", "screenshots_dir", "stt",
     "embeddings", "security",
@@ -35,8 +36,10 @@ class Config:
     poll_interval_s: float = 5.0
     queue_max_retries: int = 3
     max_concurrent_agentic: int = 2
+    backend: str = "claude"
     claude_bin: str = "claude"
     claude_config_dir: str | None = None
+    opencode_bin: str = "opencode"
     models: dict = field(default_factory=dict)
     quick_session_idle_minutes: float = 0.0
     budgets: dict = field(default_factory=dict)
@@ -78,8 +81,15 @@ class Config:
         cfg.poll_interval_s = d.get("poll_interval_s", cfg.poll_interval_s)
         cfg.queue_max_retries = d.get("queue_max_retries", cfg.queue_max_retries)
         cfg.max_concurrent_agentic = d.get("max_concurrent_agentic", cfg.max_concurrent_agentic)
+        raw_backend = str(d.get("backend", cfg.backend) or "claude").strip().lower()
+        if raw_backend not in ("claude", "opencode"):
+            log.warning("config %s: unknown backend %r — want 'claude' or "
+                        "'opencode'; falling back to 'claude'", path, raw_backend)
+            raw_backend = "claude"
+        cfg.backend = raw_backend
         cfg.claude_bin = d.get("claude_bin", cfg.claude_bin)
         cfg.claude_config_dir = d.get("claude_config_dir")
+        cfg.opencode_bin = d.get("opencode_bin", cfg.opencode_bin)
         cfg.models = d.get("models", {})
         cfg.quick_session_idle_minutes = d.get("quick_session_idle_minutes", 0.0)
         cfg.budgets = d.get("budgets", {})

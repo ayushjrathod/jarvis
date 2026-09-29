@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import (automations, browser, desktop, embeddings, graph, limits,
-               memory, notify, offline, quick, reflection, runner, spotify,
+               memory, notify, offline, opencode, quick, reflection, runner, spotify,
                telemetry)
 from .areas import AreaRegistry
 from .classifier import classify
@@ -521,7 +521,14 @@ class Service:
                         f"Use the Read tool to view the screenshot at {shot}, "
                         f"then answer this question about it: {task['text']}")
                 try:
-                    async for kind, payload in quick.stream(
+                    # backend branch: opencode mirrors quick.stream's
+                    # ("delta", …)/("meta", …) shape (dispatcher/opencode.py),
+                    # so everything below — deltas, settle, notify gate —
+                    # reads backend--agnostic meta off the same keys.
+                    stream_fn = (opencode.stream
+                                 if self.cfg.backend == "opencode"
+                                 else quick.stream)
+                    async for kind, payload in stream_fn(
                         send_text, self.cfg, model_override,
                         tools=q_tools, context=q_context,
                         resume_session_id=resume_id,
@@ -784,6 +791,17 @@ class Service:
                 if simulate and attempt == 1:
                     result = {"status": "refused", "stop_reason": "refusal",
                               "error": "simulated refusal (metadata.simulate_refusal)"}
+                elif self.cfg.backend == "opencode":
+                    # same normalized result as runner.run_once
+                    # (dispatcher/opencode.py); budget caps don't apply on
+                    # this path (no --max-budget-usd flag — timeout only).
+                    result = await opencode.run_once(
+                        task["text"], self.cfg, model, tools, self.procs, task["id"],
+                        system_extra=system_extra,
+                        resume_session_id=meta.get("resume_session_id"),
+                        max_cost_usd=meta.get("max_cost_usd"),
+                        on_step=on_step,
+                    )
                 else:
                     result = await runner.run_once(
                         task["text"], self.cfg, model, tools, self.procs, task["id"],

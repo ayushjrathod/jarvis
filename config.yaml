@@ -10,9 +10,30 @@ dispatcher:
   queue_max_retries: 3   # transient ingest failures retried this many polls before .failed
   max_concurrent_agentic: 2
 
+  # Agent backend: `claude` (Claude Code subscription CLI, the original and
+  # default) or `opencode` (`opencode run --format json`, see
+  # dispatcher/opencode.py). Both dispatch paths honour it — quick Q&A and
+  # headless agentic runs. Unknown values warn and fall back to `claude`.
+  #
+  # OpenCode notes (measured 2026-09-29):
+  # - Model IDs must be `provider/model` (e.g.
+  #   `opencode/muse-spark-1.3-contributor-free`). A bare Claude Code ID in
+  #   models.quick/agentic/fallback/meta is ignored on this path in favour
+  #   of that free default — set real opencode IDs to use anything else.
+  # - Free-tier models reject per-task tool/permission overrides, so tool
+  #   scoping is coarse: quick + read-only tasks ride the read-only `plan`
+  #   agent, write-capable agentic tasks ride full-tools `build` (broader
+  #   than the equivalent Claude Edit(path/**) scoping — see module doc).
+  # - No budget flag exists on `opencode run`: spend guard is the wall-clock
+  #   timeout only, and `models.effort` is not passed through.
+  backend: opencode
+
   # The claude aliases only exist in interactive zsh — invoke the binary directly.
   claude_bin: /home/ayra/.local/bin/claude
   claude_config_dir: /home/ayra/.claude-per
+
+  # opencode binary for `backend: opencode` (must be on PATH when relative).
+  opencode_bin: opencode
 
   # Ask-about-my-screen: portal screenshots stored + served from here
   # (GET /screenshots/<name>, pruned by jarvis.ask_screen keep_last), and a
